@@ -7,13 +7,15 @@ import dotenv from 'dotenv';
 import { auth } from 'express-oauth2-jwt-bearer';
 import cors from 'cors';
 import db from './db.js';
-import axios from 'axios';
+// import axios from 'axios';
 // import FormData from 'form-data';
 import { randomUUID } from 'crypto';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import Busboy from 'busboy';
 import mime from 'mime-types';
+import { Readable } from 'node:stream';
+import { checkRole, validateFileSecurity } from './middleware.js';  
 
 const app = express();
 const PUBLIC_PORT = 8080;
@@ -29,7 +31,7 @@ const bouncer = auth({
     audience: namespace,
     issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
     tokenSigningAlg: 'RS256'
-})
+});
 
 app.get('/vault/view/:uuid', async (req, res) => {
     const { uuid } = req.params;
@@ -155,46 +157,48 @@ app.post('/vault/upload', bouncer, (req, res) => {
     busboy.on('file', async (name, file, info) => {
         if (isProcessing) return; // Only handle one file per request
         isProcessing = true;
-
-        const { filename, mimeType: headerMime } = info;
-        const extensionMime = mime.lookup(filename);
-        const dangerousExtensions = ['.exe', '.sh', '.bat', '.php', '.js', '.msi'];
-        const isExecutableExt = dangerousExtensions.some(ext => filename.toLowerCase().endsWith(ext));
-        const isSpoofed = isExecutableExt && (headerMime.startsWith('image/') || headerMime.startsWith('text/'));
-
-        if (isSpoofed) {
-            console.error(`[SECURITY REJECTION] Spoof detected: ${filename} claimed to be ${headerMime}`);
-
-            // CRITICAL: You must consume the stream before sending the error
-            file.resume();
-            return res.status(403).json({
-                error: "Security Policy Violation",
-                details: "File extension and content-type mismatch detected."
-            });
-        }
-
-        // 3. PROCEED IF SAFE
-        const finalMime = (headerMime === 'application/octet-stream') ? (extensionMime || headerMime) : headerMime;
-
+        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime);
         try {
             console.log(`[GATEWAY] Ingesting: ${filename} (${finalMime}) from user ${userId}`);
+            if (isSpoofed) {
+                console.error(`[SECURITY] Blocked: ${filename}`);
+                file.resume();
+                return res.status(403).json({ error: "Security Violation" });
+            }
 
             // 1. FORWARD THE STREAM TO SURABAYA
             // We send the 'file' stream from Busboy, NOT the 'req' object
-            const spokeResponse = await axios({
-                method: 'post',
-                url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/receive-file`,
-                data: file,
+            // const spokeResponse = await axios({
+            //     method: 'post',
+            //     url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/receive-file`,
+            //     data: file,
+            //     headers: {
+            //         ...file.headers, // Keep stream headers if any
+            //         'x-original-name': filename
+            //     },
+            //     maxContentLength: Infinity,
+            //     maxBodyLength: Infinity,
+            //     decompress: false
+            // });
+            const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/receive-file`, {
+                method: 'POST',
+                body: file, // This is your Busboy file stream
+                // CRITICAL for streaming request bodies in Fetch:
+                duplex: 'half',
                 headers: {
-                    ...file.headers, // Keep stream headers if any
                     'x-original-name': filename
                 },
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity,
-                decompress: false
+                //  maxContentLength: Infinity,
+                // maxBodyLength: Infinity,
+                // decompress: false
             });
+            if (!spokeResponse.ok) {
+                const errorText = await spokeResponse.text();
+                throw new Error(`Spoke rejected upload: ${errorText}`);
+            }
 
-            const { physical_path, size } = spokeResponse.data;
+            const data = await spokeResponse.json();
+            const { physical_path, size } = data;
 
             // 2. SQL LOGIC: Find or Create the File Entry
             // We include mime_type here!
@@ -220,7 +224,10 @@ app.post('/vault/upload', bouncer, (req, res) => {
 
                 try {
                     // A. Delete from Surabaya
-                    await axios.delete(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`);
+                    // await axios.delete(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`);
+                    await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`, {
+                        method: 'DELETE'
+                    });
                     // B. Delete from Jakarta SQL
                     db.prepare('DELETE FROM versions WHERE id = ?').run(oldest.id);
 
@@ -303,64 +310,106 @@ app.get('/vault/audit', bouncer, (req, res) => {
 });
 // gateway.js (
 // gateway.js (Jakarta VM)
+
 app.get('/vault/download/:uuid', bouncer, async (req, res) => {
+    const { uuid } = req.params;
     const userId = req.auth.payload.sub;
-    const fileUuid = req.params.uuid;
-    const requestedVersion = req.query.v;
 
     try {
-        let fileMeta;
+        // 1. Get metadata (Join files and the LATEST version)
+        const fileInfo = db.prepare(`
+            SELECT f.filename, f.mime_type, v.physical_path, v.size 
+            FROM files f
+            JOIN versions v ON f.id = v.file_id
+            WHERE f.uuid = ? AND f.owner_id = ?
+            ORDER BY v.version_num DESC LIMIT 1
+        `).get(uuid, userId);
 
-        if (requestedVersion) {
-            // A. Specific Version Request
-            console.log(`[GATEWAY] Requesting Version ${requestedVersion} of ${fileUuid}`);
-            fileMeta = db.prepare(`
-                SELECT f.filename, v.physical_path, v.version_num
-                FROM files f
-                JOIN versions v ON f.id = v.file_id
-                WHERE f.uuid = ? AND f.owner_id = ? AND v.version_num = ?
-            `).get(fileUuid, userId, requestedVersion);
-        } else {
-            // B. Default: Get Latest Version
-            fileMeta = db.prepare(`
-                SELECT f.filename, v.physical_path, v.version_num
-                FROM files f
-                JOIN versions v ON f.id = v.file_id
-                WHERE f.uuid = ? AND f.owner_id = ?
-                ORDER BY v.version_num DESC LIMIT 1
-            `).get(fileUuid, userId);
+        if (!fileInfo) {
+            return res.status(404).json({ error: "File not found or access denied." });
         }
 
-        if (!fileMeta) {
-            return res.status(404).json({ error: "Version not found or access denied." });
-        }
+        console.log(`[GATEWAY] Streaming ${fileInfo.filename} from Surabaya for user ${userId}`);
 
-        // 2. Stream from Surabaya (Same as before)
-        const spokeResponse = await axios({
-            method: 'get',
-            url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/raw/${fileMeta.physical_path}`,
-            responseType: 'stream'
-        });
+        // 2. Request the stream from the Surabaya Spoke
+        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/serve-file/${fileInfo.physical_path}`);
 
-        // 3. Set Headers (Include version in the filename for a better UX!)
-        // Example: my_thesis_v3.pdf
-        const downloadName = fileMeta.filename.includes('.')
-            ? fileMeta.filename.replace(/(\.[^.]+)$/, `_v${fileMeta.version_num}$1`)
-            : `${fileMeta.filename}_v${fileMeta.version_num}`;
+        if (!spokeResponse.ok) throw new Error("Spoke failed to provide file stream.");
 
-        res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-        res.setHeader('Content-Type', 'application/octet-stream');
+        // 3. Set headers so the browser knows what to do
+        res.setHeader('Content-Type', fileInfo.mime_type);
+        res.setHeader('Content-Length', fileInfo.size);
+        // This forces the "Save As" dialog with the original filename
+        res.setHeader('Content-Disposition', `attachment; filename="${fileInfo.filename}"`);
 
-        // 4. PIPE IT OUT
-        spokeResponse.data.pipe(res);
-        const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
-        log.run(userId, `DOWNLOAD ${fileMeta.filename} (v${fileMeta.version_num})`, 'SUCCESS');
+        // 4. Pipe the bytes: Spoke -> Hub -> User
+        // Use Readable.fromWeb because fetch returns a Web Stream
+
+        Readable.fromWeb(spokeResponse.body).pipe(res);
 
     } catch (err) {
-        console.error("[GATEWAY] Download Failed:", err.message);
-        res.status(500).json({ error: "Secure Tunnel Interrupted" });
+        console.error("Download Error:", err.message);
+        if (!res.headersSent) res.status(500).json({ error: "Could not retrieve file." });
     }
 });
+// app.get('/vault/download/:uuid', bouncer, async (req, res) => {
+//     const userId = req.auth.payload.sub;
+//     const fileUuid = req.params.uuid;
+//     const requestedVersion = req.query.v;
+
+//     try {
+//         let fileMeta;
+
+//         if (requestedVersion) {
+//             // A. Specific Version Request
+//             console.log(`[GATEWAY] Requesting Version ${requestedVersion} of ${fileUuid}`);
+//             fileMeta = db.prepare(`
+//                 SELECT f.filename, v.physical_path, v.version_num
+//                 FROM files f
+//                 JOIN versions v ON f.id = v.file_id
+//                 WHERE f.uuid = ? AND f.owner_id = ? AND v.version_num = ?
+//             `).get(fileUuid, userId, requestedVersion);
+//         } else {
+//             // B. Default: Get Latest Version
+//             fileMeta = db.prepare(`
+//                 SELECT f.filename, v.physical_path, v.version_num
+//                 FROM files f
+//                 JOIN versions v ON f.id = v.file_id
+//                 WHERE f.uuid = ? AND f.owner_id = ?
+//                 ORDER BY v.version_num DESC LIMIT 1
+//             `).get(fileUuid, userId);
+//         }
+
+//         if (!fileMeta) {
+//             return res.status(404).json({ error: "Version not found or access denied." });
+//         }
+
+//         // 2. Stream from Surabaya (Same as before)
+//         const spokeResponse = await axios({
+//             method: 'get',
+//             url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/raw/${fileMeta.physical_path}`,
+//             responseType: 'stream'
+//         });
+
+//         // 3. Set Headers (Include version in the filename for a better UX!)
+//         // Example: my_thesis_v3.pdf
+//         const downloadName = fileMeta.filename.includes('.')
+//             ? fileMeta.filename.replace(/(\.[^.]+)$/, `_v${fileMeta.version_num}$1`)
+//             : `${fileMeta.filename}_v${fileMeta.version_num}`;
+
+//         res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+//         res.setHeader('Content-Type', 'application/octet-stream');
+
+//         // 4. PIPE IT OUT
+//         spokeResponse.data.pipe(res);
+//         const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
+//         log.run(userId, `DOWNLOAD ${fileMeta.filename} (v${fileMeta.version_num})`, 'SUCCESS');
+
+//     } catch (err) {
+//         console.error("[GATEWAY] Download Failed:", err.message);
+//         res.status(500).json({ error: "Secure Tunnel Interrupted" });
+//     }
+// });
 
 app.get('/vault/share/:uuid', bouncer, (req, res) => {
     const userId = req.auth.payload.sub;

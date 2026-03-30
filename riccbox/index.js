@@ -285,11 +285,21 @@ app.delete('/vault/delete/:filename', (req, res) => {
         res.status(404).json({ error: "File not found" });
     }
 });
+// app.get('/serve-file/:filename', (req, res) => {
+//     // const filePath = path.join(STORAGE_DIR, req.params.path);
+//      const filename = req.params.filename;
+//     const filePath = path.join(__dirname, 'vault_storage', filename);
 
+//     // Safety check: ensure the file exists
+//     if (!fs.existsSync(filePath)) return res.status(404).send("Not found");
+
+//     // Send the file directly
+//     res.sendFile(filePath);
+// });
 // index.js (Surabaya Spoke)
 // Add this route ABOVE your express.json()
 // index.js (Surabaya Spoke)
-app.get('/internal/raw/:filename', (req, res) => {
+app.get('/serve-file/:filename', (req, res) => {
     const filename = req.params.filename;
     const filePath = path.join(__dirname, 'vault_storage', filename);
 
