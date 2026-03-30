@@ -1,0 +1,2 @@
+ssh trading-gold@182.253.116.44
+
