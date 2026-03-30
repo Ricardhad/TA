@@ -1,3 +1,6 @@
+
+import mime from 'mime-types';
+
 const checkRole = (requiredRole) => {
     return (req, res, next) => {
         const userId = req.auth.payload.sub;

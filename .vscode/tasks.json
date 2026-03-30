@@ -1,0 +1,32 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Start IAP Tunnel",
+            "type": "shell",
+            "command": "gcloud compute start-iap-tunnel securegatewayvm-zonea 22 --local-host-port=localhost:2222 --zone=asia-southeast2-a",
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": [
+                {
+                    "pattern": [
+                        {
+                            "regexp": ".",
+                            "file": 1,
+                            "location": 2,
+                            "message": 3
+                        }
+                    ],
+                    "background": {
+                        "activeOnStart": true,
+                        "beginsPattern": "Listening on port",
+                        "endsPattern": "Listening on port"
+                    }
+                }
+            ]
+        }
+    ]
+}

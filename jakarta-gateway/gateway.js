@@ -15,7 +15,7 @@ import helmet from 'helmet';
 import Busboy from 'busboy';
 import mime from 'mime-types';
 import { Readable } from 'node:stream';
-import { checkRole, validateFileSecurity } from './middleware.js';  
+import { checkRole, validateFileSecurity } from './middleware.js';
 
 const app = express();
 const PUBLIC_PORT = 8080;
@@ -25,7 +25,6 @@ const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
 const namespace = process.env.NAMESPACE || 'unknown_namespace';
 
-app.use(helmet());
 
 const bouncer = auth({
     audience: namespace,
@@ -54,24 +53,25 @@ app.get('/vault/view/:uuid', async (req, res) => {
             return res.status(403).send("Invalid signature. Link may have been tampered with.");
         }
 
-        // 3. Get the physical path (No owner check needed here, the Sig proves it's valid)
-        const fileMeta = db.prepare(`
-            SELECT f.filename, v.physical_path 
+       const fileMeta = db.prepare(`
+            SELECT f.filename, f.mime_type, v.physical_path, v.size 
             FROM files f JOIN versions v ON f.id = v.file_id 
             WHERE f.uuid = ? ORDER BY v.version_num DESC LIMIT 1
         `).get(uuid);
 
         if (!fileMeta) return res.status(404).send("File no longer exists.");
 
-        // 4. Stream from Surabaya
-        const spokeResponse = await axios({
-            method: 'get',
-            url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/raw/${fileMeta.physical_path}`,
-            responseType: 'stream'
-        });
+        // 1. CORRECT FETCH SYNTAX (URL must be a string)
+        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/serve-file/${fileMeta.physical_path}`);
 
+        if (!spokeResponse.ok) throw new Error("Spoke failed to provide file.");
+
+        // 2. CORRECT HEADERS
+        res.setHeader('Content-Type', fileMeta.mime_type || 'application/octet-stream');
         res.setHeader('Content-Disposition', `inline; filename="${fileMeta.filename}"`);
-        spokeResponse.data.pipe(res);
+
+        // 3. CORRECT PIPING (Fetch body is a Web Stream)
+        Readable.fromWeb(spokeResponse.body).pipe(res);
 
     } catch (err) {
         console.error("[VIEW ERROR]", err.message);
@@ -79,8 +79,10 @@ app.get('/vault/view/:uuid', async (req, res) => {
     }
 });
 
+
 app.use(bouncer);
 
+app.use(helmet());
 app.use(cors({
     origin: 'http://localhost:5173', // Allow your React app
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -157,6 +159,7 @@ app.post('/vault/upload', bouncer, (req, res) => {
     busboy.on('file', async (name, file, info) => {
         if (isProcessing) return; // Only handle one file per request
         isProcessing = true;
+        const { filename, mimeType: headerMime } = info;
         const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime);
         try {
             console.log(`[GATEWAY] Ingesting: ${filename} (${finalMime}) from user ${userId}`);
