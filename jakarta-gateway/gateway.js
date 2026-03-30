@@ -15,7 +15,7 @@ import helmet from 'helmet';
 import Busboy from 'busboy';
 import mime from 'mime-types';
 import { Readable } from 'node:stream';
-import { checkRole, validateFileSecurity } from './middleware.js';
+import { authorizeVault, validateFileSecurity ,permitGlobalRole} from './middleware.js';
 
 const app = express();
 const PUBLIC_PORT = 8080;
@@ -103,7 +103,7 @@ app.use((req, res, next) => {
 
 
 
-app.get('/vault/metadata', bouncer, (req, res) => {
+app.get('/vault/metadata',(req, res) => {
     const userId = req.auth.payload.sub; // Get the Auth0 ID
 
     try {
@@ -122,16 +122,19 @@ app.get('/vault/metadata', bouncer, (req, res) => {
         res.status(500).json({ error: "Database query failed" });
     }
 });
-// app.get('/vault/test', bouncer, (req, res) => {
-//     const namespace = 'https://richardgatewayta.duckdns.org';
-//     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
-//     try {
-//         res.json({ message: "Test successful", user: userEmail });
-//     } catch (err) {
-//         console.error("SQL Error:", err);
-//         res.status(500).json({ error: "Database query failed" });
-//     }
-// });
+
+app.get('/vault/identity', (req, res) => {
+    const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
+    const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
+    const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
+    // const object = req.auth?.payload || 'anonymous';
+    try {
+        res.json({ message: "username retrieved", user: userEmail, roles: userRoles});
+    } catch (err) {
+        console.error("SQL Error:", err);
+        res.status(500).json({ error: "Database query failed" });
+    }
+});
 
 const sslOptions = {
     key: fs.readFileSync('/etc/letsencrypt/live/richardgatewayta.duckdns.org/privkey.pem'),
@@ -139,7 +142,7 @@ const sslOptions = {
 };
 
 
-app.post('/vault/upload', bouncer, (req, res) => {
+app.post('/vault/upload',  (req, res) => {
     const contentType = req.headers['content-type'];
 
     if (!contentType || !contentType.includes('multipart/form-data')) {
@@ -268,7 +271,7 @@ app.post('/vault/upload', bouncer, (req, res) => {
     req.pipe(busboy);
 });
 
-app.get('/vault/history/:uuid', bouncer, (req, res) => {
+app.get('/vault/history/:uuid', authorizeVault('VIEWER'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
 
@@ -288,7 +291,7 @@ app.get('/vault/history/:uuid', bouncer, (req, res) => {
     }
 });
 
-app.get('/vault/audit', bouncer, (req, res) => {
+app.get('/vault/audit',permitGlobalRole('admin'),  (req, res) => {
     // Thesis Note: In a real app, you'd check if (req.auth.payload.role === 'admin')
     // For now, we'll let the authenticated user see the system logs.
 
@@ -314,7 +317,7 @@ app.get('/vault/audit', bouncer, (req, res) => {
 // gateway.js (
 // gateway.js (Jakarta VM)
 
-app.get('/vault/download/:uuid', bouncer, async (req, res) => {
+app.get('/vault/download/:uuid',authorizeVault('VIEWER'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
 
@@ -414,7 +417,7 @@ app.get('/vault/download/:uuid', bouncer, async (req, res) => {
 //     }
 // });
 
-app.get('/vault/share/:uuid', bouncer, (req, res) => {
+app.get('/vault/share/:uuid',  authorizeVault('OWNER'),(req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
     const ttl = parseInt(req.query.ttl) || 60; // Default 60 minutes

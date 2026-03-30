@@ -36,6 +36,14 @@ db.exec(`
     ip_address TEXT,                     -- 📍 For Security Forensics
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE TABLE IF NOT EXISTS file_access (
+    file_uuid TEXT,
+    user_id TEXT, -- The Auth0 'sub' ID
+    role TEXT,    -- 'EDITOR' or 'VIEWER'
+    PRIMARY KEY (file_uuid, user_id),
+    FOREIGN KEY (file_uuid) REFERENCES files(uuid)
+  );
+
 `);
 
 export default db;

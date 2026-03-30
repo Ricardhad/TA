@@ -1,0 +1,1 @@
+gcloud compute start-iap-tunnel securegatewayvm-zonea 22 --local-host-port=localhost:2222 --zone=asia-southeast2-a
