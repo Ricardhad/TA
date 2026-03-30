@@ -139,14 +139,3 @@ dist
 
 secrets/
 /riccbox/vault_storage
-jakarta-gateway/server.csr
-jakarta-gateway/server.key
-/jakarta-gateway/.dotnet
-.vscode/sftp.json
-.vscode/sftp.json
-jakarta-gateway/.bash_history
-jakarta-gateway/.bash_logout
-jakarta-gateway/.bashrc
-jakarta-gateway/.lesshst
-jakarta-gateway/.nvm/
-.vscode/sftp.json

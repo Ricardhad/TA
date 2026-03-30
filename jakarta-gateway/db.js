@@ -12,7 +12,8 @@ db.exec(`
     filename TEXT NOT NULL,
     content_type TEXT,                   -- 📄 e.g., 'image/png' for UI preview
     bucket_name TEXT DEFAULT 'default',
-    owner_id TEXT NOT NULL,              -- 👤 Auth0 User ID
+    owner_id TEXT NOT NULL,              -- 👤 Auth0 User ID,
+    mime_type TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 

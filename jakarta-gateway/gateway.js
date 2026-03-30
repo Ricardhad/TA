@@ -8,17 +8,23 @@ import { auth } from 'express-oauth2-jwt-bearer';
 import cors from 'cors';
 import db from './db.js';
 import axios from 'axios';
-import FormData from 'form-data';
-import { randomUUID} from 'crypto';
+// import FormData from 'form-data';
+import { randomUUID } from 'crypto';
 import crypto from 'crypto';
+import helmet from 'helmet';
+import Busboy from 'busboy';
+import mime from 'mime-types';
 
 const app = express();
 const PUBLIC_PORT = 8080;
-const proxy = httpProxy.createProxyServer({});
+// const proxy = httpProxy.createProxyServer({});
 
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
 const namespace = process.env.NAMESPACE || 'unknown_namespace';
+
+app.use(helmet());
+
 const bouncer = auth({
     audience: namespace,
     issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
@@ -98,7 +104,7 @@ app.get('/vault/metadata', bouncer, (req, res) => {
 
     try {
         const query = db.prepare(`
-            SELECT f.uuid, f.filename, v.version_num, v.timestamp, v.size
+            SELECT f.uuid, f.filename, v.version_num, v.timestamp, v.size, f.mime_type
             FROM files f
             JOIN versions v ON f.id = v.file_id
             WHERE f.owner_id = ?
@@ -129,77 +135,129 @@ const sslOptions = {
 };
 
 
+app.post('/vault/upload', bouncer, (req, res) => {
+    const contentType = req.headers['content-type'];
 
-app.post('/vault/upload', bouncer, async (req, res) => {
-    const userId = req.auth.payload.sub;
-    const filename = req.headers['x-filename'] || 'unnamed-file'; // Pass filename in headers
-
-    console.log(`[GATEWAY] Streaming upload for: ${filename}`);
-
-    try {
-        // 1. FORWARD THE STREAM
-        // Instead of buffering the file, we pipe the 'req' stream directly to Surabaya.
-        const spokeResponse = await axios({
-            method: 'post',
-            url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/receive-file`,
-            data: req, // This is the RAW stream coming from the user
-            headers: {
-                'Content-Type': req.headers['content-type'],
-                'x-original-name': filename // Tell Surabaya what the file is called
-            },
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity,
-            decompress: false
+    if (!contentType || !contentType.includes('multipart/form-data')) {
+        console.error(`[GATEWAY] Blocked request with invalid Content-Type: ${contentType}`);
+        return res.status(400).json({
+            error: "Invalid Request",
+            details: "Content-Type must be multipart/form-data"
         });
-
-        const { physical_path, size } = spokeResponse.data;
-
-        // 2. SQL LOGIC: Only update metadata AFTER Surabaya confirms storage
-        let file = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND owner_id = ?')
-                     .get(filename, userId);
-        
-        if (!file) {
-            const uuid = randomUUID();
-            const info = db.prepare('INSERT INTO files (uuid, filename, owner_id) VALUES (?, ?, ?)')
-                           .run(uuid, filename, userId);
-            file = { id: info.lastInsertRowid, uuid: uuid };
-        }
-        let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(file.id);
-
-        while (versions.length >= 5) {
-            const oldest = versions[0]; // The one with the lowest version_num
-
-            console.log(`[CLEANUP] Vault full (5/5). Purging oldest version: ${oldest.physical_path}`);
-
-            try {
-                // A. Tell Surabaya to delete the physical file
-                // You'll need a DELETE route on Surabaya for this (see below)
-                await axios.delete(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`);
-
-                // B. Remove the record from Jakarta's SQL
-                db.prepare('DELETE FROM versions WHERE id = ?').run(oldest.id);
-                
-                console.log(`[CLEANUP] Successfully purged ${oldest.physical_path}`);
-                versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(file.id);
-            } catch (purgeErr) {
-                // We log it but don't stop the upload, 
-                // otherwise a network glitch would block the user from saving new work.
-                console.error("[ERROR] Failed to purge oldest version:", purgeErr.message);
-            }
-        }
-        const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(file.id);
-        const newVersion = (lastVersion.v || 0) + 1;
-
-        db.prepare('INSERT INTO versions (file_id, version_num, physical_path, size) VALUES (?, ?, ?, ?)')
-          .run(file.id, newVersion, physical_path, size);
-
-        res.json({ status: "Vaulted", version: newVersion, uuid: file.uuid });
-
-    } catch (err) {
-        console.error("Streaming Upload Failed:", err.message);
-        res.status(500).json({ error: "Gateway stream interrupted." });
     }
+
+    const busboy = Busboy({ headers: req.headers });
+    const userId = req.auth.payload.sub;
+
+    // We use a flag to ensure we only send one response
+    let isProcessing = false;
+
+    busboy.on('file', async (name, file, info) => {
+        if (isProcessing) return; // Only handle one file per request
+        isProcessing = true;
+
+        const { filename, mimeType: headerMime } = info;
+        const extensionMime = mime.lookup(filename);
+        const dangerousExtensions = ['.exe', '.sh', '.bat', '.php', '.js', '.msi'];
+        const isExecutableExt = dangerousExtensions.some(ext => filename.toLowerCase().endsWith(ext));
+        const isSpoofed = isExecutableExt && (headerMime.startsWith('image/') || headerMime.startsWith('text/'));
+
+        if (isSpoofed) {
+            console.error(`[SECURITY REJECTION] Spoof detected: ${filename} claimed to be ${headerMime}`);
+
+            // CRITICAL: You must consume the stream before sending the error
+            file.resume();
+            return res.status(403).json({
+                error: "Security Policy Violation",
+                details: "File extension and content-type mismatch detected."
+            });
+        }
+
+        // 3. PROCEED IF SAFE
+        const finalMime = (headerMime === 'application/octet-stream') ? (extensionMime || headerMime) : headerMime;
+
+        try {
+            console.log(`[GATEWAY] Ingesting: ${filename} (${finalMime}) from user ${userId}`);
+
+            // 1. FORWARD THE STREAM TO SURABAYA
+            // We send the 'file' stream from Busboy, NOT the 'req' object
+            const spokeResponse = await axios({
+                method: 'post',
+                url: `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/receive-file`,
+                data: file,
+                headers: {
+                    ...file.headers, // Keep stream headers if any
+                    'x-original-name': filename
+                },
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity,
+                decompress: false
+            });
+
+            const { physical_path, size } = spokeResponse.data;
+
+            // 2. SQL LOGIC: Find or Create the File Entry
+            // We include mime_type here!
+            let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND owner_id = ?')
+                .get(filename, userId);
+
+            if (!fileRecord) {
+                const uuid = randomUUID();
+                const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type) VALUES (?, ?, ?, ?)')
+                    .run(uuid, filename, userId, finalMime);
+                fileRecord = { id: info.lastInsertRowid, uuid: uuid };
+            } else {
+                // If the file exists, update the mime_type just in case it changed
+                db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
+            }
+
+            // 3. VERSION CLEANUP (The 5-Version Limit)
+            let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+
+            while (versions.length >= 5) {
+                const oldest = versions[0];
+                console.log(`[CLEANUP] Purging oldest version: ${oldest.physical_path}`);
+
+                try {
+                    // A. Delete from Surabaya
+                    await axios.delete(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`);
+                    // B. Delete from Jakarta SQL
+                    db.prepare('DELETE FROM versions WHERE id = ?').run(oldest.id);
+
+                    // Refresh versions list
+                    versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+                } catch (purgeErr) {
+                    console.error("[ERROR] Cleanup failed, continuing upload:", purgeErr.message);
+                }
+            }
+
+            // 4. INSERT NEW VERSION
+            const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
+            const newVersion = (lastVersion.v || 0) + 1;
+
+            // db.prepare('INSERT INTO versions (file_id, version_num, physical_path, size, timestamp) VALUES (?, ?, ?, ?, datetime("now"))')
+            //     .run(fileRecord.id, newVersion, physical_path, size);
+            db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, timestamp) VALUES (?, ?, ?, ?, datetime('now'))")
+                .run(fileRecord.id, newVersion, physical_path, size);
+
+            res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
+
+        } catch (err) {
+            console.error("Streaming Upload Failed:", err.message);
+            // If Surabaya fails, we must consume the stream to avoid hanging
+            file.resume();
+            res.status(500).json({ error: "Gateway stream interrupted." });
+        }
+    });
+
+    busboy.on('error', (err) => {
+        console.error("Busboy Error:", err);
+        res.status(500).json({ error: "Form parsing failed" });
+    });
+
+    req.pipe(busboy);
 });
+
 app.get('/vault/history/:uuid', bouncer, (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
@@ -223,7 +281,7 @@ app.get('/vault/history/:uuid', bouncer, (req, res) => {
 app.get('/vault/audit', bouncer, (req, res) => {
     // Thesis Note: In a real app, you'd check if (req.auth.payload.role === 'admin')
     // For now, we'll let the authenticated user see the system logs.
-    
+
     try {
         const logs = db.prepare(`
             SELECT 
@@ -276,7 +334,7 @@ app.get('/vault/download/:uuid', bouncer, async (req, res) => {
         if (!fileMeta) {
             return res.status(404).json({ error: "Version not found or access denied." });
         }
-        
+
         // 2. Stream from Surabaya (Same as before)
         const spokeResponse = await axios({
             method: 'get',
@@ -286,7 +344,7 @@ app.get('/vault/download/:uuid', bouncer, async (req, res) => {
 
         // 3. Set Headers (Include version in the filename for a better UX!)
         // Example: my_thesis_v3.pdf
-        const downloadName = fileMeta.filename.includes('.') 
+        const downloadName = fileMeta.filename.includes('.')
             ? fileMeta.filename.replace(/(\.[^.]+)$/, `_v${fileMeta.version_num}$1`)
             : `${fileMeta.filename}_v${fileMeta.version_num}`;
 
@@ -312,7 +370,7 @@ app.get('/vault/share/:uuid', bouncer, (req, res) => {
     try {
         // 1. Verify ownership
         const file = db.prepare('SELECT filename FROM files WHERE uuid = ? AND owner_id = ?')
-                       .get(fileUuid, userId);
+            .get(fileUuid, userId);
         if (!file) return res.status(404).json({ error: "File not found" });
 
         // 2. Create Expiry (Current time + TTL minutes)
@@ -328,14 +386,14 @@ app.get('/vault/share/:uuid', bouncer, (req, res) => {
         // 4. Construct the Public URL
         const shareLink = `${namespace}:${PUBLIC_PORT}/vault/view/${fileUuid}?expires=${expires}&sig=${signature}`;
 
-        res.json({ 
-            share_url: shareLink, 
-            expires_at: new Date(expires * 1000).toISOString() 
+        res.json({
+            share_url: shareLink,
+            expires_at: new Date(expires * 1000).toISOString()
         });
 
         // Audit Log
         db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
-          .run(userId, `SHARE_LINK_CREATED: ${file.filename}`, 'SUCCESS');
+            .run(userId, `SHARE_LINK_CREATED: ${file.filename}`, 'SUCCESS');
 
     } catch (err) {
         res.status(500).json({ error: "Failed to generate share link", details: err.message });
@@ -354,14 +412,14 @@ app.get('/vault/share/:uuid', bouncer, (req, res) => {
 
 app.use((req, res) => {
     console.warn(`[SECURITY] Blocked unauthorized path: ${req.path}`);
-    
+
     // Log the attempted intrusion
     const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
     log.run(req.auth?.payload?.sub || 'unknown', `UNAUTHORIZED_ACCESS: ${req.path}`, 'BLOCKED');
 
-    res.status(403).json({ 
-        error: "Access Denied", 
-        message: "This endpoint is not exposed via the Secure Gateway." 
+    res.status(403).json({
+        error: "Access Denied",
+        message: "This endpoint is not exposed via the Secure Gateway."
     });
 });
 

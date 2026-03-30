@@ -1,12 +1,13 @@
 const express = require('express');
-const multer = require('multer');
+// const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { get } = require('http');
-const { randomUUID } = require ('crypto');
+// const { get } = require('http');
+// const { randomUUID } = require ('crypto');
+const { Readable } =require ('stream');
 
-const newUuid = randomUUID();
+// const newUuid = randomUUID();
 require('dotenv').config();
 
 const app = express();
@@ -14,9 +15,9 @@ const PORT = 3000;
 
 // CONFIG: Ensure VAULT_KEY in .env is exactly 32 characters
 // const MASTER_KEY = process.env.VAULT_KEY; 
-const ALGORITHM = 'aes-256-gcm';
-const IV_LENGTH = 12;
-const TAG_LENGTH = 16;
+// const ALGORITHM = 'aes-256-gcm';
+// const IV_LENGTH = 12;
+// const TAG_LENGTH = 16;
 const MASTER_KEY = Buffer.from(process.env.VAULT_KEY, 'hex');
 
 // Check to make sure it's correct
@@ -26,54 +27,54 @@ if (MASTER_KEY.length !== 32) {
 
 
 // 1. STORAGE: Use MemoryStorage so the raw file never touches your disk
-const upload = multer({ storage: multer.memoryStorage() });
+// const upload = multer({ storage: multer.memoryStorage() });
 
 /**
  * Encrypts a buffer into a single [IV][TAG][DATA] blob
  */
-function encryptToVault(buffer, key) {
-    const iv = crypto.randomBytes(IV_LENGTH);
-    const cipher = crypto.createCipheriv(ALGORITHM, Buffer.from(key), iv);
+// function encryptToVault(buffer, key) {
+//     const iv = crypto.randomBytes(IV_LENGTH);
+//     const cipher = crypto.createCipheriv(ALGORITHM, Buffer.from(key), iv);
 
-    const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
-    const authTag = cipher.getAuthTag();
+//     const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
+//     const authTag = cipher.getAuthTag();
 
-    // The "Vault Header" Strategy
-    return Buffer.concat([iv, authTag, encrypted]);
-}
+//     // The "Vault Header" Strategy
+//     return Buffer.concat([iv, authTag, encrypted]);
+// }
 
-function decryptFromVault(vaultBlob, key) {
-    // 0 to 11 (12 bytes)
-    const iv = vaultBlob.subarray(0, 12);
+// function decryptFromVault(vaultBlob, key) {
+//     // 0 to 11 (12 bytes)
+//     const iv = vaultBlob.subarray(0, 12);
 
-    // 12 to 27 (16 bytes)
-    const authTag = vaultBlob.subarray(12, 28);
+//     // 12 to 27 (16 bytes)
+//     const authTag = vaultBlob.subarray(12, 28);
 
-    // 28 to end
-    const encryptedData = vaultBlob.subarray(28);
+//     // 28 to end
+//     const encryptedData = vaultBlob.subarray(28);
 
-    // Make sure 'key' here is the same Buffer format used in encryption!
-    const keyBuffer = Buffer.isBuffer(key) ? key : Buffer.from(key, 'hex');
-    console.log("Key Length:", keyBuffer.length); // Should be 32
-    console.log("Key Hex:", keyBuffer.toString('hex').substring(0, 10) + "...");
-    const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
-    decipher.setAuthTag(authTag);
+//     // Make sure 'key' here is the same Buffer format used in encryption!
+//     const keyBuffer = Buffer.isBuffer(key) ? key : Buffer.from(key, 'hex');
+//     console.log("Key Length:", keyBuffer.length); // Should be 32
+//     console.log("Key Hex:", keyBuffer.toString('hex').substring(0, 10) + "...");
+//     const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+//     decipher.setAuthTag(authTag);
 
-    return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
-}
-const METADATA_PATH = path.join(__dirname, 'vault_metadata.json');
+//     return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+// }
+// const METADATA_PATH = path.join(__dirname, 'vault_metadata.json');
 
-const getMetadata = () => {
-    try {
-        if (!fs.existsSync(METADATA_PATH)) return {};
-        const content = fs.readFileSync(METADATA_PATH, 'utf8');
-        return content ? JSON.parse(content) : {};
-    } catch (err) {
-        console.error("Metadata Error:", err);
-        return {};
-    }
-}
-const saveMetadata = (data) => fs.writeFileSync(METADATA_PATH, JSON.stringify(data, null, 2));
+// const getMetadata = () => {
+//     try {
+//         if (!fs.existsSync(METADATA_PATH)) return {};
+//         const content = fs.readFileSync(METADATA_PATH, 'utf8');
+//         return content ? JSON.parse(content) : {};
+//     } catch (err) {
+//         console.error("Metadata Error:", err);
+//         return {};
+//     }
+// }
+// const saveMetadata = (data) => fs.writeFileSync(METADATA_PATH, JSON.stringify(data, null, 2));
 
 
 
@@ -213,7 +214,7 @@ app.post('/internal/test-upload', (req, res) => {
     });
 });
 // Surabaya index.js
-import { Readable } from 'stream';
+
 
 app.get('/internal/test-download', (req, res) => {
     const totalSize = 10 * 1024 * 1024 * 1024; // 10 GB
