@@ -1,18 +1,28 @@
 const express = require('express');
 // const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs/promises');
 const crypto = require('crypto');
 // const { get } = require('http');
 // const { randomUUID } = require ('crypto');
 const { Readable } =require ('stream');
-
+// import fs from 'fs/promises';
 // const newUuid = randomUUID();
 require('dotenv').config();
 
 const app = express();
 const PORT = 3000;
 
+app.use(express.json({ 
+    limit: '1mb', 
+    strict: true 
+}));
+
+// 2. For standard form data (if you ever use it)
+app.use(express.urlencoded({ 
+    limit: '1mb', 
+    extended: true 
+}));
 // CONFIG: Ensure VAULT_KEY in .env is exactly 32 characters
 // const MASTER_KEY = process.env.VAULT_KEY; 
 // const ALGORITHM = 'aes-256-gcm';
@@ -25,6 +35,7 @@ if (MASTER_KEY.length !== 32) {
     throw new Error("VAULT_KEY must be a 64-character hex string (32 bytes)");
 }
 
+const STORAGE_DIR = path.join(__dirname, 'vault_storage');
 
 // 1. STORAGE: Use MemoryStorage so the raw file never touches your disk
 // const upload = multer({ storage: multer.memoryStorage() });
@@ -215,6 +226,21 @@ app.post('/internal/test-upload', (req, res) => {
 });
 // Surabaya index.js
 
+app.get('/internal/list-files', async (req, res) => {
+
+    try {
+        const files = await fs.readdir(STORAGE_DIR);
+        
+        // Filter out hidden files like .gitignore if necessary
+        const physicalFiles = files.filter(f => !f.startsWith('.'));
+        
+        console.log(`[MAINTENANCE] Reporting ${physicalFiles.length} files to Jakarta Hub.`);
+        res.json(physicalFiles);
+    } catch (err) {
+        console.error("[SPOKE ERROR] Disk scan failed:", err.message);
+        res.status(500).json({ error: "Could not read storage directory." });
+    }
+});
 
 app.get('/internal/test-download', (req, res) => {
     const totalSize = 10 * 1024 * 1024 * 1024; // 10 GB
@@ -273,17 +299,43 @@ app.get('/hello', (req, res) => {
 // });
 
 // index.js (Surabaya Spoke)
-app.delete('/vault/delete/:filename', (req, res) => {
-    const filename = req.params.filename;
-    const filePath = path.join(__dirname, 'vault_storage', filename);
+// 1. SINGLE DELETE (Improved)
+app.delete('/vault/delete/:filename', async (req, res) => {
+    // Sanitize to prevent Path Traversal
+    const safeName = path.basename(req.params.filename); 
+    const filePath = path.join(STORAGE_DIR, safeName);
 
-    if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath); // Actually deletes from the hard drive
-        console.log(`[SPOKE] Deleted physical file: ${filename}`);
-        res.status(200).json({ status: "Deleted" });
-    } else {
+    try {
+        await fs.access(filePath); // Check if exists
+        await fs.unlink(filePath); // Async delete
+        console.log(`[SPOKE] Purged: ${safeName}`);
+        res.json({ status: "Deleted" });
+    } catch (err) {
         res.status(404).json({ error: "File not found" });
     }
+});
+
+// 2. BULK PURGE (For your Audit/Sync)
+app.post('/internal/purge-orphans', async (req, res) => {
+    const { files } = req.body; // Array of filenames from the Jakarta Audit
+
+    if (!Array.isArray(files)) return res.status(400).send("Invalid list.");
+
+    const results = { success: 0, failed: 0 };
+
+    // Delete everything in parallel!
+    await Promise.all(files.map(async (filename) => {
+        try {
+            const safeName = path.basename(filename);
+            await fs.unlink(path.join(STORAGE_DIR, safeName));
+            results.success++;
+        } catch (err) {
+            results.failed++;
+        }
+    }));
+
+    console.log(`[MAINTENANCE] Bulk Purge Complete: ${results.success} removed.`);
+    res.json(results);
 });
 // app.get('/serve-file/:filename', (req, res) => {
 //     // const filePath = path.join(STORAGE_DIR, req.params.path);
@@ -379,5 +431,3 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));

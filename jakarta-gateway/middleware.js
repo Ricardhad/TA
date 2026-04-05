@@ -4,17 +4,24 @@ import db from './db.js';
 
 export const permitGlobalRole = (requiredRole) => {
     return (req, res, next) => {
-        // Auth0 usually puts roles in a custom claim via an 'Action'
-        // Replace 'NAMESPACE' with your DuckDNS string
         const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
-        const userRoles = req.auth.payload[`${namespace}/roles`] || [];
+        const userRolesArray = req.auth.payload[`${namespace}/roles`] || [];
+        
+        // 1. Get the "best" role the user has
+        const primaryRole = userRolesArray.find(r => ['admin', 'standard_user'].includes(r));
 
-        if (userRoles.includes(requiredRole)) {
-            return next();
+        if (!primaryRole) {
+            return res.status(403).json({ error: "Access Denied: No valid global role found." });
         }
 
-        console.warn(`[SECURITY] Audit Access Denied: User ${req.auth.payload.sub} is not a ${requiredRole}`);
-        res.status(403).json({ error: "Forbidden: System Admin Clearance Required." });
+        // 2. Compare using your hierarchy
+        const hierarchy = { 'standard_user': 1, 'admin': 2 };
+        
+        if (hierarchy[primaryRole] < hierarchy[requiredRole]) {
+            return res.status(403).json({ error: `Forbidden: Requires ${requiredRole} clearance.` });
+        }
+        req.globalRole = primaryRole;
+        next();
     };
 };
 export const authorizeVault = (requiredRole = 'VIEWER') => {

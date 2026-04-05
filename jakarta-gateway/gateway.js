@@ -15,11 +15,16 @@ import helmet from 'helmet';
 import Busboy from 'busboy';
 import mime from 'mime-types';
 import { Readable } from 'node:stream';
-import { authorizeVault, validateFileSecurity ,permitGlobalRole} from './middleware.js';
+import { authorizeVault, validateFileSecurity, permitGlobalRole } from './middleware.js';
+// import e from 'express';
 
 const app = express();
 const PUBLIC_PORT = 8080;
 // const proxy = httpProxy.createProxyServer({});
+app.use(express.json({ 
+    limit: '1mb', 
+    strict: true 
+}));
 
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
@@ -53,7 +58,7 @@ app.get('/vault/view/:uuid', async (req, res) => {
             return res.status(403).send("Invalid signature. Link may have been tampered with.");
         }
 
-       const fileMeta = db.prepare(`
+        const fileMeta = db.prepare(`
             SELECT f.filename, f.mime_type, v.physical_path, v.size 
             FROM files f JOIN versions v ON f.id = v.file_id 
             WHERE f.uuid = ? ORDER BY v.version_num DESC LIMIT 1
@@ -103,7 +108,7 @@ app.use((req, res, next) => {
 
 
 
-app.get('/vault/metadata',(req, res) => {
+app.get('/vault/metadata', permitGlobalRole('admin'), (req, res) => {
     const userId = req.auth.payload.sub; // Get the Auth0 ID
 
     try {
@@ -129,7 +134,7 @@ app.get('/vault/identity', (req, res) => {
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
     // const object = req.auth?.payload || 'anonymous';
     try {
-        res.json({ message: "username retrieved", user: userEmail, roles: userRoles});
+        res.json({ message: "username retrieved", user: userEmail, roles: userRoles });
     } catch (err) {
         console.error("SQL Error:", err);
         res.status(500).json({ error: "Database query failed" });
@@ -142,9 +147,11 @@ const sslOptions = {
 };
 
 
-app.post('/vault/upload',  (req, res) => {
+app.post('/vault/upload', (req, res) => {
     const contentType = req.headers['content-type'];
-
+    const contentLength = req.headers['content-length'];
+    const MAX_SIZE = 50 * 1024 * 1024; // 50MB
+    
     if (!contentType || !contentType.includes('multipart/form-data')) {
         console.error(`[GATEWAY] Blocked request with invalid Content-Type: ${contentType}`);
         return res.status(400).json({
@@ -152,18 +159,39 @@ app.post('/vault/upload',  (req, res) => {
             details: "Content-Type must be multipart/form-data"
         });
     }
-
-    const busboy = Busboy({ headers: req.headers });
+        const busboy = Busboy({
+        headers: req.headers,
+        limits: {
+            fileSize: MAX_SIZE, // 50MB Limit
+            files: 1                    // Only allow 1 file per request
+        }
+    });
     const userId = req.auth.payload.sub;
 
     // We use a flag to ensure we only send one response
     let isProcessing = false;
+    let limitReached = false; // Flag to stop SQL logic if file is too big
+
+    // EARLY REJECT: Check the header before even starting Busboy
+    if (contentLength && parseInt(contentLength) > MAX_SIZE) {
+        console.warn(`[SECURITY] Early Reject: Header claims ${contentLength} bytes.`);
+        return res.status(413).json({ 
+            error: "File Too Large", 
+            message: "Header indicates file exceeds 50MB limit." 
+        });
+    }
+
 
     busboy.on('file', async (name, file, info) => {
         if (isProcessing) return; // Only handle one file per request
         isProcessing = true;
         const { filename, mimeType: headerMime } = info;
         const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime);
+        file.on('limit', () => {
+            limitReached = true; 
+            console.error(`[SECURITY] File too large: ${filename}`);
+            // We don't respond here yet because the 'try' block might be mid-fetch
+        });
         try {
             console.log(`[GATEWAY] Ingesting: ${filename} (${finalMime}) from user ${userId}`);
             if (isSpoofed) {
@@ -198,6 +226,9 @@ app.post('/vault/upload',  (req, res) => {
                 // maxBodyLength: Infinity,
                 // decompress: false
             });
+            if (limitReached) {
+                return res.status(413).json({ error: "File Too Large (Max 50MB)" });
+            }
             if (!spokeResponse.ok) {
                 const errorText = await spokeResponse.text();
                 throw new Error(`Spoke rejected upload: ${errorText}`);
@@ -253,6 +284,7 @@ app.post('/vault/upload',  (req, res) => {
             db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, timestamp) VALUES (?, ?, ?, ?, datetime('now'))")
                 .run(fileRecord.id, newVersion, physical_path, size);
 
+
             res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
 
         } catch (err) {
@@ -291,7 +323,7 @@ app.get('/vault/history/:uuid', authorizeVault('VIEWER'), (req, res) => {
     }
 });
 
-app.get('/vault/audit',permitGlobalRole('admin'),  (req, res) => {
+app.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
     // Thesis Note: In a real app, you'd check if (req.auth.payload.role === 'admin')
     // For now, we'll let the authenticated user see the system logs.
 
@@ -317,23 +349,21 @@ app.get('/vault/audit',permitGlobalRole('admin'),  (req, res) => {
 // gateway.js (
 // gateway.js (Jakarta VM)
 
-app.get('/vault/download/:uuid',authorizeVault('VIEWER'), async (req, res) => {
+app.get('/vault/download/:uuid', authorizeVault('VIEWER'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
-
+    const requestedVersion = req.query.v;
     try {
         // 1. Get metadata (Join files and the LATEST version)
         const fileInfo = db.prepare(`
-            SELECT f.filename, f.mime_type, v.physical_path, v.size 
-            FROM files f
-            JOIN versions v ON f.id = v.file_id
-            WHERE f.uuid = ? AND f.owner_id = ?
+            SELECT f.filename, v.id as v_id, v.physical_path 
+            FROM files f JOIN versions v ON f.id = v.file_id
+            WHERE f.uuid = ? AND f.owner_id = ? 
+            ${requestedVersion ? 'AND v.version_num = ?' : ''}
             ORDER BY v.version_num DESC LIMIT 1
-        `).get(uuid, userId);
+        `).get(requestedVersion ? [uuid, userId, requestedVersion] : [uuid, userId]);
 
-        if (!fileInfo) {
-            return res.status(404).json({ error: "File not found or access denied." });
-        }
+        if (!fileInfo) return res.status(404).json({ error: "Version not found." });
 
         console.log(`[GATEWAY] Streaming ${fileInfo.filename} from Surabaya for user ${userId}`);
 
@@ -416,8 +446,28 @@ app.get('/vault/download/:uuid',authorizeVault('VIEWER'), async (req, res) => {
 //         res.status(500).json({ error: "Secure Tunnel Interrupted" });
 //     }
 // });
+app.get('/vault/list', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
 
-app.get('/vault/share/:uuid',  authorizeVault('OWNER'),(req, res) => {
+    try {
+        let query, params;
+
+        if (req.globalRole === 'admin') {
+            query = `SELECT f.uuid, f.filename, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
+            params = [];
+        } else {
+            query = `SELECT DISTINCT f.uuid, f.filename, v.size FROM files f JOIN versions v ON f.id = v.file_id LEFT JOIN file_access fa ON f.uuid = fa.file_uuid WHERE (f.owner_id = ? OR fa.user_id = ?) AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
+            params = [userId, userId];
+        }
+
+        res.json(db.prepare(query).all(...params));
+    } catch (err) {
+        res.status(500).json({ error: "List failed." });
+    }
+}
+);
+
+app.get('/vault/share/:uuid', authorizeVault('OWNER'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
     const ttl = parseInt(req.query.ttl) || 60; // Default 60 minutes
@@ -455,6 +505,142 @@ app.get('/vault/share/:uuid',  authorizeVault('OWNER'),(req, res) => {
     }
 });
 
+app.delete('/vault/delete/:uuid', authorizeVault('OWNER'), async (req, res) => {
+    const { uuid } = req.params;
+    const userId = req.auth.payload.sub;
+    const requestedVersion = req.query.v;
+
+    try {
+        // 1. Fetch metadata INCLUDING the version ID (v_id)
+        const fileInfo = db.prepare(`
+            SELECT f.filename, v.id as v_id, v.physical_path 
+            FROM files f JOIN versions v ON f.id = v.file_id
+            WHERE f.uuid = ? AND f.owner_id = ? 
+            ${requestedVersion ? 'AND v.version_num = ?' : ''}
+            ORDER BY v.version_num DESC LIMIT 1
+        `).get(requestedVersion ? [uuid, userId, requestedVersion] : [uuid, userId]);
+
+        if (!fileInfo) return res.status(404).json({ error: "Version not found." });
+
+        // 2. Physical Purge First (The "Body")
+        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${fileInfo.physical_path}`, { method: 'DELETE' });
+
+        if (!spokeResponse.ok) {
+            // Log the failure! The file is still there, so don't touch the DB yet.
+            db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+                .run(userId, `DELETE_FAILED: ${fileInfo.filename}`, 'SPOKE_ERROR');
+            throw new Error("Surabaya Spoke refused to delete the bytes.");
+        }
+
+        // 3. Metadata Purge Second (The "Brain")
+        db.prepare('DELETE FROM versions WHERE id = ?').run(fileInfo.v_id);
+
+        // 4. Success Audit
+        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+            .run(userId, `DELETE_SUCCESS: ${fileInfo.filename}`, 'SUCCESS');
+
+        res.status(200).json({ status: `Version of ${fileInfo.filename} purged.` });
+
+    } catch (err) {
+        console.error("Delete Error:", err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
+    try {
+        const dbFiles = db.prepare(`
+            SELECT v.physical_path, f.filename 
+            FROM versions v 
+            JOIN files f ON v.file_id = f.id
+        `).all();
+
+        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/list-files`);
+
+        // 1. Check if the Spoke is even awake
+        if (!spokeResponse.ok) {
+            throw new Error(`Spoke unreachable: ${spokeResponse.status} ${spokeResponse.statusText}`);
+        }
+
+        const physicalFiles = await spokeResponse.json();
+
+        // 2. THE FIX: Ensure physicalFiles is an Array
+        if (!Array.isArray(physicalFiles)) {
+            console.error("[AUDIT] Expected Array but got:", typeof physicalFiles, physicalFiles);
+            return res.status(502).json({ error: "Spoke returned invalid data format." });
+        }
+
+        // 3. Perform the Set Theory logic
+        const missingFromDisk = dbFiles.filter(dbFile => !physicalFiles.includes(dbFile.physical_path));
+        const orphanedOnDisk = physicalFiles.filter(pPath => !dbFiles.some(dbFile => dbFile.physical_path === pPath));
+
+        res.json({
+            status: "Audit Complete",
+            results: { missingFromDisk, orphanedOnDisk }
+        });
+
+    } catch (err) {
+        console.error("Integrity Audit Failed:", err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+app.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
+    const { missingFromDisk, orphanedOnDisk } = req.body;
+
+    // 0. Payload Validation
+    if (!Array.isArray(missingFromDisk) || !Array.isArray(orphanedOnDisk)) {
+        return res.status(400).json({ error: "Invalid payload: Expected arrays." });
+    }
+
+    const report = { pruned: 0, purged: 0, skipped: 0 };
+
+    try {
+        if (missingFromDisk.length > 0) {
+            const checkStmt = db.prepare('SELECT id FROM versions WHERE physical_path = ?');
+            const deleteStmt = db.prepare('DELETE FROM versions WHERE physical_path = ?');
+
+            for (const file of missingFromDisk) {
+                // Verify the record STILL exists in the DB before pruning
+                const exists = checkStmt.get(file.physical_path);
+                if (exists) {
+                    deleteStmt.run(file.physical_path);
+                    report.pruned++;
+                } else {
+                    report.skipped++; // Already gone or invalid path
+                }
+            }
+        }
+
+        if (orphanedOnDisk.length > 0) {
+            // Sanity Check: Ensure these paths DON'T actually have a record now
+            // (To prevent accidental deletion of a file that was JUST uploaded)
+            const checkDB = db.prepare('SELECT id FROM versions WHERE physical_path = ?');
+            const validOrphans = orphanedOnDisk.filter(path => !checkDB.get(path));
+
+            if (validOrphans.length > 0) {
+                const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/purge-orphans`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ files: validOrphans })
+                });
+
+                if (spokeResponse.ok) {
+                    const spokeData = await spokeResponse.json();
+                    report.purged = spokeData.success;
+                }
+            }
+        }
+
+        res.json({
+            message: "Synchronization Complete",
+            report,
+            details: `Successfully cleaned ${report.pruned} DB records and ${report.purged} disk files.`
+        });
+
+    } catch (err) {
+        console.error("[SYNC ERROR]", err.message);
+        res.status(500).json({ error: "Sync operation failed.", details: err.message });
+    }
+});
 // const internalOnly = ['/spoke-status', '/spoke-logs'];
 
 // app.all(/^(\/.*)/, bouncer, (req, res, next) => {
