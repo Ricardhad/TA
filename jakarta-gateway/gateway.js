@@ -1,30 +1,98 @@
-dotenv.config();
 import https from 'https';
 import fs from 'fs';
 import express from 'express';
-import httpProxy from 'http-proxy';
 import dotenv from 'dotenv';
 import { auth } from 'express-oauth2-jwt-bearer';
 import cors from 'cors';
 import db from './db.js';
-// import axios from 'axios';
-// import FormData from 'form-data';
 import { randomUUID } from 'crypto';
 import crypto from 'crypto';
 import helmet from 'helmet';
 import Busboy from 'busboy';
-import mime from 'mime-types';
 import { Readable } from 'node:stream';
-import { authorizeVault, validateFileSecurity, permitGlobalRole } from './middleware.js';
+import { authorizeVault, validateFileSecurity, permitGlobalRole ,authorizeBucket} from './middleware.js';
+// import { permission } from 'node:process';
+dotenv.config();
+// import axios from 'axios';
+// import httpProxy from 'http-proxy';
+// import FormData from 'form-data';
+// import mime from 'mime-types';
 // import e from 'express';
 
 const app = express();
 const PUBLIC_PORT = 8080;
 // const proxy = httpProxy.createProxyServer({});
-app.use(express.json({ 
-    limit: '1mb', 
-    strict: true 
+app.use(express.json({
+    limit: '1mb',
+    strict: true
 }));
+
+// HELPER: Fetch M2M Token from Auth0 (Jakarta Hub)
+let cachedM2MToken = null;
+let tokenExpiry = 0;
+
+async function getSpokeToken() {
+    const now = Math.floor(Date.now() / 1000);
+    
+    if (cachedM2MToken && now < tokenExpiry) {
+        console.log(`[AUTH] Using cached token ending in: ...${cachedM2MToken.slice(-5)}`);
+        return cachedM2MToken;
+    }
+
+    console.log("[AUTH] Fetching fresh M2M token from Auth0...");
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            client_id: process.env.M2M_CLIENT_ID,
+            client_secret: process.env.M2M_CLIENT_SECRET,
+            audience: process.env.NAMESPACE, 
+            grant_type: 'client_credentials'
+        })
+    });
+
+    const data = await response.json();
+
+    // DIAGNOSTIC: If there is no access_token, Auth0 usually sends an 'error' field
+    if (!data.access_token) {
+        console.error("[AUTH ERROR] Auth0 denied the request:", data);
+        throw new Error(`Auth0 Authentication Failed: ${data.error_description || data.error}`);
+    }
+
+    cachedM2MToken = data.access_token;
+    tokenExpiry = now + data.expires_in - 60;
+    
+    console.log(`[AUTH] New token issued ending in: ...${cachedM2MToken.slice(-5)}`);
+    return cachedM2MToken;
+}
+
+// const m2mToken = await getSpokeToken();
+
+async function spokeFetch(path, options = {}) {
+    const token = await getSpokeToken(); // Automatically gets cached or fresh token
+    const url = `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}${path}`;
+
+    const headers = {
+        ...options.headers,
+        'Authorization': `Bearer ${token}`
+    };
+
+    return fetch(url, { ...options, headers });
+}
+async function checkSpokeHealth() {
+    try {
+        const response = await spokeFetch('/internal/health');
+        if (response.ok) {
+            console.log("[TELEMETRY] Spoke is Healthy");
+            // Optionally update a value in your DB or memory
+        }
+    } catch (err) {
+        console.error("[TELEMETRY] Spoke Unreachable!");
+    }
+}
+
+// Run every 5 minutes
+setInterval(checkSpokeHealth, 5 * 60 * 1000);
 
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
@@ -36,11 +104,11 @@ const bouncer = auth({
     issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
     tokenSigningAlg: 'RS256'
 });
+app.get('/health', (req, res) => res.send("OK"));
 
 app.get('/vault/view/:uuid', async (req, res) => {
     const { uuid } = req.params;
-    const { expires, sig } = req.query;
-
+    const { expires, sig, permission } = req.query; // FIX: No more node:process!
     try {
         // 1. Verify Expiration
         if (Math.floor(Date.now() / 1000) > parseInt(expires)) {
@@ -51,13 +119,10 @@ app.get('/vault/view/:uuid', async (req, res) => {
         const secret = process.env.URL_SIGNING_SECRET;
         const expectedSig = crypto
             .createHmac('sha256', secret)
-            .update(`${uuid}:${expires}`)
+            .update(`${uuid}:${expires}:${permission}`)
             .digest('hex');
 
-        if (sig !== expectedSig) {
-            return res.status(403).send("Invalid signature. Link may have been tampered with.");
-        }
-
+        if (sig !== expectedSig) return res.status(403).send("Invalid signature.");
         const fileMeta = db.prepare(`
             SELECT f.filename, f.mime_type, v.physical_path, v.size 
             FROM files f JOIN versions v ON f.id = v.file_id 
@@ -67,14 +132,18 @@ app.get('/vault/view/:uuid', async (req, res) => {
         if (!fileMeta) return res.status(404).send("File no longer exists.");
 
         // 1. CORRECT FETCH SYNTAX (URL must be a string)
-        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/serve-file/${fileMeta.physical_path}`);
+        const spokeResponse = await spokeFetch(`/internal/files/${fileMeta.physical_path}`);
 
         if (!spokeResponse.ok) throw new Error("Spoke failed to provide file.");
 
         // 2. CORRECT HEADERS
         res.setHeader('Content-Type', fileMeta.mime_type || 'application/octet-stream');
-        res.setHeader('Content-Disposition', `inline; filename="${fileMeta.filename}"`);
-
+        // res.setHeader('Content-Disposition', `inline; filename="${fileMeta.filename}"`);
+        if (permission === 'viewable') {
+            res.setHeader('Content-Disposition', 'inline'); // Open in browser
+        } else {
+            res.setHeader('Content-Disposition', `attachment; filename="${fileMeta.filename}"`); // Force download
+        }
         // 3. CORRECT PIPING (Fetch body is a Web Stream)
         Readable.fromWeb(spokeResponse.body).pipe(res);
 
@@ -105,25 +174,61 @@ app.use((req, res, next) => {
     log.run(userEmail, `${req.method} ${req.path}`, 'AUTHORIZED');
     next();
 });
+// Jakarta Hub (gateway.js)
+app.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    const ADMIN_QUOTA_LIMIT = 50 * 1024 * 1024 * 1024; // 50gb
+    const QUOTA_LIMIT = 5 * 1024 * 1024 * 1024; // 5gb
+     const activeLimit = (userRole === 'admin') ? ADMIN_QUOTA_LIMIT : QUOTA_LIMIT;
+    try {
+        const usage = db.prepare(`
+            SELECT SUM(v.size) as total_used 
+            FROM versions v 
+            JOIN files f ON v.file_id = f.id 
+            WHERE f.owner_id = ?
+        `).get(userId);
 
+        const totalUsed = usage.total_used || 0;
 
-
-app.get('/vault/metadata', permitGlobalRole('admin'), (req, res) => {
-    const userId = req.auth.payload.sub; // Get the Auth0 ID
+        res.json({
+            used_bytes: totalUsed,
+            quota_bytes: activeLimit,
+            percent_used: ((totalUsed / activeLimit) * 100).toFixed(2)
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Could not calculate usage." });
+    }
+});
+// get files list
+app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    const search = req.query.search ? `%${req.query.search}%` : '%';
 
     try {
-        const query = db.prepare(`
-            SELECT f.uuid, f.filename, v.version_num, v.timestamp, v.size, f.mime_type
-            FROM files f
-            JOIN versions v ON f.id = v.file_id
-            WHERE f.owner_id = ?
-            AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
-        `);
+        let query, results;
 
-        const files = query.all(userId);
-        res.json(files);
+        if (req.globalRole === 'admin') {
+            query = db.prepare(`
+                SELECT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
+                FROM files f JOIN versions v ON f.id = v.file_id 
+                WHERE f.filename LIKE ? 
+                AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
+            `);
+            results = query.all(search);
+        } else {
+            query = db.prepare(`
+                SELECT DISTINCT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
+                FROM files f JOIN versions v ON f.id = v.file_id 
+                LEFT JOIN file_access fa ON f.uuid = fa.file_uuid 
+                WHERE (f.owner_id = ? OR fa.user_id = ?) 
+                AND f.filename LIKE ?
+                AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
+            `);
+            results = query.all(userId, userId, search);
+        }
+
+        res.json(results);
     } catch (err) {
-        console.error("SQL Error:", err);
         res.status(500).json({ error: "Database query failed" });
     }
 });
@@ -146,12 +251,15 @@ const sslOptions = {
     cert: fs.readFileSync('/etc/letsencrypt/live/richardgatewayta.duckdns.org/fullchain.pem')
 };
 
-
-app.post('/vault/upload', (req, res) => {
+// upload
+app.post('/vault/files', (req, res) => {
+    const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
+    const USER_QUOTA = 5 * 1024 * 1024 * 1024; // 5gb Limit 
+    const MAX_SIZE = 1 * 1024 * 1024 * 1024; // 1gb Limit 
     const contentType = req.headers['content-type'];
     const contentLength = req.headers['content-length'];
-    const MAX_SIZE = 50 * 1024 * 1024; // 50MB
-    
+    const activeLimit = (userRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
+
     if (!contentType || !contentType.includes('multipart/form-data')) {
         console.error(`[GATEWAY] Blocked request with invalid Content-Type: ${contentType}`);
         return res.status(400).json({
@@ -159,7 +267,7 @@ app.post('/vault/upload', (req, res) => {
             details: "Content-Type must be multipart/form-data"
         });
     }
-        const busboy = Busboy({
+    const busboy = Busboy({
         headers: req.headers,
         limits: {
             fileSize: MAX_SIZE, // 50MB Limit
@@ -175,9 +283,9 @@ app.post('/vault/upload', (req, res) => {
     // EARLY REJECT: Check the header before even starting Busboy
     if (contentLength && parseInt(contentLength) > MAX_SIZE) {
         console.warn(`[SECURITY] Early Reject: Header claims ${contentLength} bytes.`);
-        return res.status(413).json({ 
-            error: "File Too Large", 
-            message: "Header indicates file exceeds 50MB limit." 
+        return res.status(413).json({
+            error: "File Too Large",
+            message: "Header indicates file exceeds 50MB limit."
         });
     }
 
@@ -188,11 +296,26 @@ app.post('/vault/upload', (req, res) => {
         const { filename, mimeType: headerMime } = info;
         const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime);
         file.on('limit', () => {
-            limitReached = true; 
+            limitReached = true;
             console.error(`[SECURITY] File too large: ${filename}`);
             // We don't respond here yet because the 'try' block might be mid-fetch
         });
         try {
+            const usage = db.prepare(`
+                SELECT SUM(v.size) as total_used 
+                FROM versions v 
+                JOIN files f ON v.file_id = f.id 
+                WHERE f.owner_id = ?
+            `).get(userId);
+
+            const currentTotal = usage.total_used || 0;
+
+            if (currentTotal >= activeLimit) {
+                return res.status(403).json({
+                    error: "Quota Exceeded",
+                    message: `You have used ${(currentTotal / 1024 / 1024 / 1024).toFixed(2)} GB of your ${activeLimit / 1024 / 1024 / 1024} GB limit.`
+                });
+            }
             console.log(`[GATEWAY] Ingesting: ${filename} (${finalMime}) from user ${userId}`);
             if (isSpoofed) {
                 console.error(`[SECURITY] Blocked: ${filename}`);
@@ -214,7 +337,7 @@ app.post('/vault/upload', (req, res) => {
             //     maxBodyLength: Infinity,
             //     decompress: false
             // });
-            const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/receive-file`, {
+            const spokeResponse = await spokeFetch(`/internal/files`, {
                 method: 'POST',
                 body: file, // This is your Busboy file stream
                 // CRITICAL for streaming request bodies in Fetch:
@@ -262,7 +385,7 @@ app.post('/vault/upload', (req, res) => {
                 try {
                     // A. Delete from Surabaya
                     // await axios.delete(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`);
-                    await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${oldest.physical_path}`, {
+                    await spokeFetch(`/vault/delete/${oldest.physical_path}`, {
                         method: 'DELETE'
                     });
                     // B. Delete from Jakarta SQL
@@ -302,8 +425,8 @@ app.post('/vault/upload', (req, res) => {
 
     req.pipe(busboy);
 });
-
-app.get('/vault/history/:uuid', authorizeVault('VIEWER'), (req, res) => {
+// get details
+app.get('/vault/files/:uuid/versions', authorizeVault('VIEWER'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
 
@@ -322,10 +445,8 @@ app.get('/vault/history/:uuid', authorizeVault('VIEWER'), (req, res) => {
         res.status(500).json({ error: "Failed to retrieve history" });
     }
 });
-
+// logging
 app.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
-    // Thesis Note: In a real app, you'd check if (req.auth.payload.role === 'admin')
-    // For now, we'll let the authenticated user see the system logs.
 
     try {
         const logs = db.prepare(`
@@ -349,14 +470,14 @@ app.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
 // gateway.js (
 // gateway.js (Jakarta VM)
 
-app.get('/vault/download/:uuid', authorizeVault('VIEWER'), async (req, res) => {
+app.get('/vault/files/:uuid/content', authorizeVault('VIEWER'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
     const requestedVersion = req.query.v;
     try {
         // 1. Get metadata (Join files and the LATEST version)
         const fileInfo = db.prepare(`
-            SELECT f.filename, v.id as v_id, v.physical_path 
+            SELECT f.filename,f.mime_type, v.physical_path, v.size
             FROM files f JOIN versions v ON f.id = v.file_id
             WHERE f.uuid = ? AND f.owner_id = ? 
             ${requestedVersion ? 'AND v.version_num = ?' : ''}
@@ -368,12 +489,12 @@ app.get('/vault/download/:uuid', authorizeVault('VIEWER'), async (req, res) => {
         console.log(`[GATEWAY] Streaming ${fileInfo.filename} from Surabaya for user ${userId}`);
 
         // 2. Request the stream from the Surabaya Spoke
-        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/serve-file/${fileInfo.physical_path}`);
+        const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`);
 
         if (!spokeResponse.ok) throw new Error("Spoke failed to provide file stream.");
 
         // 3. Set headers so the browser knows what to do
-        res.setHeader('Content-Type', fileInfo.mime_type);
+        res.setHeader('Content-Type', fileInfo.mime_type || 'application/octet-stream');
         res.setHeader('Content-Length', fileInfo.size);
         // This forces the "Save As" dialog with the original filename
         res.setHeader('Content-Disposition', `attachment; filename="${fileInfo.filename}"`);
@@ -446,31 +567,32 @@ app.get('/vault/download/:uuid', authorizeVault('VIEWER'), async (req, res) => {
 //         res.status(500).json({ error: "Secure Tunnel Interrupted" });
 //     }
 // });
-app.get('/vault/list', permitGlobalRole('standard_user'), (req, res) => {
-    const userId = req.auth.payload.sub;
+// app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
+//     const userId = req.auth.payload.sub;
 
-    try {
-        let query, params;
+//     try {
+//         let query, params;
+//         console.log(`[GATEWAY] Fetching file list for user ${userId} with role ${req.globalRole}`);
+//         if (req.globalRole === 'admin') {
+//             query = `SELECT f.uuid, f.filename,f.bucket_id, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
+//             params = [];
+//         } else {
+//             query = `SELECT DISTINCT f.uuid, f.filename,f.bucket_id, v.size FROM files f JOIN versions v ON f.id = v.file_id LEFT JOIN file_access fa ON f.uuid = fa.file_uuid WHERE (f.owner_id = ? OR fa.user_id = ?) AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
+//             params = [userId, userId];
+//         }
 
-        if (req.globalRole === 'admin') {
-            query = `SELECT f.uuid, f.filename, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
-            params = [];
-        } else {
-            query = `SELECT DISTINCT f.uuid, f.filename, v.size FROM files f JOIN versions v ON f.id = v.file_id LEFT JOIN file_access fa ON f.uuid = fa.file_uuid WHERE (f.owner_id = ? OR fa.user_id = ?) AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
-            params = [userId, userId];
-        }
+//         res.json(db.prepare(query).all(...params));
+//     } catch (err) {
+//         res.status(500).json({ error: "List failed." });
+//     }
+// }
+// );
 
-        res.json(db.prepare(query).all(...params));
-    } catch (err) {
-        res.status(500).json({ error: "List failed." });
-    }
-}
-);
-
-app.get('/vault/share/:uuid', authorizeVault('OWNER'), (req, res) => {
+app.get('/vault/files/:uuid/links', authorizeVault('OWNER'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
     const ttl = parseInt(req.query.ttl) || 60; // Default 60 minutes
+    const permission = req.query.permission === 'downloadable' ? 'downloadable' : 'viewable';
 
     try {
         // 1. Verify ownership
@@ -485,7 +607,7 @@ app.get('/vault/share/:uuid', authorizeVault('OWNER'), (req, res) => {
         const secret = process.env.URL_SIGNING_SECRET;
         const signature = crypto
             .createHmac('sha256', secret)
-            .update(`${fileUuid}:${expires}`)
+            .update(`${fileUuid}:${expires}:${permission}`)
             .digest('hex');
 
         // 4. Construct the Public URL
@@ -505,7 +627,7 @@ app.get('/vault/share/:uuid', authorizeVault('OWNER'), (req, res) => {
     }
 });
 
-app.delete('/vault/delete/:uuid', authorizeVault('OWNER'), async (req, res) => {
+app.delete('/vault/files/:uuid', authorizeVault('OWNER'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
     const requestedVersion = req.query.v;
@@ -523,7 +645,7 @@ app.delete('/vault/delete/:uuid', authorizeVault('OWNER'), async (req, res) => {
         if (!fileInfo) return res.status(404).json({ error: "Version not found." });
 
         // 2. Physical Purge First (The "Body")
-        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/vault/delete/${fileInfo.physical_path}`, { method: 'DELETE' });
+        const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, { method: 'DELETE' });
 
         if (!spokeResponse.ok) {
             // Log the failure! The file is still there, so don't touch the DB yet.
@@ -546,6 +668,96 @@ app.delete('/vault/delete/:uuid', authorizeVault('OWNER'), async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+app.post('/vault/buckets', bouncer, (req, res) => {
+    const { name, region } = req.body || {} ;
+    const userId = req.auth.payload.sub;
+    const bucketUuid = randomUUID();
+
+    try {
+        const info = db.prepare(`
+            INSERT INTO buckets (uuid, name, owner_id, region) 
+            VALUES (?, ?, ?, ?)
+        `).run(bucketUuid, name, userId, region || 'sub-01');
+
+        // Automatically give the owner ADMIN permission
+        db.prepare(`
+            INSERT INTO bucket_policies (bucket_id, grantee_id, permission) 
+            VALUES (?, ?, 'ADMIN')
+        `).run(info.lastInsertRowid, userId);
+
+        res.json({ status: "Bucket Created", uuid: bucketUuid });
+    } catch (err) {
+        res.status(500).json({ error: "Could not create bucket." });
+    }
+});
+
+app.get('/vault/buckets',  (req, res) => {
+    const userId = req.auth.payload.sub;
+    
+    try {
+        const buckets = db.prepare(`
+            SELECT b.uuid, b.name, b.region 
+            FROM buckets b 
+            JOIN bucket_policies bp ON b.id = bp.bucket_id 
+            WHERE bp.grantee_id = ?
+        `).all(userId);
+        res.json({ buckets });
+    } catch (err) {
+        res.status(500).json({ error: "Could not fetch buckets." });
+    }
+});
+app.post('/vault/buckets/:bucketUuid/share', authorizeBucket('ADMIN'), (req, res) => {
+    const { bucketUuid } = req.params;
+    const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
+
+    // 1. Validation
+    if (!grantee_id || !['READ', 'WRITE'].includes(permission)) {
+        return res.status(400).json({ error: "Invalid request. Need grantee_id and permission (READ/WRITE)." });
+    }
+
+    try {
+        // 2. Get internal Bucket ID
+        const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(bucketUuid);
+        
+        // 3. Insert the Policy
+        // Use INSERT OR REPLACE so you can "Update" a user's permission easily
+        db.prepare(`
+            INSERT INTO bucket_policies (bucket_id, grantee_id, permission)
+            VALUES (?, ?, ?)
+            ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission
+        `).run(bucket.id, grantee_id, permission);
+
+        // 4. Audit Log
+        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+            .run(req.auth.payload.sub, `INVITED_${grantee_id}_TO_${bucket.name}`, 'SUCCESS');
+
+        res.json({ status: "Member added", bucket: bucket.name, user: grantee_id, role: permission });
+    } catch (err) {
+        console.error("[SHARE ERROR]", err.message);
+        res.status(500).json({ error: "Failed to share bucket." });
+    }
+});
+app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'), (req, res) => {
+    const { bucketUuid, userId } = req.params;
+
+    try {
+        const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
+        
+        // Prevent the owner from kicking themselves (Safety first!)
+        const bucketOwner = db.prepare('SELECT owner_id FROM buckets WHERE id = ?').get(bucket.id);
+        if (userId === bucketOwner.owner_id) {
+            return res.status(400).json({ error: "Cannot revoke access from the bucket owner." });
+        }
+
+        db.prepare('DELETE FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
+            .run(bucket.id, userId);
+
+        res.json({ status: "Access revoked successfully." });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to remove member." });
+    }
+});
 app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
     try {
         const dbFiles = db.prepare(`
@@ -554,7 +766,7 @@ app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
             JOIN files f ON v.file_id = f.id
         `).all();
 
-        const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/list-files`);
+        const spokeResponse = await spokeFetch(`/internal/inventory`);
 
         // 1. Check if the Spoke is even awake
         if (!spokeResponse.ok) {
@@ -617,7 +829,7 @@ app.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
             const validOrphans = orphanedOnDisk.filter(path => !checkDB.get(path));
 
             if (validOrphans.length > 0) {
-                const spokeResponse = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/purge-orphans`, {
+                const spokeResponse = await spokeFetch(`/internal/maintenance/purge`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ files: validOrphans })
@@ -641,6 +853,28 @@ app.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
         res.status(500).json({ error: "Sync operation failed.", details: err.message });
     }
 });
+
+app.post('/vault/admin/performance-test', permitGlobalRole('admin'), async (req, res) => {
+    console.log(`[STRESS TEST] Initiating high-throughput benchmark to Surabaya...`);
+
+    try {
+        const spokeResponse = await spokeFetch(`/internal/test/test-upload`, {
+            method: 'POST',
+            body: req, // Pipe the raw request stream
+            duplex: 'half'
+        });
+
+        const result = await spokeResponse.json();
+        res.json({
+            message: "Benchmark Complete",
+            spoke_received_gb: result.size_gb,
+            note: "Data was processed through the encryption tunnel but discarded at the Spoke to preserve disk health."
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Benchmark Interrupted", details: err.message });
+    }
+});
+
 // const internalOnly = ['/spoke-status', '/spoke-logs'];
 
 // app.all(/^(\/.*)/, bouncer, (req, res, next) => {
@@ -650,7 +884,6 @@ app.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
 //     // If it's not internal and didn't match the routes above, it's a 404.
 //     res.status(404).json({ error: "Endpoint not found" });
 // });
-
 app.use((req, res) => {
     console.warn(`[SECURITY] Blocked unauthorized path: ${req.path}`);
 
@@ -663,6 +896,7 @@ app.use((req, res) => {
         message: "This endpoint is not exposed via the Secure Gateway."
     });
 });
+
 
 https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
     console.log('--- Zero Trust Architecture Active ---');

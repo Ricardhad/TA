@@ -75,3 +75,48 @@ export const validateFileSecurity = (filename, headerMime) => {
             : headerMime
     };
 };
+
+export function authorizeBucket(requiredPermission) {
+    return (req, res, next) => {
+        const userId = req.auth.payload.sub;
+        const bucketUuid = req.headers['x-bucket-uuid'] || req.params.bucketUuid;
+
+        if (!bucketUuid) {
+            return res.status(400).json({ error: "Bucket UUID is required" });
+        }
+
+        const policy = db.prepare(`
+            SELECT p.permission 
+            FROM bucket_policies p
+            JOIN buckets b ON p.bucket_id = b.id
+            WHERE b.uuid = ? AND p.grantee_id = ?
+        `).get(bucketUuid, userId);
+
+        if (!policy) {
+            return res.status(403).json({ error: "Access Denied: No policy found for this user." });
+        }
+
+        // 🏆 The Hierarchy Map
+        const weights = {
+            'READ': 1,
+            'WRITE': 2,
+            'ADMIN': 3
+        };
+
+        const userWeight = weights[policy.permission] || 0;
+        const requiredWeight = weights[requiredPermission] || 0;
+
+        // If user's level is lower than required, kick them out
+        if (userWeight < requiredWeight) {
+            return res.status(403).json({ 
+                error: "Insufficient Permissions",
+                required: requiredPermission,
+                current: policy.permission
+            });
+        }
+
+        // Add to request object for use in the next function
+        req.bucket_permission = policy.permission; 
+        next();
+    };
+}
