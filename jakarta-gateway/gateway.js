@@ -707,7 +707,7 @@ app.get('/vault/buckets',  (req, res) => {
         res.status(500).json({ error: "Could not fetch buckets." });
     }
 });
-app.post('/vault/buckets/:bucketUuid/share', authorizeBucket('ADMIN'), (req, res) => {
+app.post('/vault/buckets/:bucketUuid/share',permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid } = req.params;
     const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
 
@@ -756,6 +756,24 @@ app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'),
         res.json({ status: "Access revoked successfully." });
     } catch (err) {
         res.status(500).json({ error: "Failed to remove member." });
+    }
+});
+app.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
+    const { bucketUuid } = req.params;
+    const { name, region } = req.body;
+
+    try {
+        const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
+        if (!bucket) {
+            return res.status(404).json({ error: "Bucket not found." });
+        }
+
+        db.prepare('UPDATE buckets SET name = ?, region = ? WHERE id = ?')
+            .run(name, region, bucket.id);
+
+        res.json({ status: "Bucket updated successfully." });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to update bucket." });
     }
 });
 app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {

@@ -13,7 +13,8 @@ db.exec(`
     name TEXT NOT NULL,                  -- 🏷️ User-friendly name
     region TEXT DEFAULT 'sub-01',        -- 📍 Location: Surabaya, Jakarta, etc.
     owner_id TEXT NOT NULL,              -- 👤 Creator's Auth0 ID
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP DEFAULT NULL
   );
 
   -- 2. THE POLICY LAYER (RBAC)
@@ -22,6 +23,7 @@ db.exec(`
     bucket_id INTEGER NOT NULL,
     grantee_id TEXT NOT NULL,            -- 👥 Collaborator's Auth0 ID
     permission TEXT NOT NULL,            -- ⚖️ 'READ', 'WRITE', or 'ADMIN'
+    UNIQUE(bucket_id, grantee_id),
     FOREIGN KEY(bucket_id) REFERENCES buckets(id) ON DELETE CASCADE
   );
 
@@ -34,7 +36,8 @@ db.exec(`
     owner_id TEXT NOT NULL,              -- 👤 Auth0 User ID,
     mime_type TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(bucket_id) REFERENCES buckets(id) ON DELETE SET NULL
+    deleted_at TIMESTAMP DEFAULT NULL,
+    FOREIGN KEY(bucket_id) REFERENCES buckets(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS versions (
@@ -61,7 +64,7 @@ db.exec(`
     user_id TEXT, -- The Auth0 'sub' ID
     role TEXT,    -- 'EDITOR' or 'VIEWER'
     PRIMARY KEY (file_uuid, user_id),
-    FOREIGN KEY (file_uuid) REFERENCES files(uuid)
+    FOREIGN KEY (file_uuid) REFERENCES files(uuid) ON DELETE CASCADE
   );
 
 `);

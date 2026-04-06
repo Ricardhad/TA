@@ -6,17 +6,12 @@ export const permitGlobalRole = (requiredRole) => {
     return (req, res, next) => {
         const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
         const userRolesArray = req.auth.payload[`${namespace}/roles`] || [];
-        
-        // 1. Get the "best" role the user has
-        const primaryRole = userRolesArray.find(r => ['admin', 'standard_user'].includes(r));
+        const primaryRole = userRolesArray.includes('admin') ? 'admin' : 'standard_user';
 
-        if (!primaryRole) {
-            return res.status(403).json({ error: "Access Denied: No valid global role found." });
-        }
 
         // 2. Compare using your hierarchy
         const hierarchy = { 'standard_user': 1, 'admin': 2 };
-        
+
         if (hierarchy[primaryRole] < hierarchy[requiredRole]) {
             return res.status(403).json({ error: `Forbidden: Requires ${requiredRole} clearance.` });
         }
@@ -31,7 +26,7 @@ export const authorizeVault = (requiredRole = 'VIEWER') => {
 
         // 1. Check if they are the OWNER
         const ownerCheck = db.prepare('SELECT owner_id FROM files WHERE uuid = ?').get(fileUuid);
-        
+
         if (ownerCheck && ownerCheck.owner_id === userId) {
             req.userRole = 'OWNER';
             return next(); // Owners can do everything
@@ -39,7 +34,7 @@ export const authorizeVault = (requiredRole = 'VIEWER') => {
 
         // 2. Check if they are an INVITED GUEST
         const guestCheck = db.prepare('SELECT role FROM file_access WHERE file_uuid = ? AND user_id = ?')
-                             .get(fileUuid, userId);
+            .get(fileUuid, userId);
 
         if (!guestCheck) {
             return res.status(403).json({ error: "Access Denied: You are not invited to this vault." });
@@ -81,42 +76,49 @@ export function authorizeBucket(requiredPermission) {
         const userId = req.auth.payload.sub;
         const bucketUuid = req.headers['x-bucket-uuid'] || req.params.bucketUuid;
 
-        if (!bucketUuid) {
-            return res.status(400).json({ error: "Bucket UUID is required" });
+        // 1. Global Admin Bypass
+        if (req.globalRole === 'admin') {
+            req.bucket_permission = 'ADMIN';
+            return next();
         }
 
-        const policy = db.prepare(`
-            SELECT p.permission 
-            FROM bucket_policies p
-            JOIN buckets b ON p.bucket_id = b.id
-            WHERE b.uuid = ? AND p.grantee_id = ?
-        `).get(bucketUuid, userId);
+        if (!bucketUuid) return res.status(400).json({ error: "Bucket UUID is required" });
 
-        if (!policy) {
-            return res.status(403).json({ error: "Access Denied: No policy found for this user." });
+        // Inside authorizeBucket middleware
+        const bucketData = db.prepare(`
+    SELECT b.owner_id, p.permission 
+    FROM buckets b
+    LEFT JOIN bucket_policies p ON b.id = p.bucket_id AND p.grantee_id = ?
+    WHERE b.uuid = ?
+`).get(userId, bucketUuid);
+
+        if (!bucketData) return res.status(404).json({ error: "Bucket not found" });
+
+        // 👑 THE FIX:
+        let finalPermission = bucketData.permission;
+
+        if (bucketData.owner_id === userId) {
+            finalPermission = 'ADMIN'; // Owner is always Admin
         }
 
-        // 🏆 The Hierarchy Map
-        const weights = {
-            'READ': 1,
-            'WRITE': 2,
-            'ADMIN': 3
-        };
-
-        const userWeight = weights[policy.permission] || 0;
-        const requiredWeight = weights[requiredPermission] || 0;
-
-        // If user's level is lower than required, kick them out
-        if (userWeight < requiredWeight) {
-            return res.status(403).json({ 
-                error: "Insufficient Permissions",
-                required: requiredPermission,
-                current: policy.permission
+        if (!finalPermission) {
+            return res.status(403).json({
+                error: "Access Denied: No policy found for this user.",
+                debug: { owner: bucketData.owner_id, requester: userId } // Useful for debugging
             });
         }
 
-        // Add to request object for use in the next function
-        req.bucket_permission = policy.permission; 
+        // 5. Weight Check
+        const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
+        if (weights[finalPermission] < weights[requiredPermission]) {
+            return res.status(403).json({
+                error: "Insufficient Permissions",
+                required: requiredPermission,
+                current: finalPermission
+            });
+        }
+
+        req.bucket_permission = finalPermission;
         next();
     };
 }
