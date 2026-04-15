@@ -29,17 +29,21 @@ function App() {
   const [auditLogs, setAuditLogs] = useState([]);
   const [benchmarkResult, setBenchmarkResult] = useState(null);
 
-  // --- Modal States ---
+  // --- Modal & Dialog States ---
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newBucketName, setNewBucketName] = useState('');
   const [shareBucketModal, setShareBucketModal] = useState({ open: false, bucket: null });
   const [shareEmail, setShareEmail] = useState('');
   const [sharePermission, setSharePermission] = useState('READ');
 
-  // --- Inspector State ---
   const [inspectorModal, setInspectorModal] = useState({ open: false, file: null });
   const [fileVersions, setFileVersions] = useState([]);
   const [previewData, setPreviewData] = useState({ url: null, isLoading: false, versionNum: null });
+
+  // 🆕 THE UNIVERSAL DIALOG STATE (Replaces prompt, confirm, alert)
+  const [dialog, setDialog] = useState({
+    open: false, type: '', title: '', message: '', inputValue: '', targetData: null
+  });
 
   const fileInputRef = useRef(null);
 
@@ -54,9 +58,6 @@ function App() {
     }
   }, [isAuthenticated]);
 
-  // ==========================================
-  // IDENTITY & QUOTA
-  // ==========================================
   const checkIdentity = async () => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
@@ -71,10 +72,74 @@ function App() {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
       const res = await fetch(`${API_BASE}/vault/usage`, { headers: { Authorization: `Bearer ${token}` }});
       if(res.ok) setUsage(await res.json());
-    } catch (err) { console.error("Quota fetch failed", err); }
+    } catch (err) { console.error(err); }
   }
 
   const logout = () => auth0Logout({ logoutParams: { returnTo: window.location.origin } });
+
+  // ==========================================
+  // UNIVERSAL DIALOG EXECUTOR
+  // ==========================================
+  const closeDialog = () => setDialog({ open: false, type: '', title: '', message: '', inputValue: '', targetData: null });
+
+  const executeDialogAction = async (e) => {
+    e?.preventDefault();
+    const { type, inputValue, targetData } = dialog;
+    
+    // For read-only alerts/links, just close
+    if (type === 'ALERT' || type === 'SHOW_LINK') return closeDialog();
+
+    try {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
+
+      if (type === 'RENAME_BUCKET') {
+        if (!inputValue) return;
+        await fetch(`${API_BASE}/vault/buckets/${targetData.uuid}`, {
+          method: 'PUT',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: inputValue, region: targetData.region })
+        });
+        fetchBuckets();
+        closeDialog();
+      } 
+      else if (type === 'REVOKE_ACCESS') {
+        if (!inputValue) return;
+        const res = await fetch(`${API_BASE}/vault/buckets/${targetData.uuid}/share/${inputValue}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if(!res.ok) throw new Error("Revocation failed. Are they the owner?");
+        fetchBuckets();
+        closeDialog();
+        setDialog({ open: true, type: 'ALERT', title: 'Success', message: 'Access revoked successfully.' });
+      }
+      else if (type === 'DELETE_FILE') {
+        const res = await fetch(`${API_BASE}/vault/files/${targetData.uuid}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error("Deletion failed.");
+        fetchFiles(activeBucket.uuid);
+        fetchUsage();
+        closeDialog();
+      }
+      else if (type === 'GENERATE_LINK') {
+        if (!inputValue) return;
+        const res = await fetch(`${API_BASE}/vault/files/${targetData}/links?ttl=${inputValue}&permission=downloadable`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error("Failed to generate link.");
+        const data = await res.json();
+        // Immediately trigger the "SHOW_LINK" dialog
+        setDialog({ 
+          open: true, type: 'SHOW_LINK', title: 'Secure Link Generated', 
+          message: 'Copy your secure, temporary link below:', inputValue: data.share_url 
+        });
+      }
+    } catch (err) {
+      setDialog({ open: true, type: 'ALERT', title: 'Error', message: err.message });
+    }
+  };
 
   // ==========================================
   // BUCKETS (LOBBY)
@@ -99,22 +164,8 @@ function App() {
         body: JSON.stringify({ name: newBucketName, region: 'sub-01' })
       });
       setNewBucketName(''); setShowCreateModal(false); fetchBuckets();
-    } catch (err) { alert(err.message); }
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Deployment Error', message: err.message }); }
   };
-
-  const handleRenameBucket = async (bucket) => {
-    const newName = prompt(`Enter new name for '${bucket.name}':`);
-    if (!newName) return;
-    try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      await fetch(`${API_BASE}/vault/buckets/${bucket.uuid}`, {
-        method: 'PUT',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newName, region: bucket.region })
-      });
-      fetchBuckets();
-    } catch (err) { alert(err.message); }
-  }
 
   const handleShareBucket = async (e) => {
     e.preventDefault();
@@ -125,24 +176,14 @@ function App() {
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ grantee_id: shareEmail, permission: sharePermission }) 
       });
-      alert("User successfully invited to Vault!");
       setShareBucketModal({ open: false, bucket: null });
-    } catch (err) { alert(err.message); }
+      setDialog({ open: true, type: 'ALERT', title: 'Access Granted', message: 'User successfully invited to Vault!' });
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Sharing Error', message: err.message }); }
   };
 
-  const handleRevokeAccess = async (bucket) => {
-    const targetId = prompt(`Enter Auth0 ID (sub) to kick from ${bucket.name}:`);
-    if (!targetId) return;
-    try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/buckets/${bucket.uuid}/share/${targetId}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if(!res.ok) throw new Error("Revocation failed. Are they the owner?");
-      alert("Access revoked.");
-    } catch (err) { alert(err.message); }
-  }
+  // 🆕 Refactored Triggers using custom Dialog
+  const triggerRenameBucket = (bucket) => setDialog({ open: true, type: 'RENAME_BUCKET', title: `Rename '${bucket.name}'`, message: 'Enter new bucket name:', inputValue: '', targetData: bucket });
+  const triggerRevokeAccess = (bucket) => setDialog({ open: true, type: 'REVOKE_ACCESS', title: `Kick from '${bucket.name}'`, message: 'Enter Auth0 ID (sub) to kick:', inputValue: '', targetData: bucket });
 
   // ==========================================
   // FILES (VAULT)
@@ -178,26 +219,11 @@ function App() {
         body: formData 
       });
       if (!res.ok) throw new Error("Upload rejected by Gateway");
-      alert("File securely vaulted!");
       fetchFiles(activeBucket.uuid);
-      fetchUsage(); // Update quota
-    } catch (err) { alert(err.message); } finally { e.target.value = null; }
+      fetchUsage();
+      setDialog({ open: true, type: 'ALERT', title: 'Upload Success', message: 'File securely vaulted!' });
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Upload Failed', message: err.message }); } finally { e.target.value = null; }
   };
-
-  const deleteFile = async (uuid, filename) => {
-    if(!confirm(`WARNING: Are you sure you want to permanently delete '${filename}'? This triggers a physical wipe on the Spoke.`)) return;
-    try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/files/${uuid}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!res.ok) throw new Error("Deletion failed.");
-      alert("File permanently purged.");
-      fetchFiles(activeBucket.uuid);
-      fetchUsage(); // Update quota
-    } catch (err) { alert(err.message); }
-  }
 
   const downloadFile = async (uuid, fileName, versionNum = null) => {
     try {
@@ -211,21 +237,12 @@ function App() {
       a.href = objUrl; a.download = versionNum ? `v${versionNum}_${fileName}` : fileName; 
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => window.URL.revokeObjectURL(objUrl), 1000); 
-    } catch (err) { alert("Download Error: " + err.message); }
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Download Error', message: err.message }); }
   };
 
-  const generateFileLink = async (uuid) => {
-    const ttl = prompt("Minutes until link expires:", "60");
-    if (!ttl) return;
-    try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/files/${uuid}/links?ttl=${ttl}&permission=downloadable`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = await res.json();
-      prompt("Copy secure link:", data.share_url);
-    } catch (err) { alert("Error: " + err.message); }
-  };
+  // 🆕 Refactored Triggers using custom Dialog
+  const triggerDeleteFile = (uuid, filename) => setDialog({ open: true, type: 'DELETE_FILE', title: `Purge '${filename}'?`, message: 'WARNING: This triggers a physical wipe on the Spoke. Are you absolutely sure?', targetData: {uuid, filename} });
+  const triggerGenerateLink = (uuid) => setDialog({ open: true, type: 'GENERATE_LINK', title: 'Secure Expiration Link', message: 'Minutes until link expires:', inputValue: '60', targetData: uuid });
 
   // ==========================================
   // INSPECTOR & PREVIEW LOGIC
@@ -279,7 +296,7 @@ function App() {
       const res = await fetch(`${API_BASE}/vault/admin/sync`, { headers: { Authorization: `Bearer ${token}` }});
       const data = await res.json();
       setAdminSyncReport(data.results);
-    } catch (err) { alert("Audit Failed: " + err.message); }
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Audit Failed', message: err.message }); }
   };
 
   const executeAdminPurge = async () => {
@@ -291,22 +308,19 @@ function App() {
         body: JSON.stringify(adminSyncReport)
       });
       const data = await res.json();
-      alert(data.details);
+      setDialog({ open: true, type: 'ALERT', title: 'Purge Complete', message: data.details });
       setAdminSyncReport(null); 
-    } catch (err) { alert(err.message); }
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Purge Error', message: err.message }); }
   };
 
   const triggerBenchmark = async () => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      // Sends a dummy stream to trigger the rate limiter/benchmark
       const res = await fetch(`${API_BASE}/vault/admin/performance-test`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` },
-        body: "DUMMY_STRESS_PAYLOAD" 
+        method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: "DUMMY_STRESS_PAYLOAD" 
       });
       setBenchmarkResult(await res.json());
-    } catch (err) { alert("Benchmark Failed. Spoke unreachable?"); }
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Test Failed', message: "Spoke unreachable?" }); }
   }
 
   const simulateBitRot = async () => {
@@ -314,14 +328,12 @@ function App() {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
       const dummyPayload = [{ path: "demo-path.enc", hash: "invalid-hash-123" }];
       const res = await fetch(`${API_BASE}/vault/admin/bitrot-report`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(dummyPayload)
+        method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(dummyPayload)
       });
       const data = await res.json();
-      alert(`Simulation Complete: ${data.corrupted} files marked corrupted. Check Audit Logs.`);
-      loadAdminData(); // Refresh logs
-    } catch (err) { alert(err.message); }
+      setDialog({ open: true, type: 'ALERT', title: 'Simulation Complete', message: `${data.corrupted} files marked corrupted. Check Audit Logs.` });
+      loadAdminData();
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Simulation Error', message: err.message }); }
   }
 
   // ==========================================
@@ -356,7 +368,6 @@ function App() {
               <button onClick={logout} style={{background: 'transparent', border: '1px solid #888'}}>End Session</button>
             </div>
             
-            {/* Quota Progress Bar */}
             {usage && (
               <div style={{ fontSize: '0.8rem', color: '#aaa' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -369,7 +380,6 @@ function App() {
               </div>
             )}
 
-            {/* Nav Tabs */}
             <div style={{ marginTop: '15px', display: 'flex', gap: '10px' }}>
               <button onClick={() => setActiveView('lobby')} style={{ opacity: activeView === 'lobby' ? 1 : 0.5 }}>Namespaces (Lobby)</button>
               {userRole === 'admin' && (
@@ -422,9 +432,9 @@ function App() {
                         <td><small>{bucket.uuid.split('-')[0]}</small></td>
                         <td>
                           <button onClick={() => openBucket(bucket)}>Enter</button>
-                          <button onClick={() => handleRenameBucket(bucket)} style={{ marginLeft: '5px' }}>✎ Edit</button>
+                          <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px' }}>✎ Edit</button>
                           <button onClick={() => setShareBucketModal({ open: true, bucket })} style={{ marginLeft: '5px', backgroundColor: '#ff9800', color: 'white' }}>Add Guest</button>
-                          <button onClick={() => handleRevokeAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#d32f2f', color: 'white' }}>Kick</button>
+                          <button onClick={() => triggerRevokeAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#d32f2f', color: 'white' }}>Kick</button>
                         </td>
                       </tr>
                     ))}
@@ -458,8 +468,8 @@ function App() {
                         <td>{new Date(file.timestamp).toLocaleDateString()}</td>
                         <td>
                           <button onClick={() => downloadFile(file.uuid, file.filename)}>↓</button>
-                          <button onClick={() => generateFileLink(file.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white' }}>🔗</button>
-                          <button onClick={() => deleteFile(file.uuid, file.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white' }}>Nuke</button>
+                          <button onClick={() => triggerGenerateLink(file.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white' }}>🔗</button>
+                          <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white' }}>Nuke</button>
                         </td>
                       </tr>
                     ))}
@@ -496,56 +506,90 @@ function App() {
 
           {/* VIEW 3: ADMIN PANEL */}
           {activeView === 'admin' && (
-            <div className="vault-container admin-panel">
-              <h2>Telemetry & Security Console</h2>
-              
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px' }}>
-                {/* Audit & Sync */}
-                <div style={{ padding: '20px', background: '#2c2c2c', borderLeft: '4px solid #f44336' }}>
-                  <h3>Database/Disk Integrity Sync</h3>
-                  <button onClick={runAdminAudit} style={{ backgroundColor: '#f44336', color: 'white' }}>Run Set Theory Audit</button>
-                  {adminSyncReport && (
-                    <div style={{ marginTop: '15px', padding: '10px', background: '#111' }}>
-                      <p>Missing (DB only): {adminSyncReport.missingFromDisk.length}</p>
-                      <p>Orphans (Disk only): {adminSyncReport.orphanedOnDisk.length}</p>
-                      <button onClick={executeAdminPurge} style={{ marginTop: '10px' }}>Execute Physical Purge</button>
-                    </div>
+             <div className="vault-container admin-panel">
+               <h2>Telemetry & Security Console</h2>
+               {/* ... (Admin Content is exactly the same as before) ... */}
+               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px' }}>
+                 <div style={{ padding: '20px', background: '#2c2c2c', borderLeft: '4px solid #f44336' }}>
+                   <h3>Database/Disk Integrity Sync</h3>
+                   <button onClick={runAdminAudit} style={{ backgroundColor: '#f44336', color: 'white' }}>Run Set Theory Audit</button>
+                   {adminSyncReport && (
+                     <div style={{ marginTop: '15px', padding: '10px', background: '#111' }}>
+                       <p>Missing (DB only): {adminSyncReport.missingFromDisk.length}</p>
+                       <p>Orphans (Disk only): {adminSyncReport.orphanedOnDisk.length}</p>
+                       <button onClick={executeAdminPurge} style={{ marginTop: '10px' }}>Execute Physical Purge</button>
+                     </div>
+                   )}
+                 </div>
+                 <div style={{ padding: '20px', background: '#2c2c2c', borderLeft: '4px solid #2196F3' }}>
+                   <h3>System Stress & Security</h3>
+                   <button onClick={triggerBenchmark} style={{ marginBottom: '10px', width: '100%' }}>Run Network Benchmark</button>
+                   {benchmarkResult && <p style={{ fontSize: '0.8rem', color: '#4CAF50' }}>{benchmarkResult.message}: {benchmarkResult.spoke_received_gb}GB transferred.</p>}
+                   <button onClick={simulateBitRot} style={{ backgroundColor: '#ff9800', color: 'white', width: '100%' }}>Simulate Bit-Rot Detection</button>
+                 </div>
+               </div>
+               <div style={{ padding: '20px', background: '#2c2c2c', borderTop: '4px solid #4CAF50' }}>
+                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                   <h3>Live Audit Logs</h3>
+                   <button onClick={loadAdminData}>Refresh Logs</button>
+                 </div>
+                 <div style={{ maxHeight: '300px', overflowY: 'auto', marginTop: '10px' }}>
+                   <table className="vault-table" style={{ fontSize: '0.85rem' }}>
+                     <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Status</th></tr></thead>
+                     <tbody>
+                       {auditLogs.map(log => (
+                         <tr key={log.id}>
+                           <td>{new Date(log.timestamp).toLocaleTimeString()}</td>
+                           <td>{log.user_email}</td>
+                           <td style={{ fontFamily: 'monospace' }}>{log.action}</td>
+                           <td style={{ color: log.status === 'FAILED' || log.status === 'BLOCKED' ? '#f44336' : '#4CAF50' }}>{log.status}</td>
+                         </tr>
+                       ))}
+                     </tbody>
+                   </table>
+                 </div>
+               </div>
+             </div>
+          )}
+
+          {/* 🆕 UNIVERSAL THEMED DIALOG MODAL */}
+          {dialog.open && (
+            <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
+              <div style={{ background: '#222', padding: '25px', borderRadius: '8px', border: '1px solid #555', width: '400px', maxWidth: '90%', boxShadow: '0 4px 20px rgba(0,0,0,0.5)' }}>
+                <h3 style={{ marginTop: 0, color: '#fff', borderBottom: '1px solid #444', paddingBottom: '10px' }}>{dialog.title}</h3>
+                <p style={{ color: dialog.type === 'DELETE_FILE' ? '#ff5252' : '#ccc', margin: '15px 0', lineHeight: '1.5' }}>{dialog.message}</p>
+                
+                <form onSubmit={executeDialogAction}>
+                  {/* Only show input for Prompts */}
+                  {['RENAME_BUCKET', 'REVOKE_ACCESS', 'GENERATE_LINK', 'SHOW_LINK'].includes(dialog.type) && (
+                    <input 
+                      type="text" 
+                      value={dialog.inputValue} 
+                      onChange={(e) => setDialog({...dialog, inputValue: e.target.value})}
+                      autoFocus
+                      readOnly={dialog.type === 'SHOW_LINK'}
+                      style={{ 
+                        width: '100%', padding: '12px', marginBottom: '20px', 
+                        background: '#111', color: '#fff', border: '1px solid #555', 
+                        borderRadius: '4px', boxSizing: 'border-box' 
+                      }}
+                    />
                   )}
-                </div>
-
-                {/* Network & Bitrot */}
-                <div style={{ padding: '20px', background: '#2c2c2c', borderLeft: '4px solid #2196F3' }}>
-                  <h3>System Stress & Security</h3>
-                  <button onClick={triggerBenchmark} style={{ marginBottom: '10px', width: '100%' }}>Run Network Benchmark</button>
-                  {benchmarkResult && <p style={{ fontSize: '0.8rem', color: '#4CAF50' }}>{benchmarkResult.message}: {benchmarkResult.spoke_received_gb}GB transferred.</p>}
                   
-                  <button onClick={simulateBitRot} style={{ backgroundColor: '#ff9800', color: 'white', width: '100%' }}>Simulate Bit-Rot Detection</button>
-                </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                    <button type="button" onClick={closeDialog} style={{ background: 'transparent', color: '#aaa', border: '1px solid #555' }}>
+                      {dialog.type === 'SHOW_LINK' || dialog.type === 'ALERT' ? 'Close' : 'Cancel'}
+                    </button>
+                    
+                    {/* Hide Confirm button for read-only dialogs */}
+                    {dialog.type !== 'SHOW_LINK' && dialog.type !== 'ALERT' && (
+                      <button type="submit" style={{ background: dialog.type === 'DELETE_FILE' ? '#f44336' : '#2196F3', color: 'white' }}>
+                        {dialog.type === 'DELETE_FILE' ? 'Yes, Purge File' : 'Confirm'}
+                      </button>
+                    )}
+                  </div>
+                </form>
               </div>
-
-              {/* Audit Logs */}
-              <div style={{ padding: '20px', background: '#2c2c2c', borderTop: '4px solid #4CAF50' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <h3>Live Audit Logs</h3>
-                  <button onClick={loadAdminData}>Refresh Logs</button>
-                </div>
-                <div style={{ maxHeight: '300px', overflowY: 'auto', marginTop: '10px' }}>
-                  <table className="vault-table" style={{ fontSize: '0.85rem' }}>
-                    <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Status</th></tr></thead>
-                    <tbody>
-                      {auditLogs.map(log => (
-                        <tr key={log.id}>
-                          <td>{new Date(log.timestamp).toLocaleTimeString()}</td>
-                          <td>{log.user_email}</td>
-                          <td style={{ fontFamily: 'monospace' }}>{log.action}</td>
-                          <td style={{ color: log.status === 'FAILED' || log.status === 'BLOCKED' ? '#f44336' : '#4CAF50' }}>{log.status}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
             </div>
           )}
 
