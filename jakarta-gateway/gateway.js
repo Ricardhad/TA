@@ -10,7 +10,8 @@ import crypto from 'crypto';
 import helmet from 'helmet';
 import Busboy from 'busboy';
 import { Readable } from 'node:stream';
-import { authorizeVault, validateFileSecurity, permitGlobalRole ,authorizeBucket} from './middleware.js';
+import rateLimit from 'express-rate-limit';
+import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket } from './middleware.js';
 // import { permission } from 'node:process';
 dotenv.config();
 // import axios from 'axios';
@@ -22,18 +23,41 @@ dotenv.config();
 const app = express();
 const PUBLIC_PORT = 8080;
 // const proxy = httpProxy.createProxyServer({});
+app.use(cors({
+    origin: 'http://localhost:5173', // Allow your React app
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-bucket-uuid'],
+    credentials: true
+}));
+
 app.use(express.json({
     limit: '1mb',
     strict: true
 }));
+// Global API Limiter (e.g., max 100 requests per 15 minutes)
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: { error: "Too many requests. Please try again later." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 
-// HELPER: Fetch M2M Token from Auth0 (Jakarta Hub)
+// Strict Limiter for Uploads/Shares (e.g., max 10 per minute to prevent spam)
+const strictLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000,
+    max: 10,
+    message: { error: "Action rate limit exceeded." }
+});
+
+app.use('/vault/', apiLimiter);
+app.use('/vault/files', strictLimiter);
 let cachedM2MToken = null;
 let tokenExpiry = 0;
 
 async function getSpokeToken() {
     const now = Math.floor(Date.now() / 1000);
-    
+
     if (cachedM2MToken && now < tokenExpiry) {
         console.log(`[AUTH] Using cached token ending in: ...${cachedM2MToken.slice(-5)}`);
         return cachedM2MToken;
@@ -46,7 +70,7 @@ async function getSpokeToken() {
         body: JSON.stringify({
             client_id: process.env.M2M_CLIENT_ID,
             client_secret: process.env.M2M_CLIENT_SECRET,
-            audience: process.env.NAMESPACE, 
+            audience: process.env.NAMESPACE,
             grant_type: 'client_credentials'
         })
     });
@@ -61,7 +85,7 @@ async function getSpokeToken() {
 
     cachedM2MToken = data.access_token;
     tokenExpiry = now + data.expires_in - 60;
-    
+
     console.log(`[AUTH] New token issued ending in: ...${cachedM2MToken.slice(-5)}`);
     return cachedM2MToken;
 }
@@ -157,12 +181,6 @@ app.get('/vault/view/:uuid', async (req, res) => {
 app.use(bouncer);
 
 app.use(helmet());
-app.use(cors({
-    origin: 'http://localhost:5173', // Allow your React app
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
-}));
 
 app.use((req, res, next) => {
     // const user = req.auth?.payload?.email || 'anonymous';
@@ -179,7 +197,7 @@ app.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
     const ADMIN_QUOTA_LIMIT = 50 * 1024 * 1024 * 1024; // 50gb
     const QUOTA_LIMIT = 5 * 1024 * 1024 * 1024; // 5gb
-     const activeLimit = (userRole === 'admin') ? ADMIN_QUOTA_LIMIT : QUOTA_LIMIT;
+    const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA_LIMIT : QUOTA_LIMIT;
     try {
         const usage = db.prepare(`
             SELECT SUM(v.size) as total_used 
@@ -212,7 +230,7 @@ app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
                 SELECT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
                 FROM files f JOIN versions v ON f.id = v.file_id 
                 WHERE f.filename LIKE ? 
-                AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
+                AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
             `);
             results = query.all(search);
         } else {
@@ -222,7 +240,7 @@ app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
                 LEFT JOIN file_access fa ON f.uuid = fa.file_uuid 
                 WHERE (f.owner_id = ? OR fa.user_id = ?) 
                 AND f.filename LIKE ?
-                AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
+                AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
             `);
             results = query.all(userId, userId, search);
         }
@@ -252,14 +270,14 @@ const sslOptions = {
 };
 
 // upload
-app.post('/vault/files', (req, res) => {
+app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
     const USER_QUOTA = 5 * 1024 * 1024 * 1024; // 5gb Limit 
     const MAX_SIZE = 1 * 1024 * 1024 * 1024; // 1gb Limit 
     const contentType = req.headers['content-type'];
     const contentLength = req.headers['content-length'];
-    const activeLimit = (userRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
-
+    // const activeLimit = (userRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
+    const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
     if (!contentType || !contentType.includes('multipart/form-data')) {
         console.error(`[GATEWAY] Blocked request with invalid Content-Type: ${contentType}`);
         return res.status(400).json({
@@ -275,7 +293,12 @@ app.post('/vault/files', (req, res) => {
         }
     });
     const userId = req.auth.payload.sub;
+    const bucketUuid = req.headers['x-bucket-uuid'];
+    const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
 
+    if (!bucket) {
+        return res.status(404).json({ error: "Target bucket does not exist." });
+    }
     // We use a flag to ensure we only send one response
     let isProcessing = false;
     let limitReached = false; // Flag to stop SQL logic if file is too big
@@ -362,13 +385,15 @@ app.post('/vault/files', (req, res) => {
 
             // 2. SQL LOGIC: Find or Create the File Entry
             // We include mime_type here!
-            let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND owner_id = ?')
-                .get(filename, userId);
+            // 2. SQL LOGIC: Find or Create the File Entry
+            // Make sure we look for the filename inside this specific bucket!
+            let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?')
+                .get(filename, bucket.id);
 
             if (!fileRecord) {
                 const uuid = randomUUID();
-                const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type) VALUES (?, ?, ?, ?)')
-                    .run(uuid, filename, userId, finalMime);
+                const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)')
+                    .run(uuid, filename, userId, finalMime, bucket.id);
                 fileRecord = { id: info.lastInsertRowid, uuid: uuid };
             } else {
                 // If the file exists, update the mime_type just in case it changed
@@ -495,7 +520,11 @@ app.get('/vault/files/:uuid/content', authorizeVault('VIEWER'), async (req, res)
 
         // 3. Set headers so the browser knows what to do
         res.setHeader('Content-Type', fileInfo.mime_type || 'application/octet-stream');
-        res.setHeader('Content-Length', fileInfo.size);
+        // res.setHeader('Content-Length', fileInfo.size);
+        const actualSize = spokeResponse.headers.get('content-length');
+        if (actualSize) {
+            res.setHeader('Content-Length', actualSize);
+        }
         // This forces the "Save As" dialog with the original filename
         res.setHeader('Content-Disposition', `attachment; filename="${fileInfo.filename}"`);
 
@@ -670,21 +699,26 @@ app.delete('/vault/files/:uuid', authorizeVault('OWNER'), async (req, res) => {
 });
 
 app.post('/vault/buckets', bouncer, (req, res) => {
-    const { name, region } = req.body || {} ;
+    const { name, region } = req.body || {};
     const userId = req.auth.payload.sub;
     const bucketUuid = randomUUID();
 
     try {
-        const info = db.prepare(`
-            INSERT INTO buckets (uuid, name, owner_id, region) 
-            VALUES (?, ?, ?, ?)
-        `).run(bucketUuid, name, userId, region || 'sub-01');
+        // const info = db.prepare(`
+        //     INSERT INTO buckets (uuid, name, owner_id, region) 
+        //     VALUES (?, ?, ?, ?)
+        // `).run(bucketUuid, name, userId, region || 'sub-01');
 
-        // Automatically give the owner ADMIN permission
-        db.prepare(`
-            INSERT INTO bucket_policies (bucket_id, grantee_id, permission) 
-            VALUES (?, ?, 'ADMIN')
-        `).run(info.lastInsertRowid, userId);
+        // // Automatically give the owner ADMIN permission
+        // db.prepare(`
+        //     INSERT INTO bucket_policies (bucket_id, grantee_id, permission) 
+        //     VALUES (?, ?, 'ADMIN')
+        // `).run(info.lastInsertRowid, userId);
+        const createAtomicBucket = db.transaction(() => {
+            const info = db.prepare(`INSERT INTO buckets (uuid, name, owner_id, region) VALUES (?, ?, ?, ?)`).run(bucketUuid, name, userId, region || 'sub-01');
+            db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, 'ADMIN')`).run(info.lastInsertRowid, userId);
+        });
+        createAtomicBucket();
 
         res.json({ status: "Bucket Created", uuid: bucketUuid });
     } catch (err) {
@@ -692,22 +726,23 @@ app.post('/vault/buckets', bouncer, (req, res) => {
     }
 });
 
-app.get('/vault/buckets',  (req, res) => {
+app.get('/vault/buckets', (req, res) => {
     const userId = req.auth.payload.sub;
-    
+
     try {
         const buckets = db.prepare(`
             SELECT b.uuid, b.name, b.region 
             FROM buckets b 
             JOIN bucket_policies bp ON b.id = bp.bucket_id 
-            WHERE bp.grantee_id = ?
+            WHERE bp.grantee_id = ? AND b.deleted_at IS NULL
         `).all(userId);
         res.json({ buckets });
     } catch (err) {
+        console.error("[BUCKET FETCH ERROR]:", err.message);
         res.status(500).json({ error: "Could not fetch buckets." });
     }
 });
-app.post('/vault/buckets/:bucketUuid/share',permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
+app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid } = req.params;
     const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
 
@@ -719,7 +754,7 @@ app.post('/vault/buckets/:bucketUuid/share',permitGlobalRole('standard_user'), a
     try {
         // 2. Get internal Bucket ID
         const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(bucketUuid);
-        
+
         // 3. Insert the Policy
         // Use INSERT OR REPLACE so you can "Update" a user's permission easily
         db.prepare(`
@@ -743,7 +778,7 @@ app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'),
 
     try {
         const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
-        
+
         // Prevent the owner from kicking themselves (Safety first!)
         const bucketOwner = db.prepare('SELECT owner_id FROM buckets WHERE id = ?').get(bucket.id);
         if (userId === bucketOwner.owner_id) {
@@ -892,6 +927,23 @@ app.post('/vault/admin/performance-test', permitGlobalRole('admin'), async (req,
         res.status(500).json({ error: "Benchmark Interrupted", details: err.message });
     }
 });
+app.post('/vault/admin/bitrot-report', permitGlobalRole('admin'), (req, res) => {
+    // req.body looks like: [{ path: "1774...", hash: "abc..." }]
+    const reports = req.body;
+    let corruptedFiles = 0;
+
+    for (const item of reports) {
+        const dbRecord = db.prepare('SELECT checksum, id FROM versions WHERE physical_path = ?').get(item.path);
+
+        if (dbRecord && dbRecord.checksum !== item.hash) {
+            corruptedFiles++;
+            db.prepare('INSERT INTO audit_logs (action, status) VALUES (?, ?)').run(`BIT_ROT_DETECTED_${item.path}`, 'CRITICAL');
+            // Optional: You could update a "status" column in versions to "CORRUPTED"
+        }
+    }
+
+    res.json({ message: "Scan complete", corrupted: corruptedFiles });
+});
 
 // const internalOnly = ['/spoke-status', '/spoke-logs'];
 
@@ -913,6 +965,30 @@ app.use((req, res) => {
         error: "Access Denied",
         message: "This endpoint is not exposed via the Secure Gateway."
     });
+});
+app.use((err, req, res, next) => {
+    if (err.name === 'UnauthorizedError') {
+        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+        console.warn(`[SECURITY] Failed Auth attempt on ${req.path} from IP: ${ip}`);
+
+        try {
+            db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
+                .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
+        } catch (dbErr) {
+            console.error("Failed to write to audit log:", dbErr.message);
+        }
+
+        // Return a clean JSON response instead of the ugly HTML stack trace
+        return res.status(401).json({
+            error: "Unauthorized",
+            message: "Missing, expired, or invalid authentication token."
+        });
+    }
+
+    // 2. Catch all other unhandled server errors
+    console.error("[SERVER ERROR]", err);
+    res.status(500).json({ error: "Internal Gateway Error" });
 });
 
 
