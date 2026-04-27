@@ -1,14 +1,10 @@
-import Database from 'better-sqlite3';
-const db = new Database('vault.db');
-
-db.pragma('foreign_keys = ON');
-
-db.exec(`
+-- 1. USERS LAYER (Shadow Table untuk Auth0 Identity Mapping)
 CREATE TABLE IF NOT EXISTS users (
   sub TEXT PRIMARY KEY,
   email TEXT UNIQUE NOT NULL
 );
 
+-- 2. THE NAMESPACE LAYER (Buckets)
 CREATE TABLE IF NOT EXISTS buckets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid TEXT UNIQUE NOT NULL,           
@@ -20,6 +16,7 @@ CREATE TABLE IF NOT EXISTS buckets (
   FOREIGN KEY(owner_id) REFERENCES users(sub) ON DELETE CASCADE
 );
 
+-- 3. THE POLICY LAYER (RBAC - Bucket Level)
 CREATE TABLE IF NOT EXISTS bucket_policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   bucket_id INTEGER NOT NULL,
@@ -30,6 +27,7 @@ CREATE TABLE IF NOT EXISTS bucket_policies (
   FOREIGN KEY(grantee_id) REFERENCES users(sub) ON DELETE CASCADE
 );
 
+-- 4. FILES LAYER
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid TEXT UNIQUE NOT NULL,           
@@ -43,6 +41,7 @@ CREATE TABLE IF NOT EXISTS files (
   FOREIGN KEY(owner_id) REFERENCES users(sub) ON DELETE CASCADE
 );
 
+-- 5. VERSIONS LAYER
 CREATE TABLE IF NOT EXISTS versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_id INTEGER NOT NULL,
@@ -54,6 +53,7 @@ CREATE TABLE IF NOT EXISTS versions (
   FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
+-- 6. AUDIT LAYER (Tanpa FK agar log tidak hilang saat user dihapus)
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_email TEXT,
@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 7. NOTIFICATIONS LAYER
 CREATE TABLE IF NOT EXISTS notifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id TEXT NOT NULL,               -- Target user's Auth0 ID
@@ -71,6 +72,3 @@ CREATE TABLE IF NOT EXISTS notifications (
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(user_id) REFERENCES users(sub) ON DELETE CASCADE
 );
-`);
-
-export default db;

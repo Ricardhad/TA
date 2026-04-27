@@ -19,34 +19,81 @@ export const permitGlobalRole = (requiredRole) => {
         next();
     };
 };
-export const authorizeVault = (requiredRole = 'VIEWER') => {
+// export const authorizeVault = (requiredRole = 'VIEWER') => {
+//     return (req, res, next) => {
+//         const userId = req.auth.payload.sub;
+//         const fileUuid = req.params.uuid;
+
+//         // 1. Check if they are the OWNER
+//         const ownerCheck = db.prepare('SELECT owner_id FROM files WHERE uuid = ?').get(fileUuid);
+
+//         if (ownerCheck && ownerCheck.owner_id === userId) {
+//             req.userRole = 'OWNER';
+//             return next(); // Owners can do everything
+//         }
+
+//         // 2. Check if they are an INVITED GUEST
+//         const guestCheck = db.prepare('SELECT role FROM file_access WHERE file_uuid = ? AND user_id = ?')
+//             .get(fileUuid, userId);
+
+//         if (!guestCheck) {
+//             return res.status(403).json({ error: "Access Denied: You are not invited to this vault." });
+//         }
+
+//         // 3. Check if their guest role is high enough
+//         const hierarchy = { 'VIEWER': 1, 'EDITOR': 2, 'OWNER': 3 };
+//         if (hierarchy[guestCheck.role] < hierarchy[requiredRole]) {
+//             return res.status(403).json({ error: `Forbidden: This action requires ${requiredRole} status.` });
+//         }
+
+//         req.userRole = guestCheck.role;
+//         next();
+//     };
+// };
+export const authorizeVault = (requiredPermission = 'READ') => {
     return (req, res, next) => {
         const userId = req.auth.payload.sub;
         const fileUuid = req.params.uuid;
 
-        // 1. Check if they are the OWNER
-        const ownerCheck = db.prepare('SELECT owner_id FROM files WHERE uuid = ?').get(fileUuid);
-
-        if (ownerCheck && ownerCheck.owner_id === userId) {
-            req.userRole = 'OWNER';
-            return next(); // Owners can do everything
+        // 1. Global Admin Bypass
+        if (req.globalRole === 'admin') {
+            req.bucket_permission = 'ADMIN';
+            return next();
         }
 
-        // 2. Check if they are an INVITED GUEST
-        const guestCheck = db.prepare('SELECT role FROM file_access WHERE file_uuid = ? AND user_id = ?')
-            .get(fileUuid, userId);
+        // 2. Find the file AND its parent bucket
+        const fileData = db.prepare(`
+            SELECT f.bucket_id, b.owner_id as bucket_owner
+            FROM files f
+            JOIN buckets b ON f.bucket_id = b.id
+            WHERE f.uuid = ?
+        `).get(fileUuid);
 
-        if (!guestCheck) {
-            return res.status(403).json({ error: "Access Denied: You are not invited to this vault." });
+        if (!fileData) return res.status(404).json({ error: "File not found." });
+
+        // 3. Check Bucket-Level RBAC
+        let finalPermission = null;
+
+        if (fileData.bucket_owner === userId) {
+            finalPermission = 'ADMIN'; // Owner of the bucket has ultimate power
+        } else {
+            const policy = db.prepare('SELECT permission FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
+                .get(fileData.bucket_id, userId);
+            
+            if (policy) finalPermission = policy.permission;
         }
 
-        // 3. Check if their guest role is high enough
-        const hierarchy = { 'VIEWER': 1, 'EDITOR': 2, 'OWNER': 3 };
-        if (hierarchy[guestCheck.role] < hierarchy[requiredRole]) {
-            return res.status(403).json({ error: `Forbidden: This action requires ${requiredRole} status.` });
+        if (!finalPermission) {
+            return res.status(403).json({ error: "Access Denied: You are not invited to this namespace." });
         }
 
-        req.userRole = guestCheck.role;
+        // 4. Weight Check
+        const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
+        if (weights[finalPermission] < weights[requiredPermission]) {
+            return res.status(403).json({ error: `Forbidden: Action requires ${requiredPermission} permission.` });
+        }
+
+        req.bucket_permission = finalPermission;
         next();
     };
 };

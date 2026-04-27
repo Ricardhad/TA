@@ -57,7 +57,7 @@ let tokenExpiry = 0;
 
 async function getSpokeToken() {
     const now = Math.floor(Date.now() / 1000);
-
+    
     if (cachedM2MToken && now < tokenExpiry) {
         console.log(`[AUTH] Using cached token ending in: ...${cachedM2MToken.slice(-5)}`);
         return cachedM2MToken;
@@ -76,6 +76,7 @@ async function getSpokeToken() {
     });
 
     const data = await response.json();
+    // console.log({data});
 
     // DIAGNOSTIC: If there is no access_token, Auth0 usually sends an 'error' field
     if (!data.access_token) {
@@ -218,45 +219,98 @@ app.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
     }
 });
 // get files list
+// app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
+//     const userId = req.auth.payload.sub;
+//     const search = req.query.search ? `%${req.query.search}%` : '%';
+
+//     try {
+//         let query, results;
+
+//         if (req.globalRole === 'admin') {
+//             query = db.prepare(`
+//                 SELECT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
+//                 FROM files f JOIN versions v ON f.id = v.file_id 
+//                 WHERE f.filename LIKE ? 
+//                 AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
+//             `);
+//             results = query.all(search);
+//         } else {
+//             query = db.prepare(`
+//                 SELECT DISTINCT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
+//                 FROM files f JOIN versions v ON f.id = v.file_id 
+//                 WHERE (f.owner_id = ? OR fa.user_id = ?) 
+//                 AND f.filename LIKE ?
+//                 AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
+//             `);
+//             results = query.all(userId, userId, search);
+//         }
+
+//         res.json(results);
+//     } catch (err) {
+//         res.status(500).json({ error: "Database query failed" });
+//     }
+// });
 app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
     const search = req.query.search ? `%${req.query.search}%` : '%';
+    const bucketUuid = req.headers['x-bucket-uuid']; // Sent by React when opening a bucket
 
     try {
-        let query, results;
+        let query, params;
 
-        if (req.globalRole === 'admin') {
+        if (req.globalRole === 'admin' && !bucketUuid) {
+            // 1. GOD MODE: Global File Explorer (Searches everything)
             query = db.prepare(`
-                SELECT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
+                SELECT f.uuid, f.filename, f.bucket_id, f.mime_type, v.size, v.timestamp 
                 FROM files f JOIN versions v ON f.id = v.file_id 
                 WHERE f.filename LIKE ? 
                 AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
             `);
-            results = query.all(search);
-        } else {
+            params = [search];
+            
+        } else if (bucketUuid) {
+            // 2. STANDARD MODE: Viewing inside a specific Bucket
             query = db.prepare(`
-                SELECT DISTINCT f.uuid, f.filename,f.bucket_id, f.mime_type, v.size, v.timestamp 
-                FROM files f JOIN versions v ON f.id = v.file_id 
-                LEFT JOIN file_access fa ON f.uuid = fa.file_uuid 
-                WHERE (f.owner_id = ? OR fa.user_id = ?) 
+                SELECT f.uuid, f.filename, f.bucket_id, f.mime_type, v.size, v.timestamp 
+                FROM files f 
+                JOIN versions v ON f.id = v.file_id 
+                JOIN buckets b ON f.bucket_id = b.id
+                LEFT JOIN bucket_policies bp ON b.id = bp.bucket_id AND bp.grantee_id = ?
+                WHERE b.uuid = ?
+                AND (b.owner_id = ? OR bp.permission IS NOT NULL)
                 AND f.filename LIKE ?
                 AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
             `);
-            results = query.all(userId, userId, search);
+            params = [userId, bucketUuid, userId, search];
+            
+        } else {
+            // Failsafe: Should not happen based on React UI flow
+            return res.json([]);
         }
 
-        res.json(results);
+        res.json(query.all(...params));
     } catch (err) {
+        console.error("[FILE LIST ERROR]", err.message);
         res.status(500).json({ error: "Database query failed" });
     }
 });
-
 app.get('/vault/identity', (req, res) => {
     const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
+    // const userdat = req.auth?.payload[`${namespace}`] || 'anonymous';
     // const object = req.auth?.payload || 'anonymous';
+    const userSub = req.auth?.payload.sub;
+
     try {
+        // db.prepare('INSERT INTO users (sub,email) VALUES (?, ?)').run(userSub,userEmail);
+        if (userSub && userEmail !== 'anonymous') {
+            db.prepare(`
+                INSERT INTO users (sub, email) 
+                VALUES (?, ?) 
+                ON CONFLICT(sub) DO UPDATE SET email = excluded.email
+            `).run(userSub, userEmail);
+        }
         res.json({ message: "username retrieved", user: userEmail, roles: userRoles });
     } catch (err) {
         console.error("SQL Error:", err);
@@ -451,7 +505,7 @@ app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRI
     req.pipe(busboy);
 });
 // get details
-app.get('/vault/files/:uuid/versions', authorizeVault('VIEWER'), (req, res) => {
+app.get('/vault/files/:uuid/versions', authorizeVault('READ'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
 
@@ -460,11 +514,11 @@ app.get('/vault/files/:uuid/versions', authorizeVault('VIEWER'), (req, res) => {
             SELECT v.version_num, v.timestamp, v.size, v.physical_path
             FROM versions v
             JOIN files f ON f.id = v.file_id
-            WHERE f.uuid = ? AND f.owner_id = ?
+            WHERE f.uuid = ? 
             ORDER BY v.version_num DESC
         `);
 
-        const history = query.all(fileUuid, userId);
+        const history = query.all(fileUuid);
         res.json(history);
     } catch (err) {
         res.status(500).json({ error: "Failed to retrieve history" });
@@ -495,7 +549,7 @@ app.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
 // gateway.js (
 // gateway.js (Jakarta VM)
 
-app.get('/vault/files/:uuid/content', authorizeVault('VIEWER'), async (req, res) => {
+app.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
     const requestedVersion = req.query.v;
@@ -504,10 +558,10 @@ app.get('/vault/files/:uuid/content', authorizeVault('VIEWER'), async (req, res)
         const fileInfo = db.prepare(`
             SELECT f.filename,f.mime_type, v.physical_path, v.size
             FROM files f JOIN versions v ON f.id = v.file_id
-            WHERE f.uuid = ? AND f.owner_id = ? 
+            WHERE f.uuid = ? 
             ${requestedVersion ? 'AND v.version_num = ?' : ''}
             ORDER BY v.version_num DESC LIMIT 1
-        `).get(requestedVersion ? [uuid, userId, requestedVersion] : [uuid, userId]);
+        `).get(requestedVersion ? [uuid, requestedVersion] : [uuid]);
 
         if (!fileInfo) return res.status(404).json({ error: "Version not found." });
 
@@ -606,7 +660,7 @@ app.get('/vault/files/:uuid/content', authorizeVault('VIEWER'), async (req, res)
 //             query = `SELECT f.uuid, f.filename,f.bucket_id, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
 //             params = [];
 //         } else {
-//             query = `SELECT DISTINCT f.uuid, f.filename,f.bucket_id, v.size FROM files f JOIN versions v ON f.id = v.file_id LEFT JOIN file_access fa ON f.uuid = fa.file_uuid WHERE (f.owner_id = ? OR fa.user_id = ?) AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
+//             query = `SELECT DISTINCT f.uuid, f.filename,f.bucket_id, v.size FROM files f JOIN versions v ON f.id = v.file_id AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)`;
 //             params = [userId, userId];
 //         }
 
@@ -617,7 +671,7 @@ app.get('/vault/files/:uuid/content', authorizeVault('VIEWER'), async (req, res)
 // }
 // );
 
-app.get('/vault/files/:uuid/links', authorizeVault('OWNER'), (req, res) => {
+app.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
     const ttl = parseInt(req.query.ttl) || 60; // Default 60 minutes
@@ -625,8 +679,8 @@ app.get('/vault/files/:uuid/links', authorizeVault('OWNER'), (req, res) => {
 
     try {
         // 1. Verify ownership
-        const file = db.prepare('SELECT filename FROM files WHERE uuid = ? AND owner_id = ?')
-            .get(fileUuid, userId);
+        const file = db.prepare('SELECT filename FROM files WHERE uuid = ?')
+            .get(fileUuid);
         if (!file) return res.status(404).json({ error: "File not found" });
 
         // 2. Create Expiry (Current time + TTL minutes)
@@ -656,7 +710,7 @@ app.get('/vault/files/:uuid/links', authorizeVault('OWNER'), (req, res) => {
     }
 });
 
-app.delete('/vault/files/:uuid', authorizeVault('OWNER'), async (req, res) => {
+app.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
     const requestedVersion = req.query.v;
@@ -666,10 +720,10 @@ app.delete('/vault/files/:uuid', authorizeVault('OWNER'), async (req, res) => {
         const fileInfo = db.prepare(`
             SELECT f.filename, v.id as v_id, v.physical_path 
             FROM files f JOIN versions v ON f.id = v.file_id
-            WHERE f.uuid = ? AND f.owner_id = ? 
+            WHERE f.uuid = ? 
             ${requestedVersion ? 'AND v.version_num = ?' : ''}
             ORDER BY v.version_num DESC LIMIT 1
-        `).get(requestedVersion ? [uuid, userId, requestedVersion] : [uuid, userId]);
+        `).get(requestedVersion ? [uuid,  requestedVersion] : [uuid]);
 
         if (!fileInfo) return res.status(404).json({ error: "Version not found." });
 
@@ -742,44 +796,43 @@ app.get('/vault/buckets', (req, res) => {
         res.status(500).json({ error: "Could not fetch buckets." });
     }
 });
-app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
-    const { bucketUuid } = req.params;
-    const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
+// app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
+//     const { bucketUuid } = req.params;
+//     const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
 
-    // 1. Validation
-    if (!grantee_id || !['READ', 'WRITE'].includes(permission)) {
-        return res.status(400).json({ error: "Invalid request. Need grantee_id and permission (READ/WRITE)." });
-    }
+//     // 1. Validation
+//     if (!grantee_id || !['READ', 'WRITE'].includes(permission)) {
+//         return res.status(400).json({ error: "Invalid request. Need grantee_id and permission (READ/WRITE)." });
+//     }
 
-    try {
-        // 2. Get internal Bucket ID
-        const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(bucketUuid);
+//     try {
+//         // 2. Get internal Bucket ID
+//         const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(bucketUuid);
 
-        // 3. Insert the Policy
-        // Use INSERT OR REPLACE so you can "Update" a user's permission easily
-        db.prepare(`
-            INSERT INTO bucket_policies (bucket_id, grantee_id, permission)
-            VALUES (?, ?, ?)
-            ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission
-        `).run(bucket.id, grantee_id, permission);
+//         // 3. Insert the Policy
+//         // Use INSERT OR REPLACE so you can "Update" a user's permission easily
+//         db.prepare(`
+//             INSERT INTO bucket_policies (bucket_id, grantee_id, permission)
+//             VALUES (?, ?, ?)
+//             ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission
+//         `).run(bucket.id, grantee_id, permission);
 
-        // 4. Audit Log
-        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
-            .run(req.auth.payload.sub, `INVITED_${grantee_id}_TO_${bucket.name}`, 'SUCCESS');
+//         // 4. Audit Log
+//         db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+//             .run(req.auth.payload.sub, `INVITED_${grantee_id}_TO_${bucket.name}`, 'SUCCESS');
 
-        res.json({ status: "Member added", bucket: bucket.name, user: grantee_id, role: permission });
-    } catch (err) {
-        console.error("[SHARE ERROR]", err.message);
-        res.status(500).json({ error: "Failed to share bucket." });
-    }
-});
+//         res.json({ status: "Member added", bucket: bucket.name, user: grantee_id, role: permission });
+//     } catch (err) {
+//         console.error("[SHARE ERROR]", err.message);
+//         res.status(500).json({ error: "Failed to share bucket." });
+//     }
+// });
 app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid, userId } = req.params;
 
     try {
         const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
 
-        // Prevent the owner from kicking themselves (Safety first!)
         const bucketOwner = db.prepare('SELECT owner_id FROM buckets WHERE id = ?').get(bucket.id);
         if (userId === bucketOwner.owner_id) {
             return res.status(400).json({ error: "Cannot revoke access from the bucket owner." });
@@ -793,6 +846,7 @@ app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'),
         res.status(500).json({ error: "Failed to remove member." });
     }
 });
+
 app.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid } = req.params;
     const { name, region } = req.body;
@@ -811,6 +865,107 @@ app.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
         res.status(500).json({ error: "Failed to update bucket." });
     }
 });
+
+app.get('/vault/users/search', permitGlobalRole('standard_user'), (req, res) => {
+    const searchQuery = req.query.q;
+    const currentUserId = req.auth.payload.sub;
+
+    if (!searchQuery || searchQuery.length < 2) {
+        return res.json([]);
+    }
+
+    try {
+        const users = db.prepare(`
+            SELECT sub as user_id, email 
+            FROM users 
+            WHERE email LIKE ? AND sub != ?
+            LIMIT 5
+        `).all(`%${searchQuery}%`, currentUserId);
+
+        res.json(users);
+    } catch (err) {
+        console.error("[SEARCH ERROR]", err.message);
+        res.status(500).json({ error: "Failed to search users." });
+    }
+});
+app.get('/vault/notifications', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    
+    try {
+        const notes = db.prepare(`
+            SELECT id, message, timestamp 
+            FROM notifications 
+            WHERE user_id = ? AND is_read = 0 
+            ORDER BY timestamp DESC
+        `).all(userId);
+        
+        res.json(notes);
+    } catch (err) {
+        console.error("[NOTIFY ERROR]", err.message);
+        res.status(500).json({ error: "Failed to fetch notifications." });
+    }
+});
+
+// 2. Clear (mark as read) all notifications for the user
+app.post('/vault/notifications/clear', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    
+    try {
+        // We do a soft delete (is_read = 1) instead of a hard DELETE to preserve the audit trail if needed
+        db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(userId);
+        res.json({ status: "Notifications cleared." });
+    } catch (err) {
+        console.error("[NOTIFY CLEAR ERROR]", err.message);
+        res.status(500).json({ error: "Failed to clear notifications." });
+    }
+});
+app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
+    const { bucketUuid } = req.params;
+    const { email, permission } = req.body; // Menerima Email, bukan ID panjang
+    const inviterId = req.auth.payload.sub;
+
+    if (!email || !['READ', 'WRITE'].includes(permission)) {
+        return res.status(400).json({ error: "Invalid payload. Requires email and permission." });
+    }
+
+    try {
+        const targetUser = db.prepare('SELECT sub FROM users WHERE email = ?').get(email);
+
+        if (!targetUser) {
+            return res.status(404).json({
+                error: "User not found.",
+                message: "Target user must log into RiccBox at least once before they can be invited."
+            });
+        }
+
+        const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(bucketUuid);
+        if (!bucket) return res.status(404).json({ error: "Bucket not found." });
+
+        db.prepare(`
+            INSERT INTO bucket_policies (bucket_id, grantee_id, permission)
+            VALUES (?, ?, ?)
+            ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission
+        `).run(bucket.id, targetUser.sub, permission);
+
+        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+            .run(req.auth.payload[`${process.env.NAMESPACE}/email`], `INVITED_${email}_TO_${bucket.name}`, 'SUCCESS');
+        const message = `Access Granted: You now have ${permission} rights to the namespace '${bucket.name}'.`;
+
+        db.prepare('INSERT INTO notifications (user_id, message) VALUES (?, ?)')
+            .run(targetUser.sub, message);
+        res.json({
+            status: "Invitation Successful",
+            bucket: bucket.name,
+            invited_user: email,
+            role: permission
+        });
+
+    } catch (err) {
+        console.error("[INVITE ERROR]", err.message);
+        res.status(500).json({ error: "Failed to invite user to bucket." });
+    }
+});
+
 app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
     try {
         const dbFiles = db.prepare(`
