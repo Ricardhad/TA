@@ -1,184 +1,233 @@
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
+/* Mengimpor font Inter dari Google Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
-
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
-}
-
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
-
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
-    }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
-}
-
-#docs {
-  border-right: 1px solid var(--border);
-
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-}
-
-#next-steps ul {
-  list-style: none;
+/* --- Reset & Global Styling --- */
+body {
+  margin: 0;
   padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  background-color: #f3f4f6; /* Latar belakang abu-abu sangat terang (Light Mode) */
+  color: #1f2937; /* Teks warna abu-abu gelap kehitaman */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
+.App {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 30px 20px;
 }
 
-.ticks {
-  position: relative;
+h1, h2, h3, h4 {
+  font-weight: 700;
+  color: #111827; /* Hitam tegas untuk judul */
+  letter-spacing: -0.02em;
+}
+
+/* --- Buttons --- */
+button {
+  font-family: 'Inter', sans-serif;
+  padding: 10px 16px;
+  border-radius: 8px; /* Ujung yang melengkung elegan */
+  border: 1px solid #d1d5db; /* Border abu-abu terang */
+  background-color: #ffffff; /* Tombol putih */
+  color: #374151; /* Teks tombol gelap */
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05); /* Bayangan sangat halus */
+}
+
+button:hover:not(:disabled) {
+  background-color: #f9fafb;
+  border-color: #9ca3af;
+  transform: translateY(-1px); /* Efek melayang */
+  box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background-color: #f3f4f6;
+}
+
+/* --- Inputs & Forms --- */
+input, select {
+  font-family: 'Inter', sans-serif;
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  background-color: #ffffff;
+  color: #1f2937;
+  outline: none;
+  font-size: 0.95rem;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+input:focus, select:focus {
+  border-color: #3b82f6; /* Warna biru saat fokus */
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15); /* Cincin biru bersinar */
+}
+
+input::placeholder {
+  color: #9ca3af;
+}
+
+/* --- Layout Containers --- */
+.vault-container {
+  background-color: #ffffff !important; /* Paksa menjadi putih */
+  padding: 30px;
+  border-radius: 16px; /* Sudut sangat membulat */
+  border: 1px solid #e5e7eb; /* Border halus */
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03); /* Bayangan terang */
+  margin-bottom: 25px;
+}
+
+.vault-container.admin-panel {
+  background-color: #f9fafb !important;
+}
+
+/* --- Tables --- */
+.vault-table {
   width: 100%;
+  border-collapse: separate;
+  border-spacing: 0 8px; /* Jarak antar baris tabel */
+  margin-top: 15px;
+}
 
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
+.vault-table th {
+  padding: 12px 16px;
+  text-align: left;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6b7280;
+  border-bottom: none;
+}
 
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
-  }
+.vault-table td {
+  padding: 16px;
+  background-color: #ffffff; /* Baris tabel berwarna putih */
+  color: #374151;
+  font-size: 0.95rem;
+  border-top: 1px solid #f3f4f6;
+  border-bottom: 1px solid #f3f4f6;
+  transition: background-color 0.2s, transform 0.2s;
+}
+
+/* Melengkungkan sudut kiri tabel */
+.vault-table tr td:first-child {
+  border-top-left-radius: 8px;
+  border-bottom-left-radius: 8px;
+  border-left: 1px solid #f3f4f6;
+}
+
+/* Melengkungkan sudut kanan tabel */
+.vault-table tr td:last-child {
+  border-top-right-radius: 8px;
+  border-bottom-right-radius: 8px;
+  border-right: 1px solid #f3f4f6;
+}
+
+.vault-table tr:hover td {
+  background-color: #f9fafb; /* Latar berubah abu-abu super terang saat di-hover */
+}
+
+/* --- Modals & Overlays --- */
+.modal-overlay {
+  backdrop-filter: blur(4px); 
+  background-color: rgba(17, 24, 39, 0.4) !important; /* Hitam transparan yang lebih terang */
+}
+
+/* --- Badges --- */
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* --- Utilities --- */
+.loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  font-size: 1.2rem;
+  font-weight: 500;
+  color: #6b7280;
+}
+
+/* --- Scrollbar Custom (Light Theme) --- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f3f4f6; 
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1; 
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af; 
+}
+
+/* ========================================================================= */
+/* CSS HACKS: MEMAKSA INLINE STYLE GELAP DI APP.JSX MENJADI TERANG           */
+/* ========================================================================= */
+
+/* Memaksa background modal dan kotak info menjadi putih */
+div[style*="background: #222"], 
+div[style*="background: '#222'"],
+div[style*="background: #111"], 
+div[style*="background: '#111'"],
+div[style*="background: #2a2a2a"], 
+div[style*="background: '#2a2a2a'"],
+div[style*="background: #1e1e1e"], 
+div[style*="background: '#1e1e1e'"] {
+  background-color: #ffffff !important;
+  border: 1px solid #e5e7eb !important;
+  color: #1f2937 !important;
+}
+
+/* Memaksa area admin (background #333) menjadi abu-abu cerah */
+div[style*="background: #333"], 
+div[style*="background: '#333'"] {
+  background-color: #f9fafb !important;
+  border: 1px solid #e5e7eb !important;
+  color: #1f2937 !important;
+}
+
+/* Mengubah teks putih paksaan menjadi teks gelap */
+*[style*="color: #fff"], 
+*[style*="color: '#fff'"] {
+  color: #111827 !important;
+}
+
+/* Mengubah teks abu-abu gelap paksaan menjadi lebih ramah dibaca */
+*[style*="color: #aaa"], 
+*[style*="color: '#aaa'"],
+*[style*="color: #ccc"], 
+*[style*="color: '#ccc'"] {
+  color: #4b5563 !important;
+}
+
+/* Memperbaiki border-bottom keras di header/modal */
+*[style*="border-bottom: 1px solid #444"],
+*[style*="borderBottom: '1px solid #444'"],
+*[style*="border-bottom: 2px solid #555"],
+*[style*="borderBottom: '2px solid #555'"] {
+  border-bottom-color: #e5e7eb !important;
 }

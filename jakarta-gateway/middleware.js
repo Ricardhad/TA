@@ -50,53 +50,53 @@ export const permitGlobalRole = (requiredRole) => {
 //         next();
 //     };
 // };
-export const authorizeVault = (requiredPermission = 'READ') => {
-    return (req, res, next) => {
-        const userId = req.auth.payload.sub;
-        const fileUuid = req.params.uuid;
+// export const authorizeVault = (requiredPermission = 'READ') => {
+//     return (req, res, next) => {
+//         const userId = req.auth.payload.sub;
+//         const fileUuid = req.params.uuid;
 
-        // 1. Global Admin Bypass
-        if (req.globalRole === 'admin') {
-            req.bucket_permission = 'ADMIN';
-            return next();
-        }
+//         // 1. Global Admin Bypass
+//         if (req.globalRole === 'admin') {
+//             req.bucket_permission = 'ADMIN';
+//             return next();
+//         }
 
-        // 2. Find the file AND its parent bucket
-        const fileData = db.prepare(`
-            SELECT f.bucket_id, b.owner_id as bucket_owner
-            FROM files f
-            JOIN buckets b ON f.bucket_id = b.id
-            WHERE f.uuid = ?
-        `).get(fileUuid);
+//         // 2. Find the file AND its parent bucket
+//         const fileData = db.prepare(`
+//             SELECT f.bucket_id, b.owner_id as bucket_owner
+//             FROM files f
+//             JOIN buckets b ON f.bucket_id = b.id
+//             WHERE f.uuid = ?
+//         `).get(fileUuid);
 
-        if (!fileData) return res.status(404).json({ error: "File not found." });
+//         if (!fileData) return res.status(404).json({ error: "File not found." });
 
-        // 3. Check Bucket-Level RBAC
-        let finalPermission = null;
+//         // 3. Check Bucket-Level RBAC
+//         let finalPermission = null;
 
-        if (fileData.bucket_owner === userId) {
-            finalPermission = 'ADMIN'; // Owner of the bucket has ultimate power
-        } else {
-            const policy = db.prepare('SELECT permission FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
-                .get(fileData.bucket_id, userId);
+//         if (fileData.bucket_owner === userId) {
+//             finalPermission = 'ADMIN'; // Owner of the bucket has ultimate power
+//         } else {
+//             const policy = db.prepare('SELECT permission FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
+//                 .get(fileData.bucket_id, userId);
             
-            if (policy) finalPermission = policy.permission;
-        }
+//             if (policy) finalPermission = policy.permission;
+//         }
 
-        if (!finalPermission) {
-            return res.status(403).json({ error: "Access Denied: You are not invited to this namespace." });
-        }
+//         if (!finalPermission) {
+//             return res.status(403).json({ error: "Access Denied: You are not invited to this namespace." });
+//         }
 
-        // 4. Weight Check
-        const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
-        if (weights[finalPermission] < weights[requiredPermission]) {
-            return res.status(403).json({ error: `Forbidden: Action requires ${requiredPermission} permission.` });
-        }
+//         // 4. Weight Check
+//         const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
+//         if (weights[finalPermission] < weights[requiredPermission]) {
+//             return res.status(403).json({ error: `Forbidden: Action requires ${requiredPermission} permission.` });
+//         }
 
-        req.bucket_permission = finalPermission;
-        next();
-    };
-};
+//         req.bucket_permission = finalPermission;
+//         next();
+//     };
+// };
 
 export const validateFileSecurity = (filename, headerMime) => {
     const extensionMime = mime.lookup(filename);
@@ -118,44 +118,134 @@ export const validateFileSecurity = (filename, headerMime) => {
     };
 };
 
+// export function authorizeBucket(requiredPermission) {
+//     return (req, res, next) => {
+//         const userId = req.auth.payload.sub;
+//         const bucketUuid = req.headers['x-bucket-uuid'] || req.params.bucketUuid;
+
+//         // 1. Global Admin Bypass
+//         if (req.globalRole === 'admin') {
+//             req.bucket_permission = 'ADMIN';
+//             return next();
+//         }
+
+//         if (!bucketUuid) return res.status(400).json({ error: "Bucket UUID is required" });
+
+//         // Inside authorizeBucket middleware
+//         const bucketData = db.prepare(`
+//     SELECT b.owner_id, p.permission 
+//     FROM buckets b
+//     LEFT JOIN bucket_policies p ON b.id = p.bucket_id AND p.grantee_id = ?
+//     WHERE b.uuid = ?
+// `).get(userId, bucketUuid);
+
+//         if (!bucketData) return res.status(404).json({ error: "Bucket not found" });
+
+//         // 👑 THE FIX:
+//         let finalPermission = bucketData.permission;
+
+//         if (bucketData.owner_id === userId) {
+//             finalPermission = 'ADMIN'; // Owner is always Admin
+//         }
+
+//         if (!finalPermission) {
+//             return res.status(403).json({
+//                 error: "Access Denied: No policy found for this user.",
+//                 debug: { owner: bucketData.owner_id, requester: userId } // Useful for debugging
+//             });
+//         }
+
+//         // 5. Weight Check
+//         const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
+//         if (weights[finalPermission] < weights[requiredPermission]) {
+//             return res.status(403).json({
+//                 error: "Insufficient Permissions",
+//                 required: requiredPermission,
+//                 current: finalPermission
+//             });
+//         }
+
+//         req.bucket_permission = finalPermission;
+//         next();
+//     };
+// }
+export const authorizeVault = (requiredPermission = 'READ') => {
+    return (req, res, next) => {
+        const userId = req.auth.payload.sub;
+        const fileUuid = req.params.uuid;
+
+        // 1. Find the file AND its parent bucket
+        const fileData = db.prepare(`
+            SELECT f.bucket_id, b.owner_id as bucket_owner
+            FROM files f
+            JOIN buckets b ON f.bucket_id = b.id
+            WHERE f.uuid = ?
+        `).get(fileUuid);
+
+        if (!fileData) return res.status(404).json({ error: "File not found." });
+
+        // 2. Check Bucket-Level RBAC
+        let finalPermission = null;
+
+        if (fileData.bucket_owner === userId) {
+            finalPermission = 'ADMIN'; // Owner of the bucket has ultimate power
+        } else {
+            const policy = db.prepare('SELECT permission FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
+                .get(fileData.bucket_id, userId);
+            
+            if (policy) finalPermission = policy.permission;
+        }
+
+        // 3. Evalusi Keamanan (Admin Global Bypass Dihapus!)
+        if (!finalPermission) {
+            // Pengecualian SATU-SATUNYA: Jika Admin Global ingin menghapus fail dari "Global File Explorer" (Force Purge)
+            if (req.globalRole === 'admin' && requiredPermission === 'WRITE' && req.path.includes(fileUuid)) {
+                 return next();
+            }
+            return res.status(403).json({ error: "Access Denied: You are not invited to this namespace." });
+        }
+
+        // 4. Weight Check
+        const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
+        if (weights[finalPermission] < weights[requiredPermission]) {
+            return res.status(403).json({ error: `Forbidden: Action requires ${requiredPermission} permission.` });
+        }
+
+        req.bucket_permission = finalPermission;
+        next();
+    };
+};
+
 export function authorizeBucket(requiredPermission) {
     return (req, res, next) => {
         const userId = req.auth.payload.sub;
         const bucketUuid = req.headers['x-bucket-uuid'] || req.params.bucketUuid;
 
-        // 1. Global Admin Bypass
-        if (req.globalRole === 'admin') {
-            req.bucket_permission = 'ADMIN';
-            return next();
-        }
-
         if (!bucketUuid) return res.status(400).json({ error: "Bucket UUID is required" });
 
-        // Inside authorizeBucket middleware
         const bucketData = db.prepare(`
-    SELECT b.owner_id, p.permission 
-    FROM buckets b
-    LEFT JOIN bucket_policies p ON b.id = p.bucket_id AND p.grantee_id = ?
-    WHERE b.uuid = ?
-`).get(userId, bucketUuid);
+            SELECT b.owner_id, p.permission 
+            FROM buckets b
+            LEFT JOIN bucket_policies p ON b.id = p.bucket_id AND p.grantee_id = ?
+            WHERE b.uuid = ?
+        `).get(userId, bucketUuid);
 
         if (!bucketData) return res.status(404).json({ error: "Bucket not found" });
 
-        // 👑 THE FIX:
         let finalPermission = bucketData.permission;
 
         if (bucketData.owner_id === userId) {
-            finalPermission = 'ADMIN'; // Owner is always Admin
+            finalPermission = 'ADMIN'; 
         }
 
+        // Evalusi Keamanan (Admin Global Bypass Dihapus!)
         if (!finalPermission) {
             return res.status(403).json({
                 error: "Access Denied: No policy found for this user.",
-                debug: { owner: bucketData.owner_id, requester: userId } // Useful for debugging
+                debug: { owner: bucketData.owner_id, requester: userId } 
             });
         }
 
-        // 5. Weight Check
         const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
         if (weights[finalPermission] < weights[requiredPermission]) {
             return res.status(403).json({

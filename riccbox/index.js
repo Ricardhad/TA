@@ -1,15 +1,4 @@
-// const multer = require('multer');
-// const { get } = require('http');
-// const { randomUUID } = require ('crypto');
-// import fs from 'fs/promises';
-// const newUuid = randomUUID();
 
-// const express = require('express');
-// const path = require('path');
-// const fs = require('fs/promises');
-// const crypto = require('crypto');
-// const { Readable } =require ('stream');
-// require('dotenv').config();
 import express from 'express';
 import crypto from 'crypto';
 import fs from 'fs';         
@@ -19,35 +8,30 @@ import path, { dirname } from 'path';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { auth } from 'express-oauth2-jwt-bearer';
+
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
-const SPOKE_IP= process.env.SPOKE_IP 
+const SPOKE_IP = process.env.SPOKE_IP || '0.0.0.0'; 
 
-// 2. For standard form data (if you ever use it)
 app.use(express.urlencoded({ 
     limit: '1mb', 
     extended: true 
 }));
-// CONFIG: Ensure VAULT_KEY in .env is exactly 32 characters
-// const MASTER_KEY = process.env.VAULT_KEY; 
-// const ALGORITHM = 'aes-256-gcm';
-// const IV_LENGTH = 12;
-// const TAG_LENGTH = 16;
+
 const MASTER_KEY = Buffer.from(process.env.VAULT_KEY, 'hex');
 
-// Check to make sure it's correct
 if (MASTER_KEY.length !== 32) {
     throw new Error("VAULT_KEY must be a 64-character hex string (32 bytes)");
 }
+
 const checkHubIdentity = auth({
-    audience: process.env.AUTH0_AUDIENCE, // https://richardgatewayta.duckdns.org
+    audience: process.env.AUTH0_AUDIENCE, 
     issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
     tokenSigningAlg: 'RS256'
 });
 
-// 2. IP FILTER: A secondary check to ensure traffic is coming over the VPN (172.x)
 const vpnOnly = (req, res, next) => {
     const incomingIp = req.ip || req.connection.remoteAddress;
     if (process.env.NODE_ENV === 'production' && !incomingIp.includes(process.env.HUB_VPN_IP)) {
@@ -57,27 +41,46 @@ const vpnOnly = (req, res, next) => {
     next();
 };
 
-// const STORAGE_DIR = path.join(__dirname, 'vault_storage');
+const calculateFileHash = (filePath) => {
+    return new Promise((resolve, reject) => {
+        // Kita menghitung hash dari raw file di disk (sudah terenkripsi + IV + Tag)
+        // karena itu adalah data fisik yang rentan mengalami bit rot.
+        const hash = crypto.createHash('sha256');
+        const stream = fs.createReadStream(filePath);
+        
+        stream.on('data', (chunk) => hash.update(chunk));
+        stream.on('end', () => resolve(hash.digest('hex')));
+        stream.on('error', (err) => reject(err));
+    });
+};
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const STORAGE_DIR = path.join(__dirname, 'vault_storage');
-app.use('/internal',checkHubIdentity); // 1. Authenticate the Hub's JWT
-app.use(vpnOnly); // 2. Ensure it's coming from the VPN IP
-// 1. STORAGE: Use MemoryStorage so the raw file never touches your disk
-// const upload = multer({ storage: multer.memoryStorage() });
+const STORAGE_DIR = path.join(__dirname, 'vault_storage'); // Pastikan direktori ini konsisten digunakan
+
+// Membuat folder jika belum ada
+if (!fs.existsSync(STORAGE_DIR)){
+    fs.mkdirSync(STORAGE_DIR);
+}
+
+app.use('/internal', checkHubIdentity); 
+app.use(vpnOnly); 
+
 app.use((err, req, res, next) => {
   if (err.name === 'UnauthorizedError') {
-    console.error("[SECURITY] Token Rejected:", err.message); // This will tell us why!
+    console.error("[SECURITY] Token Rejected:", err.message); 
     return res.status(401).json({ error: "Invalid Token", detail: err.message });
   }
   next(err);
 });
 
+// ==========================================
+// 1. RUTE UNGGAH DAN ENKRIPSI + HASING
+// ==========================================
 app.post('/internal/files', (req, res) => {
-    // If headers are missing, we use a fallback
     const originalName = req.headers['x-original-name'] || 'uploaded-file';
     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
-    const vaultPath = path.join(__dirname, 'vault_storage', safeName);
+    const vaultPath = path.join(STORAGE_DIR, safeName);
 
     console.log(`[SPOKE] Receiving stream: ${originalName}`);
 
@@ -85,22 +88,50 @@ app.post('/internal/files', (req, res) => {
     const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
     const writeStream = fs.createWriteStream(vaultPath);
 
-    // Write IV at the start of the file
     writeStream.write(iv);
 
-    // PIPE: User -> Cipher -> Disk
-    req.pipe(cipher).pipe(writeStream);
+    // KITA AKAN MENGHITUNG HASH DARI DATA FISIK YANG TERSIMPAN DI DISK
+    // Ini berarti hash mencakup IV + Ciphertext + Tag
+    const hash = crypto.createHash('sha256');
+    let rawFileSize = 0; // Ukuran sebelum enkripsi (sebagai informasi)
 
-    writeStream.on('finish', () => {
+    req.on('data', (chunk) => {
+        rawFileSize += chunk.length;
+    });
+
+    // Pipa 1: Enkripsi aliran data
+    req.pipe(cipher);
+
+    // Pipa 2: Menulis hasil enkripsi ke file
+    cipher.on('data', (chunk) => {
+        writeStream.write(chunk);
+    });
+
+    cipher.on('end', () => {
         const authTag = cipher.getAuthTag();
-        fs.appendFileSync(vaultPath, authTag); // Append Tag at the end
-        
-        const stats = fs.statSync(vaultPath);
-        res.status(200).json({
-            status: "Success",
-            physical_path: safeName,
-            size: stats.size
-        });
+        writeStream.write(authTag); // Tulis tag di akhir
+        writeStream.end(); // Tutup aliran penulisan
+    });
+
+    // Pipa 3: Setelah file selesai ditulis, hitung hash-nya
+    writeStream.on('finish', async () => {
+        try {
+            // Setelah file utuh di disk, hitung hash SHA-256-nya
+            const finalChecksum = await calculateFileHash(vaultPath);
+            const stats = fs.statSync(vaultPath);
+            
+            console.log(`[SPOKE] Saved: ${safeName} | Physical Size: ${stats.size} | Hash: ${finalChecksum}`);
+            
+            res.status(200).json({
+                status: "Success",
+                physical_path: safeName,
+                size: stats.size, // Menggunakan ukuran fisik file di disk
+                checksum: finalChecksum
+            });
+        } catch (hashErr) {
+            console.error("Hashing Error:", hashErr);
+            res.status(500).send("Hashing Failure");
+        }
     });
 
     writeStream.on('error', (err) => {
@@ -108,74 +139,27 @@ app.post('/internal/files', (req, res) => {
         res.status(500).send("Storage Failure");
     });
 });
-// Surabaya index.js
-app.post('/internal/test/test-upload', (req, res) => {
-    let bytesReceived = 0;
 
-    req.on('data', (chunk) => {
-        bytesReceived += chunk.length;
-    });
-
-    req.on('end', () => {
-        console.log(`[STRESS TEST] Received and discarded: ${(bytesReceived / 1024 / 1024 / 1024).toFixed(2)} GB`);
-        res.json({ status: "Discarded", size_gb: bytesReceived / 1024 / 1024 / 1024 });
-    });
-
-    req.on('error', (err) => {
-        console.error("Test stream failed:", err.message);
-        res.status(500).send("Stream broken");
-    });
-});
-
-app.get('/internal/test/test-download', (req, res) => {
-    const totalSize = 10 * 1024 * 1024 * 1024; // 10 GB
-    let sent = 0;
-
-    const dummyStream = new Readable({
-        read(size) {
-            const remaining = totalSize - sent;
-            if (remaining <= 0) {
-                this.push(null); // End of stream
-            } else {
-                const chunkSize = Math.min(size, remaining);
-                this.push(Buffer.alloc(chunkSize, 0)); // Send actual zeros
-                sent += chunkSize;
-            }
-        }
-    });
-
-    res.setHeader('Content-Length', totalSize);
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', 'attachment; filename="10GB_dummy.dat"');
-
-    console.log(`[STRESS TEST] Starting 10GB generator...`);
-    dummyStream.pipe(res);
-});
-
-// Surabaya index.js
+// ==========================================
+// 2. RUTE PERAWATAN DAN BIT ROT
+// ==========================================
 app.use(express.json({ 
     limit: '1mb', 
     strict: true 
 }));
+
 app.get('/internal/health', (req, res) => {
     res.json({
         status: "ONLINE",
         timestamp: new Date().toISOString(),
-        storage: {
-            free: "450GB",
-            total: "1TB"
-        }
+        storage: { free: "450GB", total: "1TB" }
     });
 });
-app.get('/internal/inventory', async (req, res) => {
 
+app.get('/internal/inventory', async (req, res) => {
     try {
         const files = await fsp.readdir(STORAGE_DIR);
-        
-        // Filter out hidden files like .gitignore if necessary
         const physicalFiles = files.filter(f => !f.startsWith('.'));
-        
-        console.log(`[MAINTENANCE] Reporting ${physicalFiles.length} files to Jakarta Hub.`);
         res.json(physicalFiles);
     } catch (err) {
         console.error("[SPOKE ERROR] Disk scan failed:", err.message);
@@ -183,17 +167,12 @@ app.get('/internal/inventory', async (req, res) => {
     }
 });
 
-
-// index.js (Surabaya Spoke)
-// 1. SINGLE DELETE (Improved)
 app.delete('/internal/files/:filename', async (req, res) => {
-    // Sanitize to prevent Path Traversal
     const safeName = path.basename(req.params.filename); 
     const filePath = path.join(STORAGE_DIR, safeName);
-
     try {
-        await fs.access(filePath); // Check if exists
-        await fs.unlink(filePath); // Async delete
+        await fsp.access(filePath); 
+        await fsp.unlink(filePath); 
         console.log(`[SPOKE] Purged: ${safeName}`);
         res.json({ status: "Deleted" });
     } catch (err) {
@@ -201,29 +180,71 @@ app.delete('/internal/files/:filename', async (req, res) => {
     }
 });
 
-// 2. BULK PURGE (For your Audit/Sync)
 app.post('/internal/maintenance/purge', async (req, res) => {
-    const { files } = req.body; // Array of filenames from the Jakarta Audit
-
+    const { files } = req.body; 
     if (!Array.isArray(files)) return res.status(400).send("Invalid list.");
-
     const results = { success: 0, failed: 0 };
-
-    // Delete everything in parallel!
     await Promise.all(files.map(async (filename) => {
         try {
             const safeName = path.basename(filename);
-            await fs.unlink(path.join(STORAGE_DIR, safeName));
+            await fsp.unlink(path.join(STORAGE_DIR, safeName));
             results.success++;
         } catch (err) {
             results.failed++;
         }
     }));
-
     console.log(`[MAINTENANCE] Bulk Purge Complete: ${results.success} removed.`);
     res.json(results);
 });
 
+// AGEN PEMINDAI BIT ROT
+app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
+    res.json({ status: "Bit Rot scan initiated in the background." });
+
+    // 🆕 FIX: Menggunakan STORAGE_DIR bukan 'vault_data'
+    console.log(`[MAINTENANCE] Starting Bit Rot Scan on ${STORAGE_DIR}...`);
+
+    try {
+        const files = fs.readdirSync(STORAGE_DIR);
+        const reportPayload = [];
+
+        for (const file of files) {
+            const filePath = path.join(STORAGE_DIR, file);
+            const stat = fs.statSync(filePath);
+
+            // Hanya pindai file enkripsi (abaikan folder tersembunyi atau file .keep)
+            if (stat.isFile() && file.endsWith('.enc')) {
+                const currentHash = await calculateFileHash(filePath);
+                reportPayload.push({
+                    path: file,
+                    hash: currentHash
+                });
+            }
+        }
+
+        console.log(`[MAINTENANCE] Scan complete. Audited ${reportPayload.length} files. Sending to Gateway...`);
+
+        // Untuk menembak ke Gateway, kita membutuhkan akses token M2M dari Spoke
+        // Anda perlu mereplikasi logika getSpokeToken() di sini jika Gateway mewajibkan autentikasi
+        // Asumsi sementara rute Gateway ini dilindungi JWT.
+        
+        // --- CONTOH PEMANGGILAN FETCH (Sesuaikan URL) ---
+        // await fetch(`http://{IP_GATEWAY_ANDA}:8080/api/v1/vault/admin/bitrot-report`, {
+        //     method: 'POST',
+        //     headers: { 'Content-Type': 'application/json' },
+        //     body: JSON.stringify(reportPayload)
+        // });
+
+        console.log("[MAINTENANCE] Report payload generated (Needs Auth implementation to deliver to Gateway).");
+
+    } catch (err) {
+        console.error("[MAINTENANCE ERROR] Bit Rot Scan Failed:", err);
+    }
+});
+
+// ==========================================
+// 3. RUTE PENGUNDUHAN DEKRIPSI
+// ==========================================
 app.get('/internal/files/:filename', (req, res) => {
     const filename = path.basename(req.params.filename);
     const filePath = path.join(STORAGE_DIR, filename);
@@ -234,11 +255,9 @@ app.get('/internal/files/:filename', (req, res) => {
         const stats = fs.statSync(filePath);
         const fd = fs.openSync(filePath, 'r');
 
-        // 1. Read the IV (First 12 bytes)
         const iv = Buffer.alloc(12);
         fs.readSync(fd, iv, 0, 12, 0);
 
-        // 2. Read the Auth Tag (Last 16 bytes)
         const tag = Buffer.alloc(16);
         fs.readSync(fd, tag, 0, 16, stats.size - 16);
         fs.closeSync(fd);
@@ -246,13 +265,9 @@ app.get('/internal/files/:filename', (req, res) => {
         const finalDecipher = crypto.createDecipheriv('aes-256-gcm', MASTER_KEY, iv);
         finalDecipher.setAuthTag(tag);
 
-        // 4. THE DECRYPTION PIPE
-        // We read from 12 (after IV) to size-16 (before Tag)
         const readStream = fs.createReadStream(filePath, { start: 12, end: stats.size - 17 });
         
         console.log(`[SPOKE] Decrypting stream: ${filename}`);
-
-        // Pipe: Disk -> Decipher -> Jakarta (Response)
         readStream.pipe(finalDecipher).pipe(res);
 
     } catch (err) {
@@ -261,9 +276,52 @@ app.get('/internal/files/:filename', (req, res) => {
     }
 });
 
+app.post('/internal/files/copy', async (req, res) => {
+    const { source_path } = req.body;
+    
+    // Validasi sederhana agar tidak kena Path Traversal
+    const safeSource = path.basename(source_path); 
+    const sourcePathFull = path.join(STORAGE_DIR, safeSource);
+    
+    // Buat nama fail fisik yang sepenuhnya baru
+    const newSafeName = `${Date.now()}-restored-${crypto.randomUUID()}.enc`;
+    const destPathFull = path.join(STORAGE_DIR, newSafeName);
+
+    try {
+        // Gandakan fail secara fisik di dalam disk lokal Surabaya
+        await fsp.copyFile(sourcePathFull, destPathFull);
+        
+        // Dapatkan metadatanya untuk dikembalikan ke Jakarta
+        const stats = await fsp.stat(destPathFull);
+        const checksum = await calculateFileHash(destPathFull);
+
+        console.log(`[SPOKE] Successfully cloned ${safeSource} -> ${newSafeName}`);
+
+        res.json({
+            new_physical_path: newSafeName,
+            size: stats.size,
+            checksum: checksum
+        });
+    } catch (err) {
+        console.error("Spoke Copy Error:", err);
+        res.status(500).json({ error: "Failed to duplicate file physically on Spoke." });
+    }
+});
+
+// ==========================================
+// 4. ALAT PENGUJIAN STRESS
+// ==========================================
+app.post('/internal/files/test/upload', (req, res) => {
+    let bytesReceived = 0;
+    req.on('data', (chunk) => bytesReceived += chunk.length);
+    req.on('end', () => {
+        console.log(`[STRESS TEST] Received and discarded: ${(bytesReceived / 1024 / 1024 / 1024).toFixed(2)} GB`);
+        res.json({ status: "Discarded", size_gb: bytesReceived / 1024 / 1024 / 1024 });
+    });
+    req.on('error', (err) => res.status(500).send("Stream broken"));
+});
 
 app.listen(PORT, SPOKE_IP, () => {
     console.log(`Surabaya Spoke Active on port ${PORT} at IP ${SPOKE_IP}`);
 });
-
 

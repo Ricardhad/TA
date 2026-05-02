@@ -22,11 +22,12 @@ dotenv.config();
 
 const app = express();
 const PUBLIC_PORT = 8080;
+const apiRouter = express.Router();
 // const proxy = httpProxy.createProxyServer({});
 app.use(cors({
     origin: 'http://localhost:5173', // Allow your React app
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-bucket-uuid'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-bucket-uuid', 'x-file-prefix'],
     credentials: true
 }));
 
@@ -50,14 +51,16 @@ const strictLimiter = rateLimit({
     message: { error: "Action rate limit exceeded." }
 });
 
-app.use('/vault/', apiLimiter);
-app.use('/vault/files', strictLimiter);
+
+// app.use('/api/v1/')
+apiRouter.use('/vault/', apiLimiter);
+apiRouter.use('/vault/files', strictLimiter);
 let cachedM2MToken = null;
 let tokenExpiry = 0;
 
 async function getSpokeToken() {
     const now = Math.floor(Date.now() / 1000);
-    
+
     if (cachedM2MToken && now < tokenExpiry) {
         console.log(`[AUTH] Using cached token ending in: ...${cachedM2MToken.slice(-5)}`);
         return cachedM2MToken;
@@ -131,7 +134,7 @@ const bouncer = auth({
 });
 app.get('/health', (req, res) => res.send("OK"));
 
-app.get('/vault/view/:uuid', async (req, res) => {
+apiRouter.get('/vault/view/:uuid', async (req, res) => {
     const { uuid } = req.params;
     const { expires, sig, permission } = req.query; // FIX: No more node:process!
     try {
@@ -194,7 +197,7 @@ app.use((req, res, next) => {
     next();
 });
 // Jakarta Hub (gateway.js)
-app.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
+apiRouter.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
     const ADMIN_QUOTA_LIMIT = 50 * 1024 * 1024 * 1024; // 50gb
     const QUOTA_LIMIT = 5 * 1024 * 1024 * 1024; // 5gb
@@ -219,7 +222,7 @@ app.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
     }
 });
 // get files list
-// app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
+// apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
 //     const userId = req.auth.payload.sub;
 //     const search = req.query.search ? `%${req.query.search}%` : '%';
 
@@ -250,7 +253,7 @@ app.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
 //         res.status(500).json({ error: "Database query failed" });
 //     }
 // });
-app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
+apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
     const search = req.query.search ? `%${req.query.search}%` : '%';
     const bucketUuid = req.headers['x-bucket-uuid']; // Sent by React when opening a bucket
@@ -267,7 +270,7 @@ app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
                 AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
             `);
             params = [search];
-            
+
         } else if (bucketUuid) {
             // 2. STANDARD MODE: Viewing inside a specific Bucket
             query = db.prepare(`
@@ -282,7 +285,7 @@ app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
                 AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id) AND f.deleted_at IS NULL
             `);
             params = [userId, bucketUuid, userId, search];
-            
+
         } else {
             // Failsafe: Should not happen based on React UI flow
             return res.json([]);
@@ -294,7 +297,7 @@ app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
         res.status(500).json({ error: "Database query failed" });
     }
 });
-app.get('/vault/identity', (req, res) => {
+apiRouter.get('/vault/identity', (req, res) => {
     const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
@@ -324,7 +327,7 @@ const sslOptions = {
 };
 
 // upload
-app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
+apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
     const USER_QUOTA = 5 * 1024 * 1024 * 1024; // 5gb Limit 
     const MAX_SIZE = 1 * 1024 * 1024 * 1024; // 1gb Limit 
@@ -348,6 +351,7 @@ app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRI
     });
     const userId = req.auth.payload.sub;
     const bucketUuid = req.headers['x-bucket-uuid'];
+    const folderPrefix = req.headers['x-file-prefix'] || '';
     const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
 
     if (!bucket) {
@@ -371,6 +375,7 @@ app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRI
         if (isProcessing) return; // Only handle one file per request
         isProcessing = true;
         const { filename, mimeType: headerMime } = info;
+        const fullVirtualFilename = folderPrefix + filename;
         const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime);
         file.on('limit', () => {
             limitReached = true;
@@ -435,19 +440,19 @@ app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRI
             }
 
             const data = await spokeResponse.json();
-            const { physical_path, size } = data;
+            const { physical_path, size ,checksum} = data;
 
             // 2. SQL LOGIC: Find or Create the File Entry
             // We include mime_type here!
             // 2. SQL LOGIC: Find or Create the File Entry
             // Make sure we look for the filename inside this specific bucket!
             let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?')
-                .get(filename, bucket.id);
+                .get(fullVirtualFilename, bucket.id);
 
             if (!fileRecord) {
                 const uuid = randomUUID();
                 const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)')
-                    .run(uuid, filename, userId, finalMime, bucket.id);
+                    .run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
                 fileRecord = { id: info.lastInsertRowid, uuid: uuid };
             } else {
                 // If the file exists, update the mime_type just in case it changed
@@ -483,8 +488,8 @@ app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRI
 
             // db.prepare('INSERT INTO versions (file_id, version_num, physical_path, size, timestamp) VALUES (?, ?, ?, ?, datetime("now"))')
             //     .run(fileRecord.id, newVersion, physical_path, size);
-            db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, timestamp) VALUES (?, ?, ?, ?, datetime('now'))")
-                .run(fileRecord.id, newVersion, physical_path, size);
+            db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, datetime('now'))")
+                .run(fileRecord.id, newVersion, physical_path, size,checksum);
 
 
             res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
@@ -505,7 +510,7 @@ app.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRI
     req.pipe(busboy);
 });
 // get details
-app.get('/vault/files/:uuid/versions', authorizeVault('READ'), (req, res) => {
+apiRouter.get('/vault/files/:uuid/versions', authorizeVault('READ'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
 
@@ -525,7 +530,7 @@ app.get('/vault/files/:uuid/versions', authorizeVault('READ'), (req, res) => {
     }
 });
 // logging
-app.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
+apiRouter.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
 
     try {
         const logs = db.prepare(`
@@ -549,7 +554,7 @@ app.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
 // gateway.js (
 // gateway.js (Jakarta VM)
 
-app.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) => {
+apiRouter.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
     const requestedVersion = req.query.v;
@@ -579,8 +584,16 @@ app.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) =
         if (actualSize) {
             res.setHeader('Content-Length', actualSize);
         }
+        let downloadName = fileInfo.filename;
+
+        // Jika user spesifik meminta versi lama, sisipkan nomor versi ke namanya
+        if (requestedVersion) {
+            downloadName = fileInfo.filename.includes('.')
+                ? fileInfo.filename.replace(/(\.[^.]+)$/, `_v${requestedVersion}$1`)
+                : `${fileInfo.filename}_v${requestedVersion}`;
+        }
         // This forces the "Save As" dialog with the original filename
-        res.setHeader('Content-Disposition', `attachment; filename="${fileInfo.filename}"`);
+        res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
 
         // 4. Pipe the bytes: Spoke -> Hub -> User
         // Use Readable.fromWeb because fetch returns a Web Stream
@@ -592,7 +605,7 @@ app.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) =
         if (!res.headersSent) res.status(500).json({ error: "Could not retrieve file." });
     }
 });
-// app.get('/vault/download/:uuid', bouncer, async (req, res) => {
+// apiRouter.get('/vault/download/:uuid', bouncer, async (req, res) => {
 //     const userId = req.auth.payload.sub;
 //     const fileUuid = req.params.uuid;
 //     const requestedVersion = req.query.v;
@@ -650,7 +663,7 @@ app.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) =
 //         res.status(500).json({ error: "Secure Tunnel Interrupted" });
 //     }
 // });
-// app.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
+// apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
 //     const userId = req.auth.payload.sub;
 
 //     try {
@@ -671,7 +684,7 @@ app.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, res) =
 // }
 // );
 
-app.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) => {
+apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) => {
     const userId = req.auth.payload.sub;
     const fileUuid = req.params.uuid;
     const ttl = parseInt(req.query.ttl) || 60; // Default 60 minutes
@@ -710,49 +723,130 @@ app.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) => {
     }
 });
 
-app.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
+apiRouter.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     const userId = req.auth.payload.sub;
     const requestedVersion = req.query.v;
 
     try {
-        // 1. Fetch metadata INCLUDING the version ID (v_id)
-        const fileInfo = db.prepare(`
+        if (!requestedVersion) {
+            // 1. Tarik SEMUA jalur fisik dari fail ini
+            const allVersions = db.prepare(`
+                SELECT v.physical_path, f.id as file_id 
+                FROM files f JOIN versions v ON f.id = v.file_id 
+                WHERE f.uuid = ?
+            `).all(uuid);
+
+            if (allVersions.length === 0) return res.status(404).json({ error: "File not found." });
+
+            // 2. Minta Spoke menghapus fisiknya secara massal (satu per satu atau buat rute batch di Spoke)
+            for (const v of allVersions) {
+                await spokeFetch(`/internal/files/${v.physical_path}`, { method: 'DELETE' });
+            }
+
+            // 3. Hapus Induknya di Database (karena ada ON DELETE CASCADE di db.js, tabel versions akan otomatis terhapus!)
+            db.prepare('DELETE FROM files WHERE id = ?').run(allVersions[0].file_id);
+
+            return res.status(200).json({ status: "File and all its versions completely purged." });
+        } else {
+
+            // 1. Fetch metadata INCLUDING the version ID (v_id)
+            const fileInfo = db.prepare(`
             SELECT f.filename, v.id as v_id, v.physical_path 
             FROM files f JOIN versions v ON f.id = v.file_id
             WHERE f.uuid = ? 
             ${requestedVersion ? 'AND v.version_num = ?' : ''}
             ORDER BY v.version_num DESC LIMIT 1
-        `).get(requestedVersion ? [uuid,  requestedVersion] : [uuid]);
+            `).get(uuid, requestedVersion);
 
-        if (!fileInfo) return res.status(404).json({ error: "Version not found." });
+            if (!fileInfo) return res.status(404).json({ error: "Version not found." });
 
-        // 2. Physical Purge First (The "Body")
-        const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, { method: 'DELETE' });
-
-        if (!spokeResponse.ok) {
-            // Log the failure! The file is still there, so don't touch the DB yet.
-            db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+            // 2. Physical Purge First (The "Body")
+            const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, { method: 'DELETE' });
+            
+            if (!spokeResponse.ok) {
+                // Log the failure! The file is still there, so don't touch the DB yet.
+                db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
                 .run(userId, `DELETE_FAILED: ${fileInfo.filename}`, 'SPOKE_ERROR');
-            throw new Error("Surabaya Spoke refused to delete the bytes.");
-        }
-
-        // 3. Metadata Purge Second (The "Brain")
-        db.prepare('DELETE FROM versions WHERE id = ?').run(fileInfo.v_id);
-
-        // 4. Success Audit
-        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+                throw new Error("Surabaya Spoke refused to delete the bytes.");
+            }
+            
+            // 3. Metadata Purge Second (The "Brain")
+            db.prepare('DELETE FROM versions WHERE id = ?').run(fileInfo.v_id);
+            
+            // 4. Success Audit
+            db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
             .run(userId, `DELETE_SUCCESS: ${fileInfo.filename}`, 'SUCCESS');
-
-        res.status(200).json({ status: `Version of ${fileInfo.filename} purged.` });
-
+            
+            return res.status(200).json({ status: `Version of ${fileInfo.filename} purged.` });
+        }
+            
     } catch (err) {
         console.error("Delete Error:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
+apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req, res) => {
+    const { uuid } = req.params;
+    const requestedVersion = req.query.v;
 
-app.post('/vault/buckets', bouncer, (req, res) => {
+    try {
+        // 1. Cari jejak fisik dari versi yang ingin dipulihkan
+        const fileMeta = db.prepare(`
+            SELECT f.id, f.filename, v.physical_path 
+            FROM files f 
+            JOIN versions v ON f.id = v.file_id 
+            WHERE f.uuid = ? AND v.version_num = ?
+        `).get(uuid, requestedVersion);
+
+        if (!fileMeta) return res.status(404).json({ error: "Version not found." });
+
+        // 2. Perintahkan Spoke untuk menggandakan fail fisiknya
+        const spokeResponse = await spokeFetch(`/internal/files/copy`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source_path: fileMeta.physical_path })
+        });
+
+        if (!spokeResponse.ok) throw new Error("Spoke failed to copy file.");
+        const { new_physical_path, size, checksum } = await spokeResponse.json();
+
+        // 3. Kebersihan Batas Versi (Sama seperti saat Upload baru, maksimal 5 versi)
+        let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
+
+        while (versions.length >= 5) {
+            const oldest = versions[0];
+            try {
+                await spokeFetch(`/internal/files/${oldest.physical_path}`, { method: 'DELETE' });
+                db.prepare('DELETE FROM versions WHERE id = ?').run(oldest.id);
+                versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
+            } catch (e) {
+                console.error("Cleanup error during restore");
+            }
+        }
+
+        // 4. Suntikkan versi baru ke pangkalan data
+        const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileMeta.id);
+        const newVersionNum = (lastVersion.v || 0) + 1;
+
+        db.prepare(`
+            INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) 
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+        `).run(fileMeta.id, newVersionNum, new_physical_path, size, checksum);
+
+        // Audit Log
+        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+            .run(req.auth.payload[`${process.env.NAMESPACE}/email`] || 'unknown', `RESTORED_${fileMeta.filename}_V${requestedVersion}_TO_V${newVersionNum}`, 'SUCCESS');
+
+        res.json({ status: "Restored", new_version: newVersionNum });
+
+    } catch (err) {
+        console.error("Restore Error:", err);
+        res.status(500).json({ error: "Restore failed." });
+    }
+});
+
+apiRouter.post('/vault/buckets', bouncer, (req, res) => {
     const { name, region } = req.body || {};
     const userId = req.auth.payload.sub;
     const bucketUuid = randomUUID();
@@ -780,12 +874,12 @@ app.post('/vault/buckets', bouncer, (req, res) => {
     }
 });
 
-app.get('/vault/buckets', (req, res) => {
+apiRouter.get('/vault/buckets', (req, res) => {
     const userId = req.auth.payload.sub;
 
     try {
         const buckets = db.prepare(`
-            SELECT b.uuid, b.name, b.region 
+            SELECT b.uuid, b.name, b.region , bp.permission
             FROM buckets b 
             JOIN bucket_policies bp ON b.id = bp.bucket_id 
             WHERE bp.grantee_id = ? AND b.deleted_at IS NULL
@@ -796,7 +890,7 @@ app.get('/vault/buckets', (req, res) => {
         res.status(500).json({ error: "Could not fetch buckets." });
     }
 });
-// app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
+// apiRouter.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
 //     const { bucketUuid } = req.params;
 //     const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
 
@@ -827,7 +921,7 @@ app.get('/vault/buckets', (req, res) => {
 //         res.status(500).json({ error: "Failed to share bucket." });
 //     }
 // });
-app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'), (req, res) => {
+apiRouter.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid, userId } = req.params;
 
     try {
@@ -847,7 +941,7 @@ app.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'),
     }
 });
 
-app.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
+apiRouter.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid } = req.params;
     const { name, region } = req.body;
 
@@ -865,8 +959,48 @@ app.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
         res.status(500).json({ error: "Failed to update bucket." });
     }
 });
+apiRouter.delete('/vault/buckets/:bucketUuid', permitGlobalRole('standard_user'), async (req, res) => {
+    const { bucketUuid } = req.params;
+    const userId = req.auth.payload.sub;
 
-app.get('/vault/users/search', permitGlobalRole('standard_user'), (req, res) => {
+    try {
+        // 1. Verify Bucket & Ownership (Only the true owner or Global Admin can delete)
+        const bucket = db.prepare('SELECT id, name, owner_id FROM buckets WHERE uuid = ?').get(bucketUuid);
+        
+        if (!bucket) {
+            return res.status(404).json({ error: "Bucket not found." });
+        }
+
+        if (bucket.owner_id !== userId && req.globalRole !== 'admin') {
+            return res.status(403).json({ error: "Access Denied: Only the Bucket Owner can delete the bucket." });
+        }
+
+        // 2. Safety Check: Is the bucket empty?
+        const fileCount = db.prepare('SELECT COUNT(*) as count FROM files WHERE bucket_id = ?').get(bucket.id);
+        
+        if (fileCount.count > 0) {
+            return res.status(409).json({ 
+                error: "Bucket is not empty.", 
+                message: `You must delete all ${fileCount.count} files inside '${bucket.name}' before deleting the namespace.`
+            });
+        }
+
+        // 3. Delete the Bucket (SQLite CASCADE will automatically handle the bucket_policies)
+        db.prepare('DELETE FROM buckets WHERE id = ?').run(bucket.id);
+
+        // 4. Audit Log
+        db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)')
+            .run(req.auth.payload[`${process.env.NAMESPACE}/email`], `DELETED_BUCKET: ${bucket.name}`, 'SUCCESS');
+
+        res.json({ status: "Bucket Deleted", message: `Namespace '${bucket.name}' has been permanently destroyed.` });
+
+    } catch (err) {
+        console.error("[BUCKET DELETE ERROR]", err.message);
+        res.status(500).json({ error: "Failed to delete bucket." });
+    }
+});
+
+apiRouter.get('/vault/users/search', permitGlobalRole('standard_user'), (req, res) => {
     const searchQuery = req.query.q;
     const currentUserId = req.auth.payload.sub;
 
@@ -888,9 +1022,9 @@ app.get('/vault/users/search', permitGlobalRole('standard_user'), (req, res) => 
         res.status(500).json({ error: "Failed to search users." });
     }
 });
-app.get('/vault/notifications', permitGlobalRole('standard_user'), (req, res) => {
+apiRouter.get('/vault/notifications', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
-    
+
     try {
         const notes = db.prepare(`
             SELECT id, message, timestamp 
@@ -898,7 +1032,7 @@ app.get('/vault/notifications', permitGlobalRole('standard_user'), (req, res) =>
             WHERE user_id = ? AND is_read = 0 
             ORDER BY timestamp DESC
         `).all(userId);
-        
+
         res.json(notes);
     } catch (err) {
         console.error("[NOTIFY ERROR]", err.message);
@@ -907,9 +1041,9 @@ app.get('/vault/notifications', permitGlobalRole('standard_user'), (req, res) =>
 });
 
 // 2. Clear (mark as read) all notifications for the user
-app.post('/vault/notifications/clear', permitGlobalRole('standard_user'), (req, res) => {
+apiRouter.post('/vault/notifications/clear', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
-    
+
     try {
         // We do a soft delete (is_read = 1) instead of a hard DELETE to preserve the audit trail if needed
         db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(userId);
@@ -919,7 +1053,7 @@ app.post('/vault/notifications/clear', permitGlobalRole('standard_user'), (req, 
         res.status(500).json({ error: "Failed to clear notifications." });
     }
 });
-app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
+apiRouter.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
     const { bucketUuid } = req.params;
     const { email, permission } = req.body; // Menerima Email, bukan ID panjang
     const inviterId = req.auth.payload.sub;
@@ -966,7 +1100,7 @@ app.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), 
     }
 });
 
-app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
+apiRouter.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
     try {
         const dbFiles = db.prepare(`
             SELECT v.physical_path, f.filename 
@@ -1003,7 +1137,7 @@ app.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-app.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
+apiRouter.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
     const { missingFromDisk, orphanedOnDisk } = req.body;
 
     // 0. Payload Validation
@@ -1062,11 +1196,11 @@ app.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
     }
 });
 
-app.post('/vault/admin/performance-test', permitGlobalRole('admin'), async (req, res) => {
+apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
     console.log(`[STRESS TEST] Initiating high-throughput benchmark to Surabaya...`);
 
     try {
-        const spokeResponse = await spokeFetch(`/internal/test/test-upload`, {
+        const spokeResponse = await spokeFetch(`/internal/files/test/upload`, {
             method: 'POST',
             body: req, // Pipe the raw request stream
             duplex: 'half'
@@ -1082,7 +1216,7 @@ app.post('/vault/admin/performance-test', permitGlobalRole('admin'), async (req,
         res.status(500).json({ error: "Benchmark Interrupted", details: err.message });
     }
 });
-app.post('/vault/admin/bitrot-report', permitGlobalRole('admin'), (req, res) => {
+apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, res) => {
     // req.body looks like: [{ path: "1774...", hash: "abc..." }]
     const reports = req.body;
     let corruptedFiles = 0;
@@ -1099,7 +1233,25 @@ app.post('/vault/admin/bitrot-report', permitGlobalRole('admin'), (req, res) => 
 
     res.json({ message: "Scan complete", corrupted: corruptedFiles });
 });
+// This is the trigger. It just knocks on the Spoke's door and walks away.
+apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req, res) => {
+    try {
+        // Tell the Spoke to start its background job
+        const spokeResponse = await spokeFetch(`/internal/maintenance/bitrot/scan`, { 
+            method: 'POST' 
+        });
 
+        if (!spokeResponse.ok) throw new Error("Spoke rejected the command.");
+
+        // We don't wait for the scan. We immediately tell React it started.
+        res.json({ 
+            message: "Scan initiated on the Spoke. Results will appear in the Audit Logs once the Spoke finishes." 
+        });
+    } catch (err) {
+        console.error("Trigger Error:", err.message);
+        res.status(500).json({ error: "Failed to wake up the Spoke for maintenance." });
+    }
+});
 // const internalOnly = ['/spoke-status', '/spoke-logs'];
 
 // app.all(/^(\/.*)/, bouncer, (req, res, next) => {
@@ -1109,6 +1261,7 @@ app.post('/vault/admin/bitrot-report', permitGlobalRole('admin'), (req, res) => 
 //     // If it's not internal and didn't match the routes above, it's a 404.
 //     res.status(404).json({ error: "Endpoint not found" });
 // });
+app.use('/api/v1', apiRouter);
 app.use((req, res) => {
     console.warn(`[SECURITY] Blocked unauthorized path: ${req.path}`);
 

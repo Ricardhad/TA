@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import './App.css';
 import { useAuth0 } from "@auth0/auth0-react";
 
@@ -14,11 +14,11 @@ function App() {
   } = useAuth0();
 
   // --- Core State ---
-  const [activeView, setActiveView] = useState('lobby'); 
+  const [activeView, setActiveView] = useState('lobby');
   const [userRole, setUserRole] = useState('standard_user');
   const [isFetching, setIsFetching] = useState(false);
   const [usage, setUsage] = useState(null);
-  
+
   // --- Notifications State ---
   const [notifications, setNotifications] = useState([]);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -27,24 +27,25 @@ function App() {
   const [buckets, setBuckets] = useState([]);
   const [files, setFiles] = useState([]);
   const [activeBucket, setActiveBucket] = useState(null);
-  
+  const [currentPrefix, setCurrentPrefix] = useState(''); // State untuk Virtual Folder
+
   // --- Admin State ---
-  const [adminTab, setAdminTab] = useState('telemetry'); // 'telemetry' or 'global_files'
+  const [adminTab, setAdminTab] = useState('telemetry');
   const [adminSyncReport, setAdminSyncReport] = useState(null);
   const [auditLogs, setAuditLogs] = useState([]);
   const [benchmarkResult, setBenchmarkResult] = useState(null);
-  const [globalFiles, setGlobalFiles] = useState([]); // 🆕 For Global Explorer
+  const [globalFiles, setGlobalFiles] = useState([]);
   const [globalSearch, setGlobalSearch] = useState('');
 
   // --- Modal & Dialog States ---
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newBucketName, setNewBucketName] = useState('');
-  
+
   // Share/Invite States
   const [shareBucketModal, setShareBucketModal] = useState({ open: false, bucket: null });
   const [shareEmail, setShareEmail] = useState('');
   const [sharePermission, setSharePermission] = useState('READ');
-  const [searchResults, setSearchResults] = useState([]); 
+  const [searchResults, setSearchResults] = useState([]);
 
   const [inspectorModal, setInspectorModal] = useState({ open: false, file: null });
   const [fileVersions, setFileVersions] = useState([]);
@@ -60,6 +61,40 @@ function App() {
   const API_BASE = 'https://richardgatewayta.duckdns.org:8080';
   const AUDIENCE = 'https://richardgatewayta.duckdns.org';
 
+  // ==========================================
+  // PRESENTATION LOGIC: VIRTUAL FOLDER ENGINE
+  // ==========================================
+  const displayItems = useMemo(() => {
+    const items = [];
+    const folderSet = new Set();
+
+    files.forEach(file => {
+      if (file.filename.startsWith(currentPrefix)) {
+        const relativePath = file.filename.substring(currentPrefix.length);
+        const slashIndex = relativePath.indexOf('/');
+
+        if (slashIndex === -1) {
+          // Jangan tampilkan fail "hantu" S3 (.keep) ke user
+          if (relativePath !== '.keep') {
+            items.push({ type: 'file', ...file, displayName: relativePath });
+          }
+        } else {
+          // Buat folder virtual
+          const folderName = relativePath.substring(0, slashIndex);
+          if (!folderSet.has(folderName)) {
+            folderSet.add(folderName);
+            items.push({ type: 'folder', displayName: folderName, uuid: `folder-${folderName}` });
+          }
+        }
+      }
+    });
+
+    return items.sort((a, b) => {
+      if (a.type === b.type) return a.displayName.localeCompare(b.displayName);
+      return a.type === 'folder' ? -1 : 1;
+    });
+  }, [files, currentPrefix]);
+
   useEffect(() => {
     if (isAuthenticated) {
       checkIdentity();
@@ -74,8 +109,8 @@ function App() {
   // ==========================================
   const checkIdentity = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/identity`, { headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/identity`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
       if (data.roles && data.roles.includes('admin')) setUserRole('admin');
     } catch (err) { console.error(err); }
@@ -83,24 +118,24 @@ function App() {
 
   const fetchUsage = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/usage`, { headers: { Authorization: `Bearer ${token}` }});
-      if(res.ok) setUsage(await res.json());
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/usage`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) setUsage(await res.json());
     } catch (err) { console.error(err); }
   };
 
   const fetchNotifications = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/notifications`, { headers: { Authorization: `Bearer ${token}` }});
-      if(res.ok) setNotifications(await res.json());
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/notifications`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) setNotifications(await res.json());
     } catch (err) { console.error(err); }
   };
 
   const clearNotifications = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      await fetch(`${API_BASE}/vault/notifications/clear`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      await fetch(`${API_BASE}/api/v1/vault/notifications/clear`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
       setNotifications([]);
       setShowNotifications(false);
     } catch (err) { console.error(err); }
@@ -116,58 +151,81 @@ function App() {
   const executeDialogAction = async (e) => {
     e?.preventDefault();
     const { type, inputValue, targetData } = dialog;
-    
+
     if (type === 'ALERT' || type === 'SHOW_LINK') return closeDialog();
 
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
 
       if (type === 'RENAME_BUCKET') {
         if (!inputValue) return;
-        await fetch(`${API_BASE}/vault/buckets/${targetData.uuid}`, {
+        await fetch(`${API_BASE}/api/v1/vault/buckets/${targetData.uuid}`, {
           method: 'PUT',
           headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: inputValue, region: targetData.region })
         });
         fetchBuckets();
         closeDialog();
-      } 
+      }
       else if (type === 'REVOKE_ACCESS') {
         if (!inputValue) return;
-        const res = await fetch(`${API_BASE}/vault/buckets/${targetData.uuid}/share/${inputValue}`, {
+        const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${targetData.uuid}/share/${inputValue}`, {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` }
         });
-        if(!res.ok) throw new Error("Revocation failed. Are they the owner?");
+        if (!res.ok) throw new Error("Revocation failed. Are they the owner?");
         fetchBuckets();
         closeDialog();
         setDialog({ open: true, type: 'ALERT', title: 'Success', message: 'Access revoked successfully.' });
       }
       else if (type === 'DELETE_FILE') {
-        const res = await fetch(`${API_BASE}/vault/files/${targetData.uuid}`, {
+        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData.uuid}`, {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` }
         });
         if (!res.ok) throw new Error("Deletion failed.");
-        
-        // Refresh appropriate view
+
         if (activeView === 'admin') fetchGlobalFiles(globalSearch);
         else fetchFiles(activeBucket.uuid);
-        
+
         fetchUsage();
         closeDialog();
       }
       else if (type === 'GENERATE_LINK') {
         if (!inputValue) return;
-        const res = await fetch(`${API_BASE}/vault/files/${targetData}/links?ttl=${inputValue}&permission=downloadable`, {
+        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData}/links?ttl=${inputValue}&permission=downloadable`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (!res.ok) throw new Error("Failed to generate link.");
         const data = await res.json();
-        setDialog({ 
-          open: true, type: 'SHOW_LINK', title: 'Secure Link Generated', 
-          message: 'Copy your secure, temporary link below:', inputValue: data.share_url 
+        setDialog({
+          open: true, type: 'SHOW_LINK', title: 'Secure Link Generated',
+          message: 'Copy your secure, temporary link below:', inputValue: data.share_url
         });
+      }
+      else if (type === 'CREATE_FOLDER') {
+        if (!inputValue) return;
+
+        // Buat fail kosong (0 bytes) bernama .keep sebagai pancingan prefix (Standar S3)
+        const dummyFile = new File([""], ".keep", { type: "text/plain" });
+        const formData = new FormData();
+        formData.append('file', dummyFile);
+
+        const newPrefix = currentPrefix + inputValue + '/';
+
+        const res = await fetch(`${API_BASE}/api/v1/vault/files`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'x-bucket-uuid': activeBucket.uuid,
+            'x-file-prefix': newPrefix
+          },
+          body: formData
+        });
+
+        if (!res.ok) throw new Error("Failed to create folder.");
+        fetchFiles(activeBucket.uuid);
+        closeDialog();
       }
     } catch (err) {
       setDialog({ open: true, type: 'ALERT', title: 'Error', message: err.message });
@@ -180,18 +238,18 @@ function App() {
   const fetchBuckets = async () => {
     setIsFetching(true);
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/buckets`, { headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/buckets`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
-      setBuckets(data.buckets || []); 
+      setBuckets(data.buckets || []);
     } catch (err) { console.error(err); } finally { setIsFetching(false); }
   };
 
   const handleCreateBucket = async (e) => {
     e.preventDefault();
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      await fetch(`${API_BASE}/vault/buckets`, {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      await fetch(`${API_BASE}/api/v1/vault/buckets`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newBucketName, region: 'sub-01' })
@@ -199,39 +257,36 @@ function App() {
       setNewBucketName(''); setShowCreateModal(false); fetchBuckets();
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Deployment Error', message: err.message }); }
   };
-const handleEmailSearch = async (e) => {
+
+  const handleEmailSearch = async (e) => {
     const query = e.target.value;
     setShareEmail(query);
-    
-    // Don't search if they haven't typed at least 2 characters
+
     if (query.length < 2) {
       setSearchResults([]);
       return;
     }
-    
+
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      
-      // 🆕 FIX: We added ?q=${encodeURIComponent(query)} to the URL
-      const res = await fetch(`${API_BASE}/vault/users/search?q=${encodeURIComponent(query)}`, { 
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/users/search?q=${encodeURIComponent(query)}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      
+
       if (res.ok) {
-        // The backend already filtered the results using SQL 'LIKE', so we just set them directly!
         const matchingUsers = await res.json();
         setSearchResults(matchingUsers);
       }
-    } catch (err) { 
-      console.error("Search failed", err); 
+    } catch (err) {
+      console.error("Search failed", err);
     }
   };
 
   const handleShareBucket = async (e) => {
     e.preventDefault();
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/buckets/${shareBucketModal.bucket.uuid}/share`, {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${shareBucketModal.bucket.uuid}/share`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: shareEmail, permission: sharePermission })
@@ -254,16 +309,19 @@ const handleEmailSearch = async (e) => {
   // FILES (VAULT)
   // ==========================================
   const openBucket = async (bucket) => {
-    setActiveBucket(bucket);
+    // MENYIMPAN PERMISSION BUCKET SAAT DIBUKA (Fallback default to READ)
+    const activePerm = bucket.permission || 'READ';
+    setActiveBucket({ ...bucket, permission: activePerm });
     setActiveView('vault');
+    setCurrentPrefix('');
     fetchFiles(bucket.uuid);
   };
 
   const fetchFiles = async (bucketUuid) => {
     setIsFetching(true);
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/files`, {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/files`, {
         headers: { 'Authorization': `Bearer ${token}`, 'x-bucket-uuid': bucketUuid }
       });
       const data = await res.json();
@@ -275,13 +333,17 @@ const handleEmailSearch = async (e) => {
     const file = e.target.files[0];
     if (!file || !activeBucket) return;
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
       const formData = new FormData();
       formData.append('file', file);
-      const res = await fetch(`${API_BASE}/vault/files`, {
+      const res = await fetch(`${API_BASE}/api/v1/vault/files`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'x-bucket-uuid': activeBucket.uuid },
-        body: formData 
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'x-bucket-uuid': activeBucket.uuid,
+          'x-file-prefix': currentPrefix
+        },
+        body: formData
       });
       if (!res.ok) throw new Error("Upload rejected by Gateway");
       fetchFiles(activeBucket.uuid);
@@ -292,40 +354,50 @@ const handleEmailSearch = async (e) => {
 
   const downloadFile = async (uuid, fileName, versionNum = null) => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const url = versionNum ? `${API_BASE}/vault/files/${uuid}/content?v=${versionNum}` : `${API_BASE}/vault/files/${uuid}/content`;
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const url = versionNum ? `${API_BASE}/api/v1/vault/files/${uuid}/content?v=${versionNum}` : `${API_BASE}/api/v1/vault/files/${uuid}/content`;
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       if (!res.ok) throw new Error("Access denied.");
       const blob = await res.blob();
+
+      const contentDisposition = res.headers.get('Content-Disposition');
+      let finalFileName = fileName;
+      if (contentDisposition) {
+        const fileNameMatch = contentDisposition.match(/filename="(.+)"/);
+        if (fileNameMatch && fileNameMatch.length === 2) {
+          finalFileName = fileNameMatch[1];
+        }
+      }
+
       const objUrl = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = objUrl; a.download = versionNum ? `v${versionNum}_${fileName}` : fileName; 
+      a.href = objUrl; a.download = finalFileName;
       document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => window.URL.revokeObjectURL(objUrl), 1000); 
+      setTimeout(() => window.URL.revokeObjectURL(objUrl), 1000);
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Download Error', message: err.message }); }
   };
 
-  const triggerDeleteFile = (uuid, filename) => setDialog({ open: true, type: 'DELETE_FILE', title: `Purge '${filename}'?`, message: 'WARNING: This triggers a physical wipe on the Spoke. Are you absolutely sure?', targetData: {uuid, filename} });
+  const triggerDeleteFile = (uuid, filename) => setDialog({ open: true, type: 'DELETE_FILE', title: `Purge '${filename}'?`, message: 'WARNING: This triggers a physical wipe on the Spoke. Are you absolutely sure?', targetData: { uuid, filename } });
   const triggerGenerateLink = (uuid) => setDialog({ open: true, type: 'GENERATE_LINK', title: 'Secure Expiration Link', message: 'Minutes until link expires:', inputValue: '60', targetData: uuid });
 
   // ==========================================
   // INSPECTOR & PREVIEW LOGIC
   // ==========================================
-  const openInspector = async (file) => {
+const openInspector = async (file) => {
     setInspectorModal({ open: true, file });
     setFileVersions([]);
-    setPreviewData({ url: null, isLoading: false, versionNum: null });
+    setPreviewData({ url: null, isLoading: false, versionNum: null }); // Reset preview
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/files/${file.uuid}/versions`, { headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/files/${file.uuid}/versions`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
       setFileVersions(data);
-      if (data.length > 0) loadPreview(file, data[0].version_num);
+      // HAPUS BARIS INI: if (data.length > 0) loadPreview(file, data[0].version_num);
     } catch (err) { console.error(err); }
   };
 
   const closeInspector = () => {
-    if (previewData.url) window.URL.revokeObjectURL(previewData.url); 
+    if (previewData.url) window.URL.revokeObjectURL(previewData.url);
     setInspectorModal({ open: false, file: null });
   };
 
@@ -333,12 +405,34 @@ const handleEmailSearch = async (e) => {
     if (previewData.url) window.URL.revokeObjectURL(previewData.url);
     setPreviewData({ url: null, isLoading: true, versionNum });
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/files/${file.uuid}/content?v=${versionNum}`, { headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/files/${file.uuid}/content?v=${versionNum}`, { headers: { Authorization: `Bearer ${token}` } });
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       setPreviewData({ url, isLoading: false, versionNum });
-    } catch (err) { setPreviewData({ url: null, isLoading: false, versionNum ,detail :err.message}); }
+    } catch (err) { setPreviewData({ url: null, isLoading: false, versionNum, detail: err.message }); }
+  };
+  const restoreVersion = async (file, versionNum) => {
+    try {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/files/${file.uuid}/restore?v=${versionNum}`, { 
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` } 
+      });
+      
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      // Beri notifikasi, lalu segarkan file list dan inspector
+      setDialog({ open: true, type: 'ALERT', title: 'Restore Success', message: `Version ${versionNum} has been restored as the newest version (v${data.new_version}).` });
+      
+      // Refresh layar
+      fetchFiles(activeBucket.uuid);
+      openInspector(file); // Refresh versi di modal
+      
+    } catch (err) { 
+      setDialog({ open: true, type: 'ALERT', title: 'Restore Error', message: err.message }); 
+    }
   };
 
   // ==========================================
@@ -348,32 +442,29 @@ const handleEmailSearch = async (e) => {
     setActiveView('admin');
     setIsFetching(true);
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/audit`, { headers: { Authorization: `Bearer ${token}` }});
-      if(res.ok) setAuditLogs(await res.json());
-      
-      // Load Global files if they open the explorer
-      if(adminTab === 'global_files') fetchGlobalFiles();
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/audit`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) setAuditLogs(await res.json());
+
+      if (adminTab === 'global_files') fetchGlobalFiles();
     } catch (err) { console.error(err); } finally { setIsFetching(false); }
   }
 
-  // 🆕 GLOBAL FILE EXPLORER FETCH
   const fetchGlobalFiles = async (searchQuery = '') => {
     setIsFetching(true);
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      // The backend 'GET /vault/files' endpoint handles admin fetching globally based on req.globalRole
-      const res = await fetch(`${API_BASE}/vault/files?search=${encodeURIComponent(searchQuery)}`, { 
-        headers: { Authorization: `Bearer ${token}` } 
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/files?search=${encodeURIComponent(searchQuery)}`, {
+        headers: { Authorization: `Bearer ${token}` }
       });
-      if(res.ok) setGlobalFiles(await res.json());
+      if (res.ok) setGlobalFiles(await res.json());
     } catch (err) { console.error("Global fetch failed", err); } finally { setIsFetching(false); }
   };
 
   const runAdminAudit = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/admin/sync`, { headers: { Authorization: `Bearer ${token}` }});
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/admin/sync`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
       setAdminSyncReport(data.results);
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Audit Failed', message: err.message }); }
@@ -381,41 +472,48 @@ const handleEmailSearch = async (e) => {
 
   const executeAdminPurge = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/admin/sync`, {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/admin/sync`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(adminSyncReport)
       });
       const data = await res.json();
       setDialog({ open: true, type: 'ALERT', title: 'Purge Complete', message: data.details });
-      setAdminSyncReport(null); 
+      setAdminSyncReport(null);
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Purge Error', message: err.message }); }
   };
 
   const triggerBenchmark = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const res = await fetch(`${API_BASE}/vault/admin/performance-test`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: "DUMMY_STRESS_PAYLOAD" 
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/admin/test/performance`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: "DUMMY_STRESS_PAYLOAD"
       });
       setBenchmarkResult(await res.json());
-    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Test Failed', message: "Spoke unreachable?" ,detail :err.message }); }
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Test Failed', message: "Spoke unreachable?", detail: err.message }); }
   }
 
-  const simulateBitRot = async () => {
+  const triggerBitRotScan = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE }});
-      const dummyPayload = [{ path: "demo-path.enc", hash: "invalid-hash-123" }];
-      const res = await fetch(`${API_BASE}/vault/admin/bitrot-report`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(dummyPayload)
-      });
-      const data = await res.json();
-      setDialog({ open: true, type: 'ALERT', title: 'Simulation Complete', message: `${data.corrupted} files marked corrupted. Check Audit Logs.` });
-      loadAdminData();
-    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Simulation Error', message: err.message }); }
-  }
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
 
+      // 🆕 Tembak endpoint /bitrot/scan yang baru
+      const res = await fetch(`${API_BASE}/api/v1/vault/admin/bitrot/scan`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      // Tampilkan notifikasi bahwa pemindaian telah dimulai di latar belakang
+      setDialog({ open: true, type: 'ALERT', title: 'Scan Initiated', message: data.message });
+
+    } catch (err) {
+      setDialog({ open: true, type: 'ALERT', title: 'Simulation Error', message: err.message });
+    }
+  }
   // ==========================================
   // UI HELPERS
   // ==========================================
@@ -446,22 +544,22 @@ const handleEmailSearch = async (e) => {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
                 <p style={{ margin: 0 }}>Identity: <strong>{user.email}</strong> <span className="badge"><br /> role: {userRole.toUpperCase()}</span></p>
-                
+
                 {/* THE NOTIFICATION BELL */}
                 <div style={{ position: 'relative' }}>
                   <button onClick={() => setShowNotifications(!showNotifications)} style={{ background: 'transparent', border: 'none', fontSize: '1.5rem', cursor: 'pointer', padding: 0 }}>
                     🔔 {notifications.length > 0 && <span style={{ position: 'absolute', top: '-5px', right: '-10px', background: 'red', color: 'white', borderRadius: '50%', padding: '2px 6px', fontSize: '0.7rem', fontWeight: 'bold' }}>{notifications.length}</span>}
                   </button>
-                  
+
                   {showNotifications && (
                     <div style={{ position: 'absolute', top: '35px', left: 0, background: '#e2e2e2', border: '1px solid #555', borderRadius: '4px', width: '300px', zIndex: 100, boxShadow: '0 4px 12px rgba(0,0,0,0.5)', padding: '10px' }}>
-                      <h4 style={{ margin: '0 0 10px 0', borderBottom: '1px solid #555', paddingBottom: '5px' }}>Inbox</h4>
+                      <h4 style={{ margin: '0 0 10px 0', borderBottom: '1px solid #555', paddingBottom: '5px', color: '#000' }}>Inbox</h4>
                       {notifications.length === 0 ? <p style={{ fontSize: '0.85rem', color: '#aaa', margin: 0 }}>No new messages.</p> : (
                         <>
                           <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 10px 0', maxHeight: '200px', overflowY: 'auto' }}>
                             {notifications.map(note => (
-                              <li key={note.id} style={{ fontSize: '0.85rem', marginBottom: '10px', paddingBottom: '10px', borderBottom: '1px solid #444' }}>
-                                <strong>{new Date(note.timestamp).toLocaleTimeString()}</strong><br/>
+                              <li key={note.id} style={{ fontSize: '0.85rem', marginBottom: '10px', paddingBottom: '10px', borderBottom: '1px solid #444', color: '#000' }}>
+                                <strong>{new Date(note.timestamp).toLocaleTimeString()}</strong><br />
                                 {note.message}
                               </li>
                             ))}
@@ -474,9 +572,9 @@ const handleEmailSearch = async (e) => {
                 </div>
               </div>
 
-              <button onClick={logout} style={{background: 'transparent', border: '1px solid #888'}}>End Session</button>
+              <button onClick={logout} style={{ background: 'transparent', border: '1px solid #888' }}>End Session</button>
             </div>
-            
+
             {usage && (
               <div style={{ fontSize: '0.8rem', color: '#aaa' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -519,22 +617,22 @@ const handleEmailSearch = async (e) => {
                 <div className="modal" style={{ padding: '15px', background: '#c4c4c4', marginBottom: '15px', borderLeft: '4px solid #ff9800', color: '#000' }}>
                   <h3 style={{ marginTop: 0 }}>RBAC Policy: '{shareBucketModal.bucket.name}'</h3>
                   <form onSubmit={handleShareBucket}>
-                    
+
                     <div style={{ position: 'relative', marginBottom: '10px' }}>
-                      <input 
-                        type="email" 
-                        placeholder="Search employee email..." 
-                        value={shareEmail} 
-                        onChange={handleEmailSearch} 
+                      <input
+                        type="email"
+                        placeholder="Search employee email..."
+                        value={shareEmail}
+                        onChange={handleEmailSearch}
                         autoComplete="off"
-                        required 
+                        required
                         style={{ width: '100%', padding: '10px', boxSizing: 'border-box' }}
                       />
                       {searchResults.length > 0 && (
                         <ul style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fff', border: '1px solid #ccc', margin: 0, padding: 0, listStyle: 'none', zIndex: 10 }}>
                           {searchResults.map(res => (
-                            <li 
-                              key={res.user_id} 
+                            <li
+                              key={res.user_id}
                               onClick={() => { setShareEmail(res.email); setSearchResults([]); }}
                               style={{ padding: '10px', cursor: 'pointer', borderBottom: '1px solid #eee' }}
                             >
@@ -549,29 +647,58 @@ const handleEmailSearch = async (e) => {
                       <option value="READ">Viewer (Read Only)</option>
                       <option value="WRITE">Editor (Read / Write)</option>
                     </select>
-                    
+
                     <div style={{ display: 'flex', gap: '10px' }}>
                       <button type="submit" style={{ flex: 1, backgroundColor: '#2196F3', color: 'white' }}>Invite User</button>
-                      <button type="button" onClick={() => { setShareBucketModal({open: false, bucket: null}); setSearchResults([]); setShareEmail(''); }} style={{ flex: 1 }}>Cancel</button>
+                      <button type="button" onClick={() => { setShareBucketModal({ open: false, bucket: null }); setSearchResults([]); setShareEmail(''); }} style={{ flex: 1 }}>Cancel</button>
                     </div>
                   </form>
                 </div>
               )}
 
               {buckets.length > 0 ? (
-                <table className="vault-table">
-                  <thead><tr><th>Name</th><th>Region</th><th>UUID</th><th>Management</th></tr></thead>
+                <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
+                  <thead style={{ borderBottom: '2px solid #444', color: '#aaa' }}>
+                    <tr>
+                      <th style={{ padding: '12px' }}>Name</th>
+                      <th style={{ padding: '12px' }}>Region</th>
+                      <th style={{ padding: '12px' }}>Access</th>
+                      <th style={{ padding: '12px' }}>UUID</th>
+                      <th style={{ padding: '12px', textAlign: 'right' }}>Management</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {buckets.map((bucket) => (
-                      <tr key={bucket.uuid}>
-                        <td><strong>{bucket.name}</strong></td>
-                        <td><span className="badge">{bucket.region}</span></td>
-                        <td><small>{bucket.uuid.split('-')[0]}</small></td>
-                        <td>
-                          <button onClick={() => openBucket(bucket)}>Enter</button>
-                          <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px' }}>✎ Edit</button>
-                          <button onClick={() => setShareBucketModal({ open: true, bucket })} style={{ marginLeft: '5px', backgroundColor: '#ff9800', color: 'white' }}>Add Guest</button>
-                          <button onClick={() => triggerRevokeAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#d32f2f', color: 'white' }}>Kick</button>
+                      <tr key={bucket.uuid} style={{ borderBottom: '1px solid #333' }}>
+                        <td style={{ padding: '12px' }}><strong>{bucket.name}</strong></td>
+                        <td style={{ padding: '12px' }}><span className="badge" style={{ background: '#d3d3d3' }}>{bucket.region}</span></td>
+                        <td style={{ padding: '12px' }}>
+                          <span style={{
+                            background: bucket.permission === 'ADMIN' ? '#d32f2f' : bucket.permission === 'WRITE' ? '#ff9800' : '#4CAF50',
+                            color: 'white', padding: '4px 8px', borderRadius: '4px', fontSize: '0.8rem', fontWeight: 'bold'
+                          }}>
+                            {bucket.permission}
+                          </span>
+                        </td>
+                        <td style={{ padding: '12px', fontFamily: 'monospace', color: '#aaa' }}><small>{bucket.uuid.split('-')[0]}</small></td>
+                        <td style={{ padding: '12px', textAlign: 'right' }}>
+                          <button onClick={() => openBucket(bucket)} style={{ background: '#2196F3', color: '#fff' }}>Enter</button>
+
+                          {/* 🔒 RBAC LOBBY: HANYA ADMIN BUCKET YANG BISA MENGUBAH / MENGUNDANG */}
+                          {bucket.permission === 'ADMIN' && (
+                            <>
+                              <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px' }}>✎</button>
+                              <button onClick={() => setShareBucketModal({ open: true, bucket })} style={{ marginLeft: '5px', backgroundColor: '#ff9800', color: 'white' }}>+ Guest</button>
+                              <button onClick={() => triggerRevokeAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#d32f2f', color: 'white' }}>Kick</button>
+                              <button
+                                onClick={() => setDialog({ open: true, type: 'DELETE_BUCKET', title: `Destroy Namespace '${bucket.name}'?`, message: 'WARNING: This action is irreversible. The namespace must be completely empty before it can be destroyed.', targetData: bucket })}
+                                style={{ marginLeft: '15px', backgroundColor: '#8b0000', color: 'white', padding: '4px 8px', borderRadius: '4px', border: '1px solid #ff5252', cursor: 'pointer', fontWeight: 'bold' }}
+                                title="Destroy Namespace"
+                              >
+                                ☢ Nuke
+                              </button>
+                            </>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -581,200 +708,358 @@ const handleEmailSearch = async (e) => {
             </div>
           )}
 
-          {/* VIEW 2: VAULT */}
+          {/* VIEW 2: VAULT (VIRTUAL FOLDER VIEW) */}
           {activeView === 'vault' && activeBucket && (
-            <div className="vault-container">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '15px', marginBottom: '15px' }}>
-                <button onClick={() => setActiveView('lobby')}>← Exit Vault</button>
-                <h2>{activeBucket.name}</h2>
-              </div>
-              <div className="toolbar" style={{ display: 'flex', gap: '10px', marginBottom: '15px' }}>
-                <button onClick={() => fetchFiles(activeBucket.uuid)} disabled={isFetching}>Refresh</button>
-                <input type="file" ref={fileInputRef} style={{ display: 'none' }} onChange={handleUpload} />
-                <button onClick={() => fileInputRef.current.click()} style={{ backgroundColor: '#2196F3', color: 'white' }}>Upload Encrypted</button>
+            <div className="vault-container" style={{ background: '#ffffff', padding: '25px', borderRadius: '8px' }}>
+
+              {/* BREADCRUMB NAVIGATION */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', fontSize: '1.2rem' }}>
+                <button onClick={() => setActiveView('lobby')} style={{ background: '#333', border: 'none', padding: '8px 12px', borderRadius: '4px', cursor: 'pointer', color: '#fff' }}>← Lobby</button>
+                <span style={{ color: '#aaa', margin: '0 5px' }}>|</span>
+                <strong style={{ cursor: 'pointer', color: currentPrefix === '' ? '#000000' : '#2196F3' }} onClick={() => setCurrentPrefix('')}>
+                  {activeBucket.name}
+                </strong>
+
+                {/* Render alur folder */}
+                {currentPrefix.split('/').filter(Boolean).map((part, index, array) => {
+                  const pathSoFar = array.slice(0, index + 1).join('/') + '/';
+                  return (
+                    <span key={pathSoFar} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <span style={{ color: '#555' }}>/</span>
+                      <strong
+                        style={{ cursor: 'pointer', color: pathSoFar === currentPrefix ? '#000' : '#2196F3' }}
+                        onClick={() => setCurrentPrefix(pathSoFar)}
+                      >
+                        {part}
+                      </strong>
+                    </span>
+                  );
+                })}
               </div>
 
-              {files.length > 0 ? (
-                <table className="vault-table">
-                  <thead><tr><th>File</th><th>Size</th><th>Created</th><th>Actions</th></tr></thead>
+              <div className="toolbar" style={{ display: 'flex', gap: '10px', marginBottom: '20px', borderBottom: '1px solid #444', paddingBottom: '15px' }}>
+                <button onClick={() => fetchFiles(activeBucket.uuid)} disabled={isFetching} style={{ background: '#333', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>↻ Refresh</button>
+
+                {/* 🔒 RBAC VAULT: HANYA MUNCUL JIKA BUKAN READ */}
+                {activeBucket.permission !== 'READ' && (
+                  <>
+                    <button
+                      onClick={() => setDialog({ open: true, type: 'CREATE_FOLDER', title: 'New Folder', message: 'Enter new folder name:' })}
+                      style={{ backgroundColor: '#2196F3', color: 'white', fontWeight: 'bold', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
+                      + New Folder
+                    </button>
+
+                    <input type="file" ref={fileInputRef} style={{ display: 'none' }} onChange={handleUpload} />
+                    <button onClick={() => fileInputRef.current.click()} style={{ backgroundColor: '#4CAF50', color: 'white', fontWeight: 'bold', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
+                      + Upload to {currentPrefix === '' ? 'Root' : currentPrefix.split('/').slice(-2, -1)[0]}
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {displayItems.length > 0 ? (
+                <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
+                  <thead style={{ borderBottom: '2px solid #444', color: '#aaa', fontSize: '0.9rem' }}>
+                    <tr>
+                      <th style={{ padding: '12px', color: '#000' }}>Name</th>
+                      <th style={{ padding: '12px', color: '#000' }}>Size</th>
+                      <th style={{ padding: '12px', color: '#000' }}>Modified</th>
+                      <th style={{ padding: '12px', textAlign: 'right', color: '#000' }}>Actions</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {files.map((file) => (
-                      <tr key={file.uuid}>
-                        <td><strong style={{ cursor: 'pointer', color: '#2196F3' }} onClick={() => openInspector(file)}>{file.filename}</strong></td>
-                        <td>{formatBytes(file.size)}</td>
-                        <td>{new Date(file.timestamp).toLocaleDateString()}</td>
-                        <td>
-                          <button onClick={() => downloadFile(file.uuid, file.filename)}>↓</button>
-                          <button onClick={() => triggerGenerateLink(file.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white' }}>🔗</button>
-                          <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white' }}>Nuke</button>
+                    {displayItems.map((item) => (
+                      <tr key={item.uuid} style={{ borderBottom: '1px solid #e0e0e0' }}>
+                        <td style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          {item.type === 'folder' ? (
+                            <>
+                              <span style={{ fontSize: '1.5rem' }}>📁</span>
+                              <strong style={{ cursor: 'pointer', color: '#000' }} onClick={() => setCurrentPrefix(currentPrefix + item.displayName + '/')}>
+                                {item.displayName}
+                              </strong>
+                            </>
+                          ) : (
+                            <>
+                              <span style={{ fontSize: '1.5rem' }}>📄</span>
+                              <span style={{ cursor: 'pointer', color: '#2196F3' }} onClick={() => openInspector(item)}>
+                                {item.displayName}
+                              </span>
+                            </>
+                          )}
+                        </td>
+                        <td style={{ padding: '12px', color: '#555' }}>{item.type === 'folder' ? '-' : formatBytes(item.size)}</td>
+                        <td style={{ padding: '12px', color: '#555' }}>{item.type === 'folder' ? '-' : new Date(item.timestamp).toLocaleDateString()}</td>
+                        <td style={{ padding: '12px', textAlign: 'right' }}>
+                          {item.type === 'file' && (
+                            <>
+                              <button onClick={() => downloadFile(item.uuid, item.filename)} style={{ background: '#e0e0e0', border: '1px solid #aaa', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', color: '#000' }}>↓</button>
+
+                              {/* 🔒 RBAC VAULT: SEMBUNYIKAN UNTUK VIEWER */}
+                              {activeBucket.permission !== 'READ' && (
+                                <>
+                                  <button onClick={() => triggerGenerateLink(item.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🔗</button>
+                                  <button onClick={() => triggerDeleteFile(item.uuid, item.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🗑</button>
+                                </>
+                              )}
+                            </>
+                          )}
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
-              ) : <p>Vault is empty.</p>}
+              ) : (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#000', border: '1px dashed #444', borderRadius: '8px' }}>
+                  <span style={{ fontSize: '3rem', display: 'block', marginBottom: '10px' }}>📭</span>
+                  {currentPrefix === '' ? 'Bucket is empty.' : 'Folder is empty.'} {activeBucket.permission !== 'READ' && 'Drop files here to upload.'}
+                </div>
+              )}
             </div>
           )}
 
-          {/* INSPECTOR MODAL */}
+   {/* INSPECTOR MODAL */}
           {inspectorModal.open && inspectorModal.file && (
-            <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.9)', display: 'flex', padding: '40px', zIndex: 1000 }}>
-              <div className="modal-content" style={{ background: '#111', width: '100%', display: 'flex', borderRadius: '8px', border: '1px solid #444' }}>
-                <div style={{ flex: 2, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #444', padding: '20px' }}>
-                  {previewData.isLoading ? <p>Decrypting Stream...</p> : previewData.url && isPreviewable(inspectorModal.file.mime_type) ? (
-                      <iframe src={previewData.url} style={{ width: '100%', height: '100%', border: 'none', background: 'white' }} />
-                  ) : <div style={{ textAlign: 'center' }}><h1>🔒</h1><h3>No preview available</h3><button onClick={() => downloadFile(inspectorModal.file.uuid, inspectorModal.file.filename, previewData.versionNum)}>Download Securely</button></div>}
+            <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', padding: '40px', zIndex: 1000 }}>
+              <div className="modal-content" style={{ background: '#ffffff', width: '100%', display: 'flex', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
+                
+                {/* PANEL KIRI (PRATILIK) */}
+                <div style={{ flex: 2, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
+                  {previewData.isLoading ? (
+                    <div className="loading">Decrypting Stream...</div>
+                  ) : previewData.url && isPreviewable(inspectorModal.file.mime_type) ? (
+                    <iframe src={previewData.url} style={{ width: '100%', height: '100%', border: 'none', background: 'white', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }} />
+                  ) : previewData.url ? (
+                    <div style={{ textAlign: 'center', color: '#374151' }}>
+                      <span style={{ fontSize: '4rem', display: 'block', marginBottom: '15px' }}>🔒</span>
+                      <h3 style={{ margin: '0 0 15px 0' }}>No visual preview available</h3>
+                      <button onClick={() => downloadFile(inspectorModal.file.uuid, inspectorModal.file.filename, previewData.versionNum)} style={{ backgroundColor: '#3b82f6', color: 'white', fontWeight: 'bold' }}>
+                        Download Securely
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: 'center', color: '#6b7280' }}>
+                      <span style={{ fontSize: '4rem', display: 'block', marginBottom: '15px' }}>👁️</span>
+                      <h3 style={{ margin: '0 0 10px 0' }}>Preview Hidden</h3>
+                      <p style={{ margin: 0, fontSize: '0.9rem' }}>Select a version and click "Preview" to load the encrypted stream.</p>
+                    </div>
+                  )}
                 </div>
-                <div style={{ flex: 1, padding: '20px', overflowY: 'auto' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '20px' }}>
-                    <h3 style={{ margin: 0 }}>Versions</h3>
-                    <button onClick={closeInspector}>Close</button>
+
+                {/* PANEL KANAN (DAFTAR VERSI) */}
+                <div style={{ flex: 1, padding: '25px', overflowY: 'auto', backgroundColor: '#ffffff' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px', borderBottom: '1px solid #e5e7eb', paddingBottom: '15px' }}>
+                    <h3 style={{ margin: 0, color: '#111827' }}>Version History</h3>
+                    <button onClick={closeInspector} style={{ background: 'transparent', color: '#6b7280', border: '1px solid #d1d5db' }}>Close</button>
                   </div>
-                  {fileVersions.map((v) => (
-                      <div key={v.version_num} onClick={() => loadPreview(inspectorModal.file, v.version_num)} style={{ background: previewData.versionNum === v.version_num ? '#2196F3' : '#333', padding: '15px', marginBottom: '10px', cursor: 'pointer' }}>
-                          <strong>v{v.version_num}</strong> - {formatBytes(v.size)} <br/>
-                          <small>{new Date(v.timestamp).toLocaleString()}</small>
+                  
+                  {fileVersions.map((v, index) => {
+                    const isLatest = index === 0;
+                    const isBeingPreviewed = previewData.versionNum === v.version_num;
+                    
+                    return (
+                      <div key={v.version_num} style={{ 
+                        background: isBeingPreviewed ? '#eff6ff' : '#ffffff', 
+                        border: `1px solid ${isBeingPreviewed ? '#3b82f6' : '#e5e7eb'}`,
+                        padding: '15px', 
+                        marginBottom: '12px', 
+                        borderRadius: '8px',
+                        transition: 'all 0.2s ease',
+                        boxShadow: isBeingPreviewed ? '0 2px 4px rgba(59, 130, 246, 0.1)' : 'none'
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '10px' }}>
+                          <div>
+                            <strong style={{ color: '#111827', fontSize: '1.1rem' }}>v{v.version_num}</strong> 
+                            {isLatest && <span style={{ marginLeft: '8px', fontSize: '0.7rem', background: '#dcfce7', color: '#166534', padding: '2px 6px', borderRadius: '4px', fontWeight: 'bold' }}>LATEST</span>}
+                            <br />
+                            <small style={{ color: '#6b7280' }}>{formatBytes(v.size)} • {new Date(v.timestamp).toLocaleString()}</small>
+                          </div>
+                        </div>
+
+                        {/* TOMBOL AKSI UNTUK MASING-MASING VERSI */}
+                        <div style={{ display: 'flex', gap: '8px', marginTop: '15px' }}>
+                          <button 
+                            onClick={() => loadPreview(inspectorModal.file, v.version_num)} 
+                            style={{ flex: 1, backgroundColor: isBeingPreviewed ? '#3b82f6' : '#f3f4f6', color: isBeingPreviewed ? 'white' : '#374151', padding: '6px', fontSize: '0.8rem', border: 'none' }}>
+                            {previewData.isLoading && isBeingPreviewed ? 'Loading...' : 'Preview'}
+                          </button>
+                          
+                          {/* 🔒 RBAC: Tombol Restore hanya muncul jika pengguna punya akses WRITE atau ADMIN */}
+                          {activeBucket.permission !== 'READ' && !isLatest && (
+                            <button 
+                              onClick={() => restoreVersion(inspectorModal.file, v.version_num)}
+                              style={{ flex: 1, backgroundColor: '#10b981', color: 'white', padding: '6px', fontSize: '0.8rem', border: 'none' }}>
+                              Restore
+                            </button>
+                          )}
+                        </div>
                       </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>
           )}
-
           {/* VIEW 3: ADMIN PANEL (GOD MODE) */}
           {activeView === 'admin' && (
-             <div className="vault-container admin-panel">
-               <div style={{ display: 'flex', gap: '15px', marginBottom: '20px', borderBottom: '2px solid #555', paddingBottom: '10px' }}>
-                 <button onClick={() => { setAdminTab('telemetry'); loadAdminData(); }} style={{ background: adminTab === 'telemetry' ? '#2196F3' : 'transparent', color: adminTab === 'telemetry' ? 'white' : '#aaa' }}>Telemetry & Health</button>
-                 <button onClick={() => { setAdminTab('global_files'); fetchGlobalFiles(); }} style={{ background: adminTab === 'global_files' ? '#673ab7' : 'transparent', color: adminTab === 'global_files' ? 'white' : '#aaa' }}>Global File Explorer</button>
-               </div>
+            <div className="vault-container admin-panel">
+              <div style={{ display: 'flex', gap: '15px', marginBottom: '20px', borderBottom: '2px solid #555', paddingBottom: '10px' }}>
+                <button onClick={() => { setAdminTab('telemetry'); loadAdminData(); }} style={{ background: adminTab === 'telemetry' ? '#2196F3' : 'transparent', color: adminTab === 'telemetry' ? 'white' : '#aaa', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>Telemetry & Health</button>
+                <button onClick={() => { setAdminTab('global_files'); fetchGlobalFiles(); }} style={{ background: adminTab === 'global_files' ? '#673ab7' : 'transparent', color: adminTab === 'global_files' ? 'white' : '#aaa', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>Global File Explorer</button>
+              </div>
 
-               {/* TAB A: TELEMETRY & AUDIT */}
-               {adminTab === 'telemetry' && (
-                 <>
-                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px' }}>
-                     <div style={{ padding: '20px', background: '#d1d1d1', borderLeft: '4px solid #f44336', color: '#000' }}>
-                       <h3 style={{ marginTop: 0 }}>Database/Disk Integrity Sync</h3>
-                       <button onClick={runAdminAudit} style={{ backgroundColor: '#f44336', color: 'white' }}>Run Set Theory Audit</button>
-                       {adminSyncReport && (
-                         <div style={{ marginTop: '15px', padding: '10px', background: '#c4c4c4', border: '1px solid #aaa' }}>
-                           <p style={{ margin: '0 0 5px 0' }}><strong>Missing (DB only):</strong> {adminSyncReport.missingFromDisk.length}</p>
-                           <p style={{ margin: '0 0 10px 0' }}><strong>Orphans (Disk only):</strong> {adminSyncReport.orphanedOnDisk.length}</p>
-                           <button onClick={executeAdminPurge} style={{ backgroundColor: '#222', color: 'white' }}>Execute Physical Purge</button>
-                         </div>
-                       )}
-                     </div>
-                     <div style={{ padding: '20px', background: '#c4c4c4', borderLeft: '4px solid #2196F3', color: '#000' }}>
-                       <h3 style={{ marginTop: 0 }}>System Stress & Security</h3>
-                       <button onClick={triggerBenchmark} style={{ marginBottom: '10px', width: '100%', backgroundColor: '#2196F3', color: 'white' }}>Run Network Benchmark</button>
-                       {benchmarkResult && <p style={{ fontSize: '0.85rem', color: '#000', fontWeight: 'bold' }}>{benchmarkResult.message}: {benchmarkResult.spoke_received_gb}GB transferred.</p>}
-                       <button onClick={simulateBitRot} style={{ backgroundColor: '#ff9800', color: 'white', width: '100%' }}>Simulate Bit-Rot Detection</button>
-                     </div>
-                   </div>
-                   <div style={{ padding: '20px', background: '#c4c4c4', borderTop: '4px solid #4CAF50', color: '#000' }}>
-                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                       <h3 style={{ margin: 0 }}>Live Audit Logs</h3>
-                       <button onClick={loadAdminData} style={{ backgroundColor: '#4CAF50', color: 'white' }}>Refresh Logs</button>
-                     </div>
-                     <div style={{ maxHeight: '300px', overflowY: 'auto', marginTop: '15px', background: '#e0e0e0', border: '1px solid #aaa' }}>
-                       <table className="vault-table" style={{ fontSize: '0.85rem', color: '#000', width: '100%' }}>
-                         <thead style={{ background: '#d1d1d1' }}><tr><th>Time</th><th>User</th><th>Action</th><th>Status</th></tr></thead>
-                         <tbody>
-                           {auditLogs.map(log => (
-                             <tr key={log.id} style={{ borderBottom: '1px solid #ccc' }}>
-                               <td style={{ padding: '8px' }}>{new Date(log.timestamp).toLocaleTimeString()}</td>
-                               <td style={{ padding: '8px' }}>{log.user_email}</td>
-                               <td style={{ fontFamily: 'monospace', padding: '8px' }}>{log.action}</td>
-                               <td style={{ color: log.status === 'FAILED' || log.status === 'BLOCKED' ? '#d32f2f' : '#388e3c', padding: '8px', fontWeight: 'bold' }}>{log.status}</td>
-                             </tr>
-                           ))}
-                         </tbody>
-                       </table>
-                     </div>
-                   </div>
-                 </>
-               )}
+              {/* TAB A: TELEMETRY & AUDIT */}
+              {adminTab === 'telemetry' && (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px' }}>
+                    <div style={{ padding: '20px', background: '#2a2a2a', borderLeft: '4px solid #f44336', borderRadius: '4px' }}>
+                      <h3 style={{ marginTop: 0, color: '#fff' }}>Database/Disk Integrity Sync</h3>
+                      <button onClick={runAdminAudit} style={{ backgroundColor: '#f44336', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Run Set Theory Audit</button>
+                      {adminSyncReport && (
+                        <div style={{ marginTop: '15px', padding: '10px', background: '#333', border: '1px solid #555', borderRadius: '4px' }}>
+                          <p style={{ margin: '0 0 5px 0', color: '#fff' }}><strong>Missing (DB only):</strong> {adminSyncReport.missingFromDisk.length}</p>
+                          <p style={{ margin: '0 0 10px 0', color: '#fff' }}><strong>Orphans (Disk only):</strong> {adminSyncReport.orphanedOnDisk.length}</p>
+                          <button onClick={executeAdminPurge} style={{ backgroundColor: '#f44336', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Execute Physical Purge</button>
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ padding: '20px', background: '#2a2a2a', borderLeft: '4px solid #2196F3', borderRadius: '4px' }}>
+                      <h3 style={{ marginTop: 0, color: '#fff' }}>System Stress & Security</h3>
+                      <button onClick={triggerBenchmark} style={{ marginBottom: '10px', width: '100%', backgroundColor: '#2196F3', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Run Network Benchmark</button>
+                      {benchmarkResult && <p style={{ fontSize: '0.85rem', color: '#fff', fontWeight: 'bold' }}>{benchmarkResult.message}: {benchmarkResult.spoke_received_gb}GB transferred.</p>}
+                      <button onClick={triggerBitRotScan} style={{ backgroundColor: '#ff9800', color: 'white', width: '100%', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
+                        Run Bit-Rot Detection
+                      </button> </div>
+                  </div>
+                  <div style={{ padding: '20px', background: '#2a2a2a', borderTop: '4px solid #4CAF50', borderRadius: '4px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <h3 style={{ margin: 0, color: '#fff' }}>Live Audit Logs</h3>
+                      <button onClick={loadAdminData} style={{ backgroundColor: '#4CAF50', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Refresh Logs</button>
+                    </div>
+                    <div style={{ maxHeight: '300px', overflowY: 'auto', marginTop: '15px', background: '#1e1e1e', border: '1px solid #444', borderRadius: '4px' }}>
+                      <table className="vault-table" style={{ fontSize: '0.85rem', color: '#fff', width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+                        <thead style={{ background: '#333' }}><tr><th style={{ padding: '8px' }}>Time</th><th style={{ padding: '8px' }}>User</th><th style={{ padding: '8px' }}>Action</th><th style={{ padding: '8px' }}>Status</th></tr></thead>
+                        <tbody>
+                          {auditLogs.map(log => (
+                            <tr key={log.id} style={{ borderBottom: '1px solid #333' }}>
+                              <td style={{ padding: '8px' }}>{new Date(log.timestamp).toLocaleTimeString()}</td>
+                              <td style={{ padding: '8px', color: '#aaa' }}>{log.user_email}</td>
+                              <td style={{ fontFamily: 'monospace', padding: '8px', color: '#2196F3' }}>{log.action}</td>
+                              <td style={{ color: log.status === 'FAILED' || log.status === 'BLOCKED' ? '#f44336' : '#4CAF50', padding: '8px', fontWeight: 'bold' }}>{log.status}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              )}
 
-               {/* 🆕 TAB B: GLOBAL FILE EXPLORER */}
-               {adminTab === 'global_files' && (
-                 <div style={{ background: '#1e1e1e', padding: '20px', borderRadius: '8px' }}>
-                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
-                     <h3 style={{ margin: 0, color: '#673ab7' }}>Global Data Index</h3>
-                     <div style={{ display: 'flex', gap: '10px' }}>
-                       <input 
-                         type="text" 
-                         placeholder="Search all files..." 
-                         value={globalSearch} 
-                         onChange={(e) => setGlobalSearch(e.target.value)} 
-                         onKeyDown={(e) => e.key === 'Enter' && fetchGlobalFiles(globalSearch)}
-                         style={{ padding: '8px', borderRadius: '4px', border: '1px solid #555', background: '#333', color: 'white' }}
-                       />
-                       <button onClick={() => fetchGlobalFiles(globalSearch)} style={{ background: '#673ab7', color: 'white' }}>Search</button>
-                     </div>
-                   </div>
+              {/* TAB B: GLOBAL FILE EXPLORER */}
+              {adminTab === 'global_files' && (
+                <div style={{ background: '#1e1e1e', padding: '20px', borderRadius: '8px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+                    <h3 style={{ margin: 0, color: '#673ab7' }}>Global Data Index</h3>
+                    <div style={{ display: 'flex', gap: '10px' }}>
+                      <input
+                        type="text"
+                        placeholder="Search all files..."
+                        value={globalSearch}
+                        onChange={(e) => setGlobalSearch(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && fetchGlobalFiles(globalSearch)}
+                        style={{ padding: '8px', borderRadius: '4px', border: '1px solid #555', background: '#333', color: 'white' }}
+                      />
+                      <button onClick={() => fetchGlobalFiles(globalSearch)} style={{ background: '#673ab7', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Search</button>
+                    </div>
+                  </div>
 
-                   {globalFiles.length > 0 ? (
-                     <table className="vault-table">
-                       <thead><tr><th>Filename</th><th>Bucket ID</th><th>Size</th><th>UUID</th><th>Admin Action</th></tr></thead>
-                       <tbody>
-                         {globalFiles.map((file) => (
-                           <tr key={file.uuid}>
-                             <td><strong style={{ color: '#673ab7' }}>{file.filename}</strong></td>
-                             <td>{file.bucket_id}</td>
-                             <td>{formatBytes(file.size)}</td>
-                             <td style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{file.uuid.substring(0, 13)}...</td>
-                             <td>
-                               <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ backgroundColor: '#f44336', color: 'white', padding: '4px 8px', fontSize: '0.8rem' }}>Force Purge</button>
-                             </td>
-                           </tr>
-                         ))}
-                       </tbody>
-                     </table>
-                   ) : <p style={{ color: '#aaa' }}>No files found in the global index.</p>}
-                 </div>
-               )}
-             </div>
+                  {globalFiles.length > 0 ? (
+                    <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
+                      <thead style={{ borderBottom: '2px solid #444', color: '#aaa' }}><tr><th style={{ padding: '12px' }}>Filename</th><th style={{ padding: '12px' }}>Bucket ID</th><th style={{ padding: '12px' }}>Size</th><th style={{ padding: '12px' }}>UUID</th><th style={{ padding: '12px', textAlign: 'right' }}>Admin Action</th></tr></thead>
+                      <tbody>
+                        {globalFiles.map((file) => (
+                          <tr key={file.uuid} style={{ borderBottom: '1px solid #333' }}>
+                            <td style={{ padding: '12px' }}><strong style={{ color: '#673ab7' }}>{file.filename}</strong></td>
+                            <td style={{ padding: '12px', color: '#aaa' }}>{file.bucket_id}</td>
+                            <td style={{ padding: '12px', color: '#aaa' }}>{formatBytes(file.size)}</td>
+                            <td style={{ padding: '12px', fontFamily: 'monospace', fontSize: '0.8rem', color: '#aaa' }}>{file.uuid.substring(0, 13)}...</td>
+                            <td style={{ padding: '12px', textAlign: 'right' }}>
+                              <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ backgroundColor: '#f44336', color: 'white', padding: '4px 8px', fontSize: '0.8rem', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Force Purge</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : <p style={{ color: '#aaa' }}>No files found in the global index.</p>}
+                </div>
+              )}
+            </div>
           )}
 
           {/* UNIVERSAL THEMED DIALOG MODAL */}
-          {dialog.open && (
-            <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
-              <div style={{ background: '#222', padding: '25px', borderRadius: '8px', border: '1px solid #555', width: '400px', maxWidth: '90%', boxShadow: '0 4px 20px rgba(0,0,0,0.5)' }}>
-                <h3 style={{ marginTop: 0, color: '#fff', borderBottom: '1px solid #444', paddingBottom: '10px' }}>{dialog.title}</h3>
-                <p style={{ color: dialog.type === 'DELETE_FILE' ? '#ff5252' : '#ccc', margin: '15px 0', lineHeight: '1.5' }}>{dialog.message}</p>
-                
-                <form onSubmit={executeDialogAction}>
-                  {['RENAME_BUCKET', 'REVOKE_ACCESS', 'GENERATE_LINK', 'SHOW_LINK'].includes(dialog.type) && (
-                    <input 
-                      type="text" 
-                      value={dialog.inputValue} 
-                      onChange={(e) => setDialog({...dialog, inputValue: e.target.value})}
-                      autoFocus
-                      readOnly={dialog.type === 'SHOW_LINK'}
-                      style={{ 
-                        width: '100%', padding: '12px', marginBottom: '20px', 
-                        background: '#111', color: '#fff', border: '1px solid #555', 
-                        borderRadius: '4px', boxSizing: 'border-box' 
-                      }}
-                    />
-                  )}
-                  
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
-                    <button type="button" onClick={closeDialog} style={{ background: 'transparent', color: '#aaa', border: '1px solid #555' }}>
-                      {dialog.type === 'SHOW_LINK' || dialog.type === 'ALERT' ? 'Close' : 'Cancel'}
-                    </button>
-                    
-                    {dialog.type !== 'SHOW_LINK' && dialog.type !== 'ALERT' && (
-                      <button type="submit" style={{ background: dialog.type === 'DELETE_FILE' ? '#f44336' : '#2196F3', color: 'white' }}>
-                        {dialog.type === 'DELETE_FILE' ? 'Yes, Purge File' : 'Confirm'}
-                      </button>
-                    )}
-                  </div>
-                </form>
-              </div>
-            </div>
-          )}
+          {/* UNIVERSAL THEMED DIALOG MODAL */}
+          {dialog.open && (() => {
+            // Evaluasi logika khusus untuk fitur "Type to Confirm"
+            const isDeleteAction = dialog.type === 'DELETE_FILE' || dialog.type === 'DELETE_BUCKET';
+            const expectedConfirmation = dialog.type === 'DELETE_FILE' ? dialog.targetData?.filename : (dialog.type === 'DELETE_BUCKET' ? dialog.targetData?.name : '');
+            const isConfirmDisabled = isDeleteAction && dialog.inputValue !== expectedConfirmation;
 
+            return (
+              <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
+                <div style={{ background: '#222', padding: '25px', borderRadius: '8px', border: '1px solid #555', width: '400px', maxWidth: '90%', boxShadow: '0 4px 20px rgba(0,0,0,0.5)' }}>
+                  <h3 style={{ marginTop: 0, color: '#fff', borderBottom: '1px solid #444', paddingBottom: '10px' }}>{dialog.title}</h3>
+                  <p style={{ color: isDeleteAction ? '#ff5252' : '#ccc', margin: '15px 0', lineHeight: '1.5' }}>
+                    {dialog.message}
+                    {isDeleteAction && (
+                      <span style={{ display: 'block', marginTop: '10px', color: '#fff' }}>
+                        Please type <strong style={{ userSelect: 'none' }}>{expectedConfirmation}</strong> to confirm.
+                      </span>
+                    )}
+                  </p>
+
+                  <form onSubmit={executeDialogAction}>
+                    {/* Tambahkan DELETE_FILE dan DELETE_BUCKET agar input text muncul */}
+                    {['RENAME_BUCKET', 'REVOKE_ACCESS', 'GENERATE_LINK', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
+                      <input
+                        type="text"
+                        value={dialog.inputValue}
+                        onChange={(e) => setDialog({ ...dialog, inputValue: e.target.value })}
+                        autoFocus
+                        readOnly={dialog.type === 'SHOW_LINK'}
+                        placeholder={isDeleteAction ? expectedConfirmation : ''}
+                        style={{
+                          width: '100%', padding: '12px', marginBottom: '20px',
+                          background: '#111', color: '#fff', border: '1px solid #555',
+                          borderRadius: '4px', boxSizing: 'border-box'
+                        }}
+                      />
+                    )}
+
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                      <button type="button" onClick={closeDialog} style={{ background: 'transparent', color: '#aaa', border: '1px solid #555', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
+                        {dialog.type === 'SHOW_LINK' || dialog.type === 'ALERT' ? 'Close' : 'Cancel'}
+                      </button>
+
+                      {dialog.type !== 'SHOW_LINK' && dialog.type !== 'ALERT' && (
+                        <button
+                          type="submit"
+                          disabled={isConfirmDisabled}
+                          style={{
+                            background: isDeleteAction ? (isConfirmDisabled ? '#555' : '#f44336') : '#2196F3',
+                            color: isConfirmDisabled ? '#888' : 'white',
+                            padding: '8px 16px', border: 'none', borderRadius: '4px',
+                            cursor: isConfirmDisabled ? 'not-allowed' : 'pointer',
+                            transition: 'background 0.3s'
+                          }}
+                        >
+                          {isDeleteAction ? 'Yes, Execute' : 'Confirm'}
+                        </button>
+                      )}
+                    </div>
+                  </form>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
