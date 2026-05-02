@@ -29,7 +29,7 @@ function App() {
   const [files, setFiles] = useState([]);
   const [activeBucket, setActiveBucket] = useState(null);
   const [currentPrefix, setCurrentPrefix] = useState(''); // State untuk Virtual Folder
-
+  const [uploadProgress, setUploadProgress] = useState(null);
   // --- Admin State ---
   const [adminTab, setAdminTab] = useState('telemetry');
   const [adminSyncReport, setAdminSyncReport] = useState(null);
@@ -383,27 +383,76 @@ function App() {
     } catch (err) { console.error(err); } finally { setIsFetching(false); }
   };
 
-  const handleUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file || !activeBucket) return;
+const handleUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const token = await getAccessTokenSilently();
       const formData = new FormData();
-      formData.append('file', file);
-      const res = await fetch(`${API_BASE}/api/v1/vault/files`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'x-bucket-uuid': activeBucket.uuid,
-          'x-file-prefix': currentPrefix
-        },
-        body: formData
-      });
-      if (!res.ok) throw new Error("Upload rejected by Gateway");
-      fetchFiles(activeBucket.uuid);
-      fetchUsage();
-      setDialog({ open: true, type: 'ALERT', title: 'Upload Success', message: 'File securely vaulted!' });
-    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Upload Failed', message: err.message }); } finally { e.target.value = null; }
+      formData.append('file', file); // Nama field 'file' harus cocok dengan yang ditangkap Busboy di Gateway
+
+      const xhr = new XMLHttpRequest();
+      
+      // 1. Tentukan rute tujuan API Anda
+      // Pastikan API_URL Anda sesuai, misalnya: "https://richardgatewayta.duckdns.org:8080"
+      const uploadUrl = `/api/v1/vault/files`; 
+      xhr.open('POST', uploadUrl, true);
+
+      // 2. Pasang semua Header Keamanan (Sangat Penting untuk Zero Trust!)
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      xhr.setRequestHeader('x-bucket-uuid', activeBucket.uuid);
+      if (currentPrefix) {
+        xhr.setRequestHeader('x-file-prefix', currentPrefix);
+      }
+
+      // 3. PANTAU KEMAJUAN DI SINI!
+      xhr.upload.onprogress = (progressEvent) => {
+        if (progressEvent.lengthComputable) {
+          const percentComplete = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+          // Perbarui state yang sudah kita siapkan sebelumnya
+          setUploadProgress({
+            filename: file.name,
+            percent: percentComplete,
+            loaded: progressEvent.loaded,
+            total: progressEvent.total
+          });
+        }
+      };
+
+      // 4. Tangani saat unggahan selesai
+      xhr.onload = () => {
+        if (xhr.status === 200 || xhr.status === 201) {
+          console.log("Upload Success!");
+          fetchFiles(activeBucket.uuid); // Segarkan tabel fail
+          fetchUsage(); // Segarkan kuota
+        } else {
+          try {
+            const errResponse = JSON.parse(xhr.responseText);
+            alert(`Upload Failed: ${errResponse.error || errResponse.message}`);
+          } catch(e) {
+            alert(`Upload Failed: Server Error (${xhr.status},${e})`);
+          }
+        }
+        // Bersihkan state progress dan reset input file
+        setTimeout(() => setUploadProgress(null), 1000); // Jeda 1 detik agar animasi 100% terlihat
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      };
+
+      // 5. Tangani jika koneksi internet terputus
+      xhr.onerror = () => {
+        alert("Network Error: Could not reach the Gateway.");
+        setUploadProgress(null);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      };
+
+      // 6. Eksekusi pengiriman data!
+      xhr.send(formData);
+
+    } catch (err) {
+      console.error("Upload preparation failed:", err);
+      alert("Failed to start upload. Please try again.");
+    }
   };
 
   const downloadFile = async (uuid, fileName, versionNum = null) => {
@@ -583,7 +632,55 @@ function App() {
   if (isLoading) return <div className="loading">Initializing Secure Protocol...</div>;
 
   return (
+    
     <div className="App">
+      {/* ========================================== */}
+      {/* FLOATING UPLOAD PROGRESS BAR */}
+      {/* ========================================== */}
+      {uploadProgress && (
+        <div style={{
+          position: 'fixed',
+          bottom: '25px',
+          right: '25px',
+          background: '#1f2937', // Warna gelap modern
+          color: 'white',
+          padding: '20px',
+          borderRadius: '12px',
+          boxShadow: '0 10px 25px rgba(0,0,0,0.5)',
+          width: '320px',
+          zIndex: 9999, // Pastikan selalu di paling depan
+          border: '1px solid #374151'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '10px' }}>
+            <span style={{ fontSize: '1.2rem', marginRight: '10px' }}>☁️</span>
+            <h4 style={{ margin: '0', fontSize: '1rem', fontWeight: '600' }}>Encrypting & Uploading</h4>
+          </div>
+          
+          <p style={{ margin: '0 0 15px 0', fontSize: '0.85rem', color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={uploadProgress.filename}>
+            {uploadProgress.filename}
+          </p>
+          
+          {/* Track (Latar Belakang Bar) */}
+          <div style={{ width: '100%', background: '#374151', borderRadius: '8px', overflow: 'hidden', height: '12px' }}>
+            {/* Fill (Animasi Bar yang berjalan) */}
+            <div style={{
+              width: `${uploadProgress.percent}%`,
+              background: uploadProgress.percent === 100 ? '#10b981' : '#3b82f6', // Berubah hijau saat 100%
+              height: '100%',
+              transition: 'width 0.3s ease-in-out, background-color 0.3s ease'
+            }}></div>
+          </div>
+          
+          {/* Angka Statistik (MB dan Persentase) */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '10px', fontSize: '0.8rem', color: '#9ca3af', fontWeight: '500' }}>
+            <span>{uploadProgress.percent}%</span>
+            <span>
+              {(uploadProgress.loaded / 1024 / 1024).toFixed(2)} MB / {(uploadProgress.total / 1024 / 1024).toFixed(2)} MB
+            </span>
+          </div>
+        </div>
+      )}
+
       <h1>RiccBox</h1>
 
       {!isAuthenticated ? (
@@ -929,13 +1026,13 @@ function App() {
                         <td style={{ padding: '12px', textAlign: 'right' }}>
                           {item.type === 'file' && (
                             <>
-                              <button onClick={() => downloadFile(item.uuid, item.filename)} style={{ background: '#e0e0e0', border: '1px solid #aaa', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', color: '#000' }}>↓</button>
+                              <button title="Download File securely" onClick={() => downloadFile(item.uuid, item.filename)} style={{ background: '#e0e0e0', border: '1px solid #aaa', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', color: '#000' }}>↓</button>
 
                               {/* 🔒 RBAC VAULT: SEMBUNYIKAN UNTUK VIEWER */}
                               {activeBucket.permission !== 'READ' && (
                                 <>
-                                  <button onClick={() => triggerGenerateLink(item.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🔗</button>
-                                  <button onClick={() => triggerDeleteFile(item.uuid, item.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🗑</button>
+                                  <button title="Generate Shareable Link" onClick={() => triggerGenerateLink(item.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🔗</button>
+                                  <button title="Delete File" onClick={() => triggerDeleteFile(item.uuid, item.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🗑</button>
                                 </>
                               )}
                             </>
@@ -957,10 +1054,10 @@ function App() {
           {/* INSPECTOR MODAL */}
           {inspectorModal.open && inspectorModal.file && (
             <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', padding: '40px', zIndex: 1000 }}>
-              <div className="modal-content" style={{ background: '#ffffff', width: '100%', display: 'flex', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
+              <div className="modal-content" style={{display: 'flex', flexWrap: 'wrap', background: '#ffffff', width: '100%', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
 
                 {/* PANEL KIRI (PRATILIK) */}
-                <div style={{ flex: 2, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
+                <div style={{flex: '2 1 300px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
                   {previewData.isLoading ? (
                     <div className="loading">Decrypting Stream...</div>
                   ) : previewData.url && isPreviewable(inspectorModal.file.mime_type) ? (
@@ -974,7 +1071,7 @@ function App() {
                       </button>
                     </div>
                   ) : (
-                    <div style={{ textAlign: 'center', color: '#6b7280' }}>
+                    <div style={{ flex: '1 1 300px', textAlign: 'center', color: '#6b7280' }}>
                       <span style={{ fontSize: '4rem', display: 'block', marginBottom: '15px' }}>👁️</span>
                       <h3 style={{ margin: '0 0 10px 0' }}>Preview Hidden</h3>
                       <p style={{ margin: 0, fontSize: '0.9rem' }}>Select a version and click "Preview" to load the encrypted stream.</p>
@@ -1110,6 +1207,7 @@ function App() {
                   </div>
 
                   {globalFiles.length > 0 ? (
+                    <div style={{ overflowX: 'auto', width: '100%' }}>
                     <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
                       <thead style={{ borderBottom: '2px solid #444', color: '#aaa' }}><tr><th style={{ padding: '12px' }}>Filename</th><th style={{ padding: '12px' }}>Bucket ID</th><th style={{ padding: '12px' }}>Size</th><th style={{ padding: '12px' }}>UUID</th><th style={{ padding: '12px', textAlign: 'right' }}>Admin Action</th></tr></thead>
                       <tbody>
@@ -1126,6 +1224,7 @@ function App() {
                         ))}
                       </tbody>
                     </table>
+                    </div>
                   ) : <p style={{ color: '#aaa' }}>No files found in the global index.</p>}
                 </div>
               )}
@@ -1136,9 +1235,19 @@ function App() {
           {dialog.open && (() => {
             // Evaluasi logika khusus untuk fitur "Type to Confirm"
             const isDeleteAction = dialog.type === 'DELETE_FILE' || dialog.type === 'DELETE_BUCKET';
-            const expectedConfirmation = dialog.type === 'DELETE_FILE' ? dialog.targetData?.filename : (dialog.type === 'DELETE_BUCKET' ? dialog.targetData?.name : '');
-            const isConfirmDisabled = isDeleteAction && dialog.inputValue !== expectedConfirmation;
-
+            
+            // 🌟 UX FIX: Untuk BUCKET, wajib ketik namanya. Untuk FILE, cukup ketik "DELETE"
+            let expectedConfirmation = '';
+            if (dialog.type === 'DELETE_BUCKET') {
+              expectedConfirmation = dialog.targetData?.name;
+            } else if (dialog.type === 'DELETE_FILE') {
+              expectedConfirmation = 'DELETE'; // Kata kunci generik yang lebih mudah
+            }
+            // Mengubah input menjadi huruf besar semua agar pengguna tidak bingung soal kapitalisasi
+            const currentInput = dialog.inputValue ? dialog.inputValue.toUpperCase() : '';
+            const targetConfirm = expectedConfirmation ? expectedConfirmation.toUpperCase() : '';
+            
+            const isConfirmDisabled = isDeleteAction && currentInput !== targetConfirm;
             return (
               <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
                 <div style={{ background: '#222', padding: '25px', borderRadius: '8px', border: '1px solid #555', width: '400px', maxWidth: '90%', boxShadow: '0 4px 20px rgba(0,0,0,0.5)' }}>
@@ -1147,7 +1256,7 @@ function App() {
                     {dialog.message}
                     {isDeleteAction && (
                       <span style={{ display: 'block', marginTop: '10px', color: '#fff' }}>
-                        Please type <strong style={{ userSelect: 'none' }}>{expectedConfirmation}</strong> to confirm.
+                        Please type <strong style={{ userSelect: 'none', color: '#ff5252' }}>{expectedConfirmation}</strong> to confirm.
                       </span>
                     )}
                   </p>

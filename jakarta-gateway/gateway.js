@@ -42,8 +42,12 @@ app.use(helmet({
             "script-src": ["'self'", "'unsafe-inline'"],
             // Izinkan React menggunakan CSS bawaannya
             "style-src": ["'self'", "'unsafe-inline'"],
-            // Izinkan pemuatan gambar/avatar (dari Auth0, Google, dll)
-            "img-src": ["'self'", "data:", "https:"]
+
+            "img-src": ["'self'", "data:", "https:", "blob:"], 
+            
+            "frame-src": ["'self'", "blob:"], 
+            
+            "worker-src": ["'self'", "blob:"]
         },
     },
 }));
