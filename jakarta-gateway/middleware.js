@@ -4,6 +4,11 @@ import db from './db.js';
 
 export const permitGlobalRole = (requiredRole) => {
     return (req, res, next) => {
+        if (req.auth && req.auth.payload && req.auth.payload.gty === 'client-credentials') {
+            console.log("[RBAC] Machine-to-Machine token detected. Granting Admin bypass.");
+            req.globalRole = 'admin'; // Berikan Spoke hak akses penuh
+            return next();
+        }
         const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
         const userRolesArray = req.auth.payload[`${namespace}/roles`] || [];
         const primaryRole = userRolesArray.includes('admin') ? 'admin' : 'standard_user';

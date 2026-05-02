@@ -19,13 +19,32 @@ dotenv.config();
 // import FormData from 'form-data';
 // import mime from 'mime-types';
 // import e from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PUBLIC_PORT = 8080;
 const apiRouter = express.Router();
 // const proxy = httpProxy.createProxyServer({});
+
+
+const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
+const LOCAL_PORT = process.env.GATEWAY_PORT;
+const namespace = process.env.NAMESPACE || 'unknown_namespace';
+
+
+const bouncer = auth({
+    audience: namespace,
+    issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
+    tokenSigningAlg: 'RS256'
+});
+app.use(bouncer);
+
 app.use(cors({
-    origin: 'http://localhost:5173', // Allow your React app
+    origin: ['http://localhost:5173', 'https://richardgatewayta.duckdns.org:8080'], // Allow your React app
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-bucket-uuid', 'x-file-prefix'],
     credentials: true
@@ -99,12 +118,12 @@ async function getSpokeToken() {
 async function spokeFetch(path, options = {}) {
     const token = await getSpokeToken(); // Automatically gets cached or fresh token
     const url = `http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}${path}`;
-
+    
     const headers = {
         ...options.headers,
         'Authorization': `Bearer ${token}`
     };
-
+    
     return fetch(url, { ...options, headers });
 }
 async function checkSpokeHealth() {
@@ -122,16 +141,16 @@ async function checkSpokeHealth() {
 // Run every 5 minutes
 setInterval(checkSpokeHealth, 5 * 60 * 1000);
 
-const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
-const LOCAL_PORT = process.env.GATEWAY_PORT;
-const namespace = process.env.NAMESPACE || 'unknown_namespace';
-
-
-const bouncer = auth({
-    audience: namespace,
-    issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
-    tokenSigningAlg: 'RS256'
+app.use(helmet());
+app.use((req, res, next) => {
+    // Karena dipanggil di bawah, ini hanya mencatat aktivitas API
+    const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
+    const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
+    log.run(userEmail, `${req.method} ${req.path}`, 'AUTHORIZED');
+    next();
 });
+app.use('/api/v1',bouncer, apiRouter);
+
 app.get('/health', (req, res) => res.send("OK"));
 
 apiRouter.get('/vault/view/:uuid', async (req, res) => {
@@ -161,9 +180,9 @@ apiRouter.get('/vault/view/:uuid', async (req, res) => {
 
         // 1. CORRECT FETCH SYNTAX (URL must be a string)
         const spokeResponse = await spokeFetch(`/internal/files/${fileMeta.physical_path}`);
-
+        
         if (!spokeResponse.ok) throw new Error("Spoke failed to provide file.");
-
+        
         // 2. CORRECT HEADERS
         res.setHeader('Content-Type', fileMeta.mime_type || 'application/octet-stream');
         // res.setHeader('Content-Disposition', `inline; filename="${fileMeta.filename}"`);
@@ -174,7 +193,7 @@ apiRouter.get('/vault/view/:uuid', async (req, res) => {
         }
         // 3. CORRECT PIPING (Fetch body is a Web Stream)
         Readable.fromWeb(spokeResponse.body).pipe(res);
-
+        
     } catch (err) {
         console.error("[VIEW ERROR]", err.message);
         res.status(500).send("Secure viewing failed.");
@@ -182,9 +201,7 @@ apiRouter.get('/vault/view/:uuid', async (req, res) => {
 });
 
 
-app.use(bouncer);
 
-app.use(helmet());
 
 app.use((req, res, next) => {
     // const user = req.auth?.payload?.email || 'anonymous';
@@ -879,9 +896,10 @@ apiRouter.get('/vault/buckets', (req, res) => {
 
     try {
         const buckets = db.prepare(`
-            SELECT b.uuid, b.name, b.region , bp.permission
+            SELECT b.uuid, b.name, b.region, bp.permission, b.owner_id, u.email as owner_email
             FROM buckets b 
             JOIN bucket_policies bp ON b.id = bp.bucket_id 
+            LEFT JOIN users u ON b.owner_id = u.sub
             WHERE bp.grantee_id = ? AND b.deleted_at IS NULL
         `).all(userId);
         res.json({ buckets });
@@ -890,6 +908,28 @@ apiRouter.get('/vault/buckets', (req, res) => {
         res.status(500).json({ error: "Could not fetch buckets." });
     }
 });
+apiRouter.get('/vault/buckets/:bucketUuid/members', authorizeBucket('ADMIN'), (req, res) => {
+    const { bucketUuid } = req.params;
+
+    try {
+        const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
+        if (!bucket) return res.status(404).json({ error: "Bucket not found." });
+
+        // Ambil data dari kebijakan bucket (bucket_policies) dan gabungkan dengan email user
+        const members = db.prepare(`
+            SELECT u.sub as user_id, u.email, bp.permission
+            FROM bucket_policies bp
+            JOIN users u ON bp.grantee_id = u.sub
+            WHERE bp.bucket_id = ?
+        `).all(bucket.id);
+
+        res.json(members);
+    } catch (err) {
+        console.error("[MEMBERS FETCH ERROR]", err.message);
+        res.status(500).json({ error: "Failed to fetch members." });
+    }
+});
+
 // apiRouter.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
 //     const { bucketUuid } = req.params;
 //     const { grantee_id, permission } = req.body; // grantee_id is the guest's Auth0 'sub'
@@ -1261,7 +1301,6 @@ apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req
 //     // If it's not internal and didn't match the routes above, it's a 404.
 //     res.status(404).json({ error: "Endpoint not found" });
 // });
-app.use('/api/v1', apiRouter);
 app.use((req, res) => {
     console.warn(`[SECURITY] Blocked unauthorized path: ${req.path}`);
 
@@ -1299,10 +1338,10 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: "Internal Gateway Error" });
 });
 
-
+// app.listen(8080)
 https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
     console.log('--- Zero Trust Architecture Active ---');
     console.log(`Public Entry: https://richardgatewayta.duckdns.org:${PUBLIC_PORT}`);
     console.log(`Internal Destination: ${LOCAL_SPOKE_IP}:${LOCAL_PORT}`);
     console.log('--------------------------------------');
-});
+}); 

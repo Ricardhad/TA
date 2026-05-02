@@ -1,7 +1,7 @@
 
 import express from 'express';
 import crypto from 'crypto';
-import fs from 'fs';         
+import fs from 'fs';
 import { promises as fsp } from 'fs';
 import { Readable } from 'stream';
 import path, { dirname } from 'path';
@@ -13,11 +13,11 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
-const SPOKE_IP = process.env.SPOKE_IP || '0.0.0.0'; 
+const SPOKE_IP = process.env.SPOKE_IP || '0.0.0.0';
 
-app.use(express.urlencoded({ 
-    limit: '1mb', 
-    extended: true 
+app.use(express.urlencoded({
+    limit: '1mb',
+    extended: true
 }));
 
 const MASTER_KEY = Buffer.from(process.env.VAULT_KEY, 'hex');
@@ -25,9 +25,45 @@ const MASTER_KEY = Buffer.from(process.env.VAULT_KEY, 'hex');
 if (MASTER_KEY.length !== 32) {
     throw new Error("VAULT_KEY must be a 64-character hex string (32 bytes)");
 }
+// --- MANAJEMEN TOKEN M2M UNTUK SPOKE -> GATEWAY ---
+let cachedGatewayToken = null;
+let gatewayTokenExpiry = 0;
+
+async function getGatewayToken() {
+    const now = Math.floor(Date.now() / 1000);
+
+    // Gunakan token lama jika belum kedaluwarsa agar tidak membebani limit Auth0
+    if (cachedGatewayToken && now < gatewayTokenExpiry) {
+        return cachedGatewayToken;
+    }
+
+    console.log("[AUTH] Fetching fresh M2M token from Auth0 to contact Gateway...");
+
+    // Spoke meminta token ke Auth0
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            client_id: process.env.M2M_CLIENT_ID,
+            client_secret: process.env.M2M_CLIENT_SECRET,
+            audience: process.env.AUTH0_AUDIENCE, // Sesuai dengan API Gateway Anda
+            grant_type: 'client_credentials'
+        })
+    });
+
+    const data = await response.json();
+
+    if (!data.access_token) {
+        throw new Error(`Auth0 denied Spoke token request: ${data.error_description || data.error}`);
+    }
+
+    cachedGatewayToken = data.access_token;
+    gatewayTokenExpiry = now + data.expires_in - 60; // Cadangan waktu 1 menit
+    return cachedGatewayToken;
+}
 
 const checkHubIdentity = auth({
-    audience: process.env.AUTH0_AUDIENCE, 
+    audience: process.env.AUTH0_AUDIENCE,
     issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
     tokenSigningAlg: 'RS256'
 });
@@ -47,7 +83,7 @@ const calculateFileHash = (filePath) => {
         // karena itu adalah data fisik yang rentan mengalami bit rot.
         const hash = crypto.createHash('sha256');
         const stream = fs.createReadStream(filePath);
-        
+
         stream.on('data', (chunk) => hash.update(chunk));
         stream.on('end', () => resolve(hash.digest('hex')));
         stream.on('error', (err) => reject(err));
@@ -59,19 +95,19 @@ const __dirname = path.dirname(__filename);
 const STORAGE_DIR = path.join(__dirname, 'vault_storage'); // Pastikan direktori ini konsisten digunakan
 
 // Membuat folder jika belum ada
-if (!fs.existsSync(STORAGE_DIR)){
+if (!fs.existsSync(STORAGE_DIR)) {
     fs.mkdirSync(STORAGE_DIR);
 }
 
-app.use('/internal', checkHubIdentity); 
-app.use(vpnOnly); 
+app.use('/internal', checkHubIdentity);
+app.use(vpnOnly);
 
 app.use((err, req, res, next) => {
-  if (err.name === 'UnauthorizedError') {
-    console.error("[SECURITY] Token Rejected:", err.message); 
-    return res.status(401).json({ error: "Invalid Token", detail: err.message });
-  }
-  next(err);
+    if (err.name === 'UnauthorizedError') {
+        console.error("[SECURITY] Token Rejected:", err.message);
+        return res.status(401).json({ error: "Invalid Token", detail: err.message });
+    }
+    next(err);
 });
 
 // ==========================================
@@ -119,9 +155,9 @@ app.post('/internal/files', (req, res) => {
             // Setelah file utuh di disk, hitung hash SHA-256-nya
             const finalChecksum = await calculateFileHash(vaultPath);
             const stats = fs.statSync(vaultPath);
-            
+
             console.log(`[SPOKE] Saved: ${safeName} | Physical Size: ${stats.size} | Hash: ${finalChecksum}`);
-            
+
             res.status(200).json({
                 status: "Success",
                 physical_path: safeName,
@@ -143,9 +179,9 @@ app.post('/internal/files', (req, res) => {
 // ==========================================
 // 2. RUTE PERAWATAN DAN BIT ROT
 // ==========================================
-app.use(express.json({ 
-    limit: '1mb', 
-    strict: true 
+app.use(express.json({
+    limit: '1mb',
+    strict: true
 }));
 
 app.get('/internal/health', (req, res) => {
@@ -168,11 +204,11 @@ app.get('/internal/inventory', async (req, res) => {
 });
 
 app.delete('/internal/files/:filename', async (req, res) => {
-    const safeName = path.basename(req.params.filename); 
+    const safeName = path.basename(req.params.filename);
     const filePath = path.join(STORAGE_DIR, safeName);
     try {
-        await fsp.access(filePath); 
-        await fsp.unlink(filePath); 
+        await fsp.access(filePath);
+        await fsp.unlink(filePath);
         console.log(`[SPOKE] Purged: ${safeName}`);
         res.json({ status: "Deleted" });
     } catch (err) {
@@ -181,7 +217,7 @@ app.delete('/internal/files/:filename', async (req, res) => {
 });
 
 app.post('/internal/maintenance/purge', async (req, res) => {
-    const { files } = req.body; 
+    const { files } = req.body;
     if (!Array.isArray(files)) return res.status(400).send("Invalid list.");
     const results = { success: 0, failed: 0 };
     await Promise.all(files.map(async (filename) => {
@@ -227,16 +263,20 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
         // Untuk menembak ke Gateway, kita membutuhkan akses token M2M dari Spoke
         // Anda perlu mereplikasi logika getSpokeToken() di sini jika Gateway mewajibkan autentikasi
         // Asumsi sementara rute Gateway ini dilindungi JWT.
-        
+
         // --- CONTOH PEMANGGILAN FETCH (Sesuaikan URL) ---
-        // await fetch(`http://{IP_GATEWAY_ANDA}:8080/api/v1/vault/admin/bitrot-report`, {
-        //     method: 'POST',
-        //     headers: { 'Content-Type': 'application/json' },
-        //     body: JSON.stringify(reportPayload)
-        // });
+        const GATEWAY_URL = 'https://richardgatewayta.duckdns.org:8080';
+        const token = await getGatewayToken();
+        const gatewayResponse = await fetch(`${GATEWAY_URL}/api/v1/vault/admin/bitrot/report`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(reportPayload)
+        });
+        if (!gatewayResponse.ok) {
+            throw new Error(`Gateway rejected the report with status: ${gatewayResponse.status}`);
+        }
 
-        console.log("[MAINTENANCE] Report payload generated (Needs Auth implementation to deliver to Gateway).");
-
+        console.log("[MAINTENANCE] Report successfully delivered to Gateway.");
     } catch (err) {
         console.error("[MAINTENANCE ERROR] Bit Rot Scan Failed:", err);
     }
@@ -266,7 +306,7 @@ app.get('/internal/files/:filename', (req, res) => {
         finalDecipher.setAuthTag(tag);
 
         const readStream = fs.createReadStream(filePath, { start: 12, end: stats.size - 17 });
-        
+
         console.log(`[SPOKE] Decrypting stream: ${filename}`);
         readStream.pipe(finalDecipher).pipe(res);
 
@@ -278,11 +318,11 @@ app.get('/internal/files/:filename', (req, res) => {
 
 app.post('/internal/files/copy', async (req, res) => {
     const { source_path } = req.body;
-    
+
     // Validasi sederhana agar tidak kena Path Traversal
-    const safeSource = path.basename(source_path); 
+    const safeSource = path.basename(source_path);
     const sourcePathFull = path.join(STORAGE_DIR, safeSource);
-    
+
     // Buat nama fail fisik yang sepenuhnya baru
     const newSafeName = `${Date.now()}-restored-${crypto.randomUUID()}.enc`;
     const destPathFull = path.join(STORAGE_DIR, newSafeName);
@@ -290,7 +330,7 @@ app.post('/internal/files/copy', async (req, res) => {
     try {
         // Gandakan fail secara fisik di dalam disk lokal Surabaya
         await fsp.copyFile(sourcePathFull, destPathFull);
-        
+
         // Dapatkan metadatanya untuk dikembalikan ke Jakarta
         const stats = await fsp.stat(destPathFull);
         const checksum = await calculateFileHash(destPathFull);

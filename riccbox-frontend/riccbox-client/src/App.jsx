@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo } from 'react';
 import './App.css';
 import { useAuth0 } from "@auth0/auth0-react";
 
+
 function App() {
   const {
     isLoading,
@@ -42,7 +43,6 @@ function App() {
   const [newBucketName, setNewBucketName] = useState('');
 
   // Share/Invite States
-  const [shareBucketModal, setShareBucketModal] = useState({ open: false, bucket: null });
   const [shareEmail, setShareEmail] = useState('');
   const [sharePermission, setSharePermission] = useState('READ');
   const [searchResults, setSearchResults] = useState([]);
@@ -55,7 +55,64 @@ function App() {
   const [dialog, setDialog] = useState({
     open: false, type: '', title: '', message: '', inputValue: '', targetData: null
   });
+  // --- MANAGE ACCESS STATES ---
+  const [manageAccessModal, setManageAccessModal] = useState({ open: false, bucket: null, members: [], isLoading: false });
 
+  // Buka Modal & Ambil Daftar Anggota
+  const openManageAccess = async (bucket) => {
+    setManageAccessModal({ open: true, bucket, members: [], isLoading: true });
+    try {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${bucket.uuid}/members`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const members = await res.json();
+        setManageAccessModal({ open: true, bucket, members, isLoading: false });
+      }
+    } catch (err) { console.error(err); }
+  };
+
+  // Undang / Ubah Akses Anggota
+  const handleShareBucket = async (e, directEmail = null, directPermission = null) => {
+    if (e) e.preventDefault();
+    const targetEmail = directEmail || shareEmail;
+    const targetPermission = directPermission || sharePermission;
+
+    try {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${manageAccessModal.bucket.uuid}/share`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: targetEmail, permission: targetPermission })
+      });
+      
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.message || errData.error);
+      }
+      
+      // Bersihkan input dan segarkan daftar anggota
+      setShareEmail('');
+      setSearchResults([]);
+      openManageAccess(manageAccessModal.bucket); 
+      if (!directEmail) setDialog({ open: true, type: 'ALERT', title: 'Access Granted', message: `Invitation sent to ${targetEmail}.` });
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Sharing Error', message: err.message }); }
+  };
+
+  // Tendang Anggota (Kick)
+  const handleKickMember = async (userId) => {
+    try {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${manageAccessModal.bucket.uuid}/share/${userId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) throw new Error("Revocation failed.");
+      
+      openManageAccess(manageAccessModal.bucket); // Segarkan daftar
+    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Revoke Error', message: err.message }); }
+  };
   const fileInputRef = useRef(null);
 
   const API_BASE = 'https://richardgatewayta.duckdns.org:8080';
@@ -191,6 +248,23 @@ function App() {
         fetchUsage();
         closeDialog();
       }
+      else if (type === 'DELETE_BUCKET') {
+        // Panggil endpoint DELETE Gateway
+        const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${targetData.uuid}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        const data = await res.json();
+        
+        // Jika backend menolak (misal: bucket belum kosong)
+        if (!res.ok) throw new Error(data.message || data.error);
+
+        // Jika sukses: Segarkan daftar di Lobby, tutup dialog lama, dan tampilkan notifikasi sukses
+        fetchBuckets();
+        closeDialog();
+        setDialog({ open: true, type: 'ALERT', title: 'Namespace Destroyed', message: data.message });
+      }
       else if (type === 'GENERATE_LINK') {
         if (!inputValue) return;
         const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData}/links?ttl=${inputValue}&permission=downloadable`, {
@@ -282,28 +356,8 @@ function App() {
     }
   };
 
-  const handleShareBucket = async (e) => {
-    e.preventDefault();
-    try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
-      const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${shareBucketModal.bucket.uuid}/share`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: shareEmail, permission: sharePermission })
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.message || errData.error);
-      }
-      setShareBucketModal({ open: false, bucket: null });
-      setShareEmail('');
-      setSearchResults([]);
-      setDialog({ open: true, type: 'ALERT', title: 'Access Granted', message: `Invitation sent to ${shareEmail}.` });
-    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Sharing Error', message: err.message }); }
-  };
 
   const triggerRenameBucket = (bucket) => setDialog({ open: true, type: 'RENAME_BUCKET', title: `Rename '${bucket.name}'`, message: 'Enter new bucket name:', inputValue: '', targetData: bucket });
-  const triggerRevokeAccess = (bucket) => setDialog({ open: true, type: 'REVOKE_ACCESS', title: `Kick from '${bucket.name}'`, message: 'Enter Auth0 ID (sub) to kick:', inputValue: '', targetData: bucket });
 
   // ==========================================
   // FILES (VAULT)
@@ -383,7 +437,7 @@ function App() {
   // ==========================================
   // INSPECTOR & PREVIEW LOGIC
   // ==========================================
-const openInspector = async (file) => {
+  const openInspector = async (file) => {
     setInspectorModal({ open: true, file });
     setFileVersions([]);
     setPreviewData({ url: null, isLoading: false, versionNum: null }); // Reset preview
@@ -415,23 +469,23 @@ const openInspector = async (file) => {
   const restoreVersion = async (file, versionNum) => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
-      const res = await fetch(`${API_BASE}/api/v1/vault/files/${file.uuid}/restore?v=${versionNum}`, { 
+      const res = await fetch(`${API_BASE}/api/v1/vault/files/${file.uuid}/restore?v=${versionNum}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` } 
+        headers: { Authorization: `Bearer ${token}` }
       });
-      
+
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
       // Beri notifikasi, lalu segarkan file list dan inspector
       setDialog({ open: true, type: 'ALERT', title: 'Restore Success', message: `Version ${versionNum} has been restored as the newest version (v${data.new_version}).` });
-      
+
       // Refresh layar
       fetchFiles(activeBucket.uuid);
       openInspector(file); // Refresh versi di modal
-      
-    } catch (err) { 
-      setDialog({ open: true, type: 'ALERT', title: 'Restore Error', message: err.message }); 
+
+    } catch (err) {
+      setDialog({ open: true, type: 'ALERT', title: 'Restore Error', message: err.message });
     }
   };
 
@@ -591,7 +645,7 @@ const openInspector = async (file) => {
               <button onClick={() => setActiveView('lobby')} style={{ opacity: activeView === 'lobby' ? 1 : 0.5 }}>Namespaces (Lobby)</button>
               {userRole === 'admin' && (
                 <button onClick={loadAdminData} style={{ opacity: activeView === 'admin' ? 1 : 0.5, backgroundColor: '#d32f2f', color: 'white' }}>
-                  God Mode (Admin)
+                  Admin mode
                 </button>
               )}
             </div>
@@ -613,52 +667,91 @@ const openInspector = async (file) => {
                 </form>
               )}
 
-              {shareBucketModal.open && (
-                <div className="modal" style={{ padding: '15px', background: '#c4c4c4', marginBottom: '15px', borderLeft: '4px solid #ff9800', color: '#000' }}>
-                  <h3 style={{ marginTop: 0 }}>RBAC Policy: '{shareBucketModal.bucket.name}'</h3>
-                  <form onSubmit={handleShareBucket}>
+             {/* 🆕 PANEL MANAGE ACCESS MODERN */}
+              {manageAccessModal.open && (
+                <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(17, 24, 39, 0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+                  <div className="modal-content" style={{ background: '#ffffff', width: '500px', maxWidth: '90%', borderRadius: '12px', border: '1px solid #e5e7eb', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)', overflow: 'hidden' }}>
+                    
+                    {/* Header */}
+                    <div style={{ padding: '20px 25px', borderBottom: '1px solid #f3f4f6', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f9fafb' }}>
+                      <h3 style={{ margin: 0, color: '#111827' }}>Manage Access: {manageAccessModal.bucket.name}</h3>
+                      <button onClick={() => { setManageAccessModal({ open: false, bucket: null, members: [] }); setSearchResults([]); setShareEmail(''); }} style={{ background: 'transparent', border: 'none', color: '#9ca3af', fontSize: '1.2rem', cursor: 'pointer' }}>✖</button>
+                    </div>
 
-                    <div style={{ position: 'relative', marginBottom: '10px' }}>
-                      <input
-                        type="email"
-                        placeholder="Search employee email..."
-                        value={shareEmail}
-                        onChange={handleEmailSearch}
-                        autoComplete="off"
-                        required
-                        style={{ width: '100%', padding: '10px', boxSizing: 'border-box' }}
-                      />
-                      {searchResults.length > 0 && (
-                        <ul style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fff', border: '1px solid #ccc', margin: 0, padding: 0, listStyle: 'none', zIndex: 10 }}>
-                          {searchResults.map(res => (
-                            <li
-                              key={res.user_id}
-                              onClick={() => { setShareEmail(res.email); setSearchResults([]); }}
-                              style={{ padding: '10px', cursor: 'pointer', borderBottom: '1px solid #eee' }}
-                            >
-                              {res.email}
-                            </li>
-                          ))}
-                        </ul>
+                    <div style={{ padding: '25px' }}>
+                      {/* Form Tambah Orang */}
+                      <form onSubmit={(e) => handleShareBucket(e)} style={{ display: 'flex', gap: '10px', marginBottom: '25px' }}>
+                        <div style={{ position: 'relative', flex: 2 }}>
+                          <input type="email" placeholder="Add email address..." value={shareEmail} onChange={handleEmailSearch} autoComplete="off" required style={{ width: '100%', padding: '10px 14px', boxSizing: 'border-box' }} />
+                          {searchResults.length > 0 && (
+                            <ul style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#fff', border: '1px solid #d1d5db', borderRadius: '8px', margin: '5px 0 0 0', padding: 0, listStyle: 'none', zIndex: 10, boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
+                              {searchResults.map(res => (
+                                <li key={res.user_id} onClick={() => { setShareEmail(res.email); setSearchResults([]); }} style={{ padding: '10px 14px', cursor: 'pointer', borderBottom: '1px solid #f3f4f6', color: '#374151' }}>
+                                  {res.email}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                        <select value={sharePermission} onChange={(e) => setSharePermission(e.target.value)} style={{ flex: 1, padding: '10px' }}>
+                          <option value="READ">Viewer</option>
+                          <option value="WRITE">Editor</option>
+                        </select>
+                        <button type="submit" style={{ backgroundColor: '#3b82f6', color: 'white', border: 'none' }}>Invite</button>
+                      </form>
+
+                      {/* Daftar Anggota */}
+                      <h4 style={{ margin: '0 0 15px 0', color: '#6b7280', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>People with Access</h4>
+                      
+                      {manageAccessModal.isLoading ? (
+                        <p style={{ color: '#9ca3af', textAlign: 'center' }}>Loading members...</p>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '250px', overflowY: 'auto' }}>
+                          {manageAccessModal.members.map(member => {
+                            const isOwner = member.permission === 'ADMIN';
+                            return (
+                              <div key={member.user_id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px', backgroundColor: '#f9fafb', borderRadius: '8px', border: '1px solid #f3f4f6' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                  <div style={{ width: '36px', height: '36px', borderRadius: '50%', backgroundColor: isOwner ? '#e0e7ff' : '#f3f4f6', color: isOwner ? '#4338ca' : '#6b7280', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold', fontSize: '1.2rem' }}>
+                                    {member.email.charAt(0).toUpperCase()}
+                                  </div>
+                                  <div>
+                                    <div style={{ color: '#111827', fontWeight: '600', fontSize: '0.95rem' }}>{member.email}</div>
+                                    <div style={{ color: '#6b7280', fontSize: '0.8rem' }}>{isOwner ? 'Workspace Owner' : 'Guest Member'}</div>
+                                  </div>
+                                </div>
+                                
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  {isOwner ? (
+                                    <span style={{ color: '#9ca3af', fontSize: '0.85rem', paddingRight: '10px' }}>Owner</span>
+                                  ) : (
+                                    <>
+                                      <select 
+                                        value={member.permission} 
+                                        onChange={(e) => handleShareBucket(null, member.email, e.target.value)} 
+                                        style={{ padding: '6px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid #d1d5db', cursor: 'pointer' }}
+                                      >
+                                        <option value="READ">Viewer</option>
+                                        <option value="WRITE">Editor</option>
+                                      </select>
+                                      <button onClick={() => handleKickMember(member.user_id)} style={{ backgroundColor: 'transparent', color: '#ef4444', border: 'none', fontSize: '1.2rem', padding: '4px 8px' }} title="Remove Access">
+                                        🗑
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
-
-                    <select value={sharePermission} onChange={(e) => setSharePermission(e.target.value)} style={{ width: '100%', padding: '10px', marginBottom: '10px', boxSizing: 'border-box' }}>
-                      <option value="READ">Viewer (Read Only)</option>
-                      <option value="WRITE">Editor (Read / Write)</option>
-                    </select>
-
-                    <div style={{ display: 'flex', gap: '10px' }}>
-                      <button type="submit" style={{ flex: 1, backgroundColor: '#2196F3', color: 'white' }}>Invite User</button>
-                      <button type="button" onClick={() => { setShareBucketModal({ open: false, bucket: null }); setSearchResults([]); setShareEmail(''); }} style={{ flex: 1 }}>Cancel</button>
-                    </div>
-                  </form>
+                  </div>
                 </div>
               )}
-
               {buckets.length > 0 ? (
                 <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
-                  <thead style={{ borderBottom: '2px solid #444', color: '#aaa' }}>
+                  <thead>
                     <tr>
                       <th style={{ padding: '12px' }}>Name</th>
                       <th style={{ padding: '12px' }}>Region</th>
@@ -668,43 +761,70 @@ const openInspector = async (file) => {
                     </tr>
                   </thead>
                   <tbody>
-                    {buckets.map((bucket) => (
-                      <tr key={bucket.uuid} style={{ borderBottom: '1px solid #333' }}>
-                        <td style={{ padding: '12px' }}><strong>{bucket.name}</strong></td>
-                        <td style={{ padding: '12px' }}><span className="badge" style={{ background: '#d3d3d3' }}>{bucket.region}</span></td>
-                        <td style={{ padding: '12px' }}>
-                          <span style={{
-                            background: bucket.permission === 'ADMIN' ? '#d32f2f' : bucket.permission === 'WRITE' ? '#ff9800' : '#4CAF50',
-                            color: 'white', padding: '4px 8px', borderRadius: '4px', fontSize: '0.8rem', fontWeight: 'bold'
-                          }}>
-                            {bucket.permission}
-                          </span>
-                        </td>
-                        <td style={{ padding: '12px', fontFamily: 'monospace', color: '#aaa' }}><small>{bucket.uuid.split('-')[0]}</small></td>
-                        <td style={{ padding: '12px', textAlign: 'right' }}>
-                          <button onClick={() => openBucket(bucket)} style={{ background: '#2196F3', color: '#fff' }}>Enter</button>
+                    {buckets.map((bucket) => {
+                      // Menentukan apakah pengguna adalah pemilik asli (ADMIN) atau tamu
+                      const isOwner = bucket.permission === 'ADMIN';
 
-                          {/* 🔒 RBAC LOBBY: HANYA ADMIN BUCKET YANG BISA MENGUBAH / MENGUNDANG */}
-                          {bucket.permission === 'ADMIN' && (
-                            <>
-                              <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px' }}>✎</button>
-                              <button onClick={() => setShareBucketModal({ open: true, bucket })} style={{ marginLeft: '5px', backgroundColor: '#ff9800', color: 'white' }}>+ Guest</button>
-                              <button onClick={() => triggerRevokeAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#d32f2f', color: 'white' }}>Kick</button>
-                              <button
-                                onClick={() => setDialog({ open: true, type: 'DELETE_BUCKET', title: `Destroy Namespace '${bucket.name}'?`, message: 'WARNING: This action is irreversible. The namespace must be completely empty before it can be destroyed.', targetData: bucket })}
-                                style={{ marginLeft: '15px', backgroundColor: '#8b0000', color: 'white', padding: '4px 8px', borderRadius: '4px', border: '1px solid #ff5252', cursor: 'pointer', fontWeight: 'bold' }}
-                                title="Destroy Namespace"
-                              >
-                                ☢ Nuke
-                              </button>
-                            </>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                      return (
+                        <tr key={bucket.uuid}>
+                          <td style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <strong style={{ color: '#111827' }}>{bucket.name}</strong>
+                            {isOwner ? (
+                              <span style={{ fontSize: '0.7rem', backgroundColor: '#e0e7ff', color: '#4338ca', padding: '4px 8px', borderRadius: '12px', fontWeight: 'bold' }}>OWNER</span>
+                            ) : (
+                              <span style={{ fontSize: '0.7rem', backgroundColor: '#fef3c7', color: '#d97706', padding: '4px 8px', borderRadius: '12px', fontWeight: 'bold' }}>GUEST</span>
+                            )}
+                          </td>
+                          <td style={{ padding: '12px' }}>
+                            <span className="badge" style={{ background: '#f3f4f6', color: '#4b5563', border: '1px solid #e5e7eb' }}>
+                              {bucket.region}
+                            </span>
+                          </td>
+                          <td style={{ padding: '12px' }}>
+                            <span style={{
+                              background: bucket.permission === 'ADMIN' ? '#fee2e2' : bucket.permission === 'WRITE' ? '#fef3c7' : '#dcfce7',
+                              color: bucket.permission === 'ADMIN' ? '#991b1b' : bucket.permission === 'WRITE' ? '#92400e' : '#166534',
+                              padding: '6px 12px', borderRadius: '12px', fontSize: '0.75rem', fontWeight: 'bold'
+                            }}>
+                              {bucket.permission}
+                            </span>
+                          </td>
+                          <td style={{ padding: '12px', fontFamily: 'monospace', color: '#6b7280' }}>
+                            <small>{bucket.uuid.split('-')[0]}</small>
+                          </td>
+                          <td style={{ padding: '12px', textAlign: 'right' }}>
+                            <button onClick={() => openBucket(bucket)} style={{ background: '#3b82f6', color: '#fff', border: 'none' }}>Enter</button>
+
+                        {/* 🔒 RBAC LOBBY: HANYA ADMIN BUCKET YANG BISA MENGUBAH / MENGUNDANG */}
+                            {isOwner && (
+                              <>
+                                <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}>✎ Rename</button>
+                                
+                                {/* 🆕 TOMBOL SAKTI MANAGE ACCESS */}
+                                <button onClick={() => openManageAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#8b5cf6', color: 'white', border: 'none' }}>
+                                  👥 Manage Access
+                                </button>
+                                
+                                <button
+                                  onClick={() => setDialog({ open: true, type: 'DELETE_BUCKET', title: `Destroy Namespace '${bucket.name}'?`, message: 'WARNING: This action is irreversible. The namespace must be completely empty before it can be destroyed.', targetData: bucket })}
+                                  style={{ marginLeft: '15px', backgroundColor: '#7f1d1d', color: 'white', padding: '6px 10px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontWeight: 'bold' }}
+                                >
+                                  ☢ Nuke
+                                </button>
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
-              ) : <p>No buckets provisioned.</p>}
+              ) : (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280', border: '1px dashed #d1d5db', borderRadius: '8px' }}>
+                  <span style={{ fontSize: '3rem', display: 'block', marginBottom: '10px' }}>📦</span>
+                  No namespaces provisioned yet.
+                </div>
+              )}
             </div>
           )}
 
@@ -736,6 +856,23 @@ const openInspector = async (file) => {
                   );
                 })}
               </div>
+                <div style={{ textAlign: 'right', backgroundColor: '#f9fafb', padding: '8px 12px', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+                  <div style={{ fontSize: '0.75rem', color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '2px' }}>
+                    Namespace Metadata
+                  </div>
+                  <div style={{ fontSize: '0.9rem', color: '#111827', display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'flex-end' }}>
+                    {/* Tampilkan Email Pemilik */}
+                    <span title="Bucket Owner">
+                      👤 {activeBucket.permission === 'ADMIN' ? 'You (Owner)' : activeBucket.owner_email || 'Unknown Owner'}
+                    </span>
+                    <span style={{ color: '#d1d5db' }}>|</span>
+                    {/* Tampilkan Izin Pengguna Saat Ini */}
+                    <span title="Your Access Level">
+                      🔑 Access: <strong style={{ color: activeBucket.permission === 'READ' ? '#166534' : '#92400e' }}>{activeBucket.permission}</strong>
+                    </span>
+                  </div>
+                </div>
+
 
               <div className="toolbar" style={{ display: 'flex', gap: '10px', marginBottom: '20px', borderBottom: '1px solid #444', paddingBottom: '15px' }}>
                 <button onClick={() => fetchFiles(activeBucket.uuid)} disabled={isFetching} style={{ background: '#333', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>↻ Refresh</button>
@@ -817,11 +954,11 @@ const openInspector = async (file) => {
             </div>
           )}
 
-   {/* INSPECTOR MODAL */}
+          {/* INSPECTOR MODAL */}
           {inspectorModal.open && inspectorModal.file && (
             <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', padding: '40px', zIndex: 1000 }}>
               <div className="modal-content" style={{ background: '#ffffff', width: '100%', display: 'flex', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
-                
+
                 {/* PANEL KIRI (PRATILIK) */}
                 <div style={{ flex: 2, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
                   {previewData.isLoading ? (
@@ -851,24 +988,24 @@ const openInspector = async (file) => {
                     <h3 style={{ margin: 0, color: '#111827' }}>Version History</h3>
                     <button onClick={closeInspector} style={{ background: 'transparent', color: '#6b7280', border: '1px solid #d1d5db' }}>Close</button>
                   </div>
-                  
+
                   {fileVersions.map((v, index) => {
                     const isLatest = index === 0;
                     const isBeingPreviewed = previewData.versionNum === v.version_num;
-                    
+
                     return (
-                      <div key={v.version_num} style={{ 
-                        background: isBeingPreviewed ? '#eff6ff' : '#ffffff', 
+                      <div key={v.version_num} style={{
+                        background: isBeingPreviewed ? '#eff6ff' : '#ffffff',
                         border: `1px solid ${isBeingPreviewed ? '#3b82f6' : '#e5e7eb'}`,
-                        padding: '15px', 
-                        marginBottom: '12px', 
+                        padding: '15px',
+                        marginBottom: '12px',
                         borderRadius: '8px',
                         transition: 'all 0.2s ease',
                         boxShadow: isBeingPreviewed ? '0 2px 4px rgba(59, 130, 246, 0.1)' : 'none'
                       }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '10px' }}>
                           <div>
-                            <strong style={{ color: '#111827', fontSize: '1.1rem' }}>v{v.version_num}</strong> 
+                            <strong style={{ color: '#111827', fontSize: '1.1rem' }}>v{v.version_num}</strong>
                             {isLatest && <span style={{ marginLeft: '8px', fontSize: '0.7rem', background: '#dcfce7', color: '#166534', padding: '2px 6px', borderRadius: '4px', fontWeight: 'bold' }}>LATEST</span>}
                             <br />
                             <small style={{ color: '#6b7280' }}>{formatBytes(v.size)} • {new Date(v.timestamp).toLocaleString()}</small>
@@ -877,15 +1014,15 @@ const openInspector = async (file) => {
 
                         {/* TOMBOL AKSI UNTUK MASING-MASING VERSI */}
                         <div style={{ display: 'flex', gap: '8px', marginTop: '15px' }}>
-                          <button 
-                            onClick={() => loadPreview(inspectorModal.file, v.version_num)} 
+                          <button
+                            onClick={() => loadPreview(inspectorModal.file, v.version_num)}
                             style={{ flex: 1, backgroundColor: isBeingPreviewed ? '#3b82f6' : '#f3f4f6', color: isBeingPreviewed ? 'white' : '#374151', padding: '6px', fontSize: '0.8rem', border: 'none' }}>
                             {previewData.isLoading && isBeingPreviewed ? 'Loading...' : 'Preview'}
                           </button>
-                          
+
                           {/* 🔒 RBAC: Tombol Restore hanya muncul jika pengguna punya akses WRITE atau ADMIN */}
                           {activeBucket.permission !== 'READ' && !isLatest && (
-                            <button 
+                            <button
                               onClick={() => restoreVersion(inspectorModal.file, v.version_num)}
                               style={{ flex: 1, backgroundColor: '#10b981', color: 'white', padding: '6px', fontSize: '0.8rem', border: 'none' }}>
                               Restore
@@ -995,7 +1132,6 @@ const openInspector = async (file) => {
             </div>
           )}
 
-          {/* UNIVERSAL THEMED DIALOG MODAL */}
           {/* UNIVERSAL THEMED DIALOG MODAL */}
           {dialog.open && (() => {
             // Evaluasi logika khusus untuk fitur "Type to Confirm"
