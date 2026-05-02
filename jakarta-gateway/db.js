@@ -1,7 +1,8 @@
 import Database from 'better-sqlite3';
 const db = new Database('vault.db');
 
-db.pragma('foreign_keys = ON');
+db.pragma('foreign_keys = ON ');
+db.pragma('journal_mode = WAL');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
