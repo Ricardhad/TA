@@ -53,10 +53,10 @@ app.use(helmet({
             // Izinkan React menggunakan CSS bawaannya
             "style-src": ["'self'", "'unsafe-inline'"],
 
-            "img-src": ["'self'", "data:", "https:", "blob:"], 
-            
-            "frame-src": ["'self'", "blob:"], 
-            
+            "img-src": ["'self'", "data:", "https:", "blob:"],
+
+            "frame-src": ["'self'", "blob:"],
+
             "worker-src": ["'self'", "blob:"]
         },
     },
@@ -72,12 +72,12 @@ app.use(cors({
 app.use((req, res, next) => {
     // KECUALIKAN rute Upload DAN rute Benchmark agar req tetap berupa Stream murni!
     if (req.method === 'POST' && (
-        req.path === '/api/v1/vault/files' || 
+        req.path === '/api/v1/vault/files' ||
         req.path === '/api/v1/vault/admin/test/performance'
     )) {
         return next();
     }
-    
+
     // Untuk rute lain, gunakan JSON parser dengan limit kecil
     express.json({ limit: '5mb', strict: true })(req, res, (err) => {
         if (err) return next(err);
@@ -115,7 +115,7 @@ const bouncer = auth({
 let cachedM2MToken = null;
 let tokenExpiry = 0;
 // 🆕 Tambahkan variabel kunci
-let tokenPromise = null; 
+let tokenPromise = null;
 
 async function getSpokeToken() {
     const now = Math.floor(Date.now() / 1000);
@@ -129,7 +129,7 @@ async function getSpokeToken() {
     }
 
     console.log("[AUTH] Fetching fresh M2M token from Auth0...");
-    
+
     tokenPromise = (async () => {
         try {
             const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
@@ -144,7 +144,7 @@ async function getSpokeToken() {
             });
 
             const data = await response.json();
-            
+
             if (!data.access_token) {
                 console.error("[AUTH ERROR] Auth0 denied the request:", data);
                 throw new Error(`Auth0 Authentication Failed: ${data.error_description || data.error}`);
@@ -206,7 +206,7 @@ apiRouter.get('/vault/view/:uuid', async (req, res) => {
         const secret = process.env.URL_SIGNING_SECRET;
         const expectedSig = crypto.createHmac('sha256', secret).update(`${uuid}:${expires}:${permission}`).digest('hex');
         if (sig !== expectedSig) return res.status(403).send("Invalid signature.");
-        
+
         const fileMeta = db.prepare(`SELECT f.filename, f.mime_type, v.physical_path, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? ORDER BY v.version_num DESC LIMIT 1`).get(uuid);
         if (!fileMeta) return res.status(404).send("File no longer exists.");
 
@@ -216,7 +216,7 @@ apiRouter.get('/vault/view/:uuid', async (req, res) => {
         res.setHeader('Content-Type', fileMeta.mime_type || 'application/octet-stream');
         if (permission === 'viewable') res.setHeader('Content-Disposition', 'inline');
         else res.setHeader('Content-Disposition', `attachment; filename="${fileMeta.filename}"`);
-        
+
         Readable.fromWeb(spokeResponse.body).pipe(res);
     } catch (err) {
         console.error("[VIEW ERROR]", err.message);
@@ -239,8 +239,8 @@ apiRouter.get('/vault/identity', (req, res) => {
 
 apiRouter.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
-    const ADMIN_QUOTA_LIMIT = 50 * 1024 * 1024 * 1024; 
-    const QUOTA_LIMIT = 5 * 1024 * 1024 * 1024; 
+    const ADMIN_QUOTA_LIMIT = 50 * 1024 * 1024 * 1024;
+    const QUOTA_LIMIT = 5 * 1024 * 1024 * 1024;
     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA_LIMIT : QUOTA_LIMIT;
     try {
         const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
@@ -252,7 +252,7 @@ apiRouter.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
 apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
     const userId = req.auth.payload.sub;
     const search = req.query.search ? `%${req.query.search}%` : '%';
-    const bucketUuid = req.headers['x-bucket-uuid']; 
+    const bucketUuid = req.headers['x-bucket-uuid'];
     try {
         let query, params;
         if (req.globalRole === 'admin' && !bucketUuid) {
@@ -269,10 +269,21 @@ apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
 apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
     const USER_QUOTA = 5 * 1024 * 1024 * 1024;
-    const MAX_SIZE = 1 * 1024 * 1024 * 1024; 
+    const MAX_SIZE = 1 * 1024 * 1024 * 1024;
     const contentType = req.headers['content-type'];
     const contentLength = req.headers['content-length'];
     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
+    const controller = new AbortController();
+
+    // 2. Pasang pendengar jika koneksi klien (browser) terputus
+    req.on('error', (err) => {
+        console.warn(`[UPLOAD-GATEWAY] Stream Error: ${err.message}`);
+        controller.abort();
+    });
+    req.on('aborted', () => {
+        console.warn(`[UPLOAD-GATEWAY] User membatalkan unggahan.`);
+        controller.abort();
+    });
 
     if (!contentType || !contentType.includes('multipart/form-data')) return res.status(400).json({ error: "Invalid Request" });
     if (contentLength && parseInt(contentLength) > MAX_SIZE) return res.status(413).json({ error: "File Too Large" });
@@ -282,14 +293,14 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
     const bucketUuid = req.headers['x-bucket-uuid'];
     const folderPrefix = req.headers['x-file-prefix'] || '';
     const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
-    
+
     if (!bucket) return res.status(404).json({ error: "Target bucket does not exist." });
 
     let isProcessing = false;
-    let limitReached = false; 
+    let limitReached = false;
 
     busboy.on('file', async (name, file, info) => {
-        if (isProcessing) return; 
+        if (isProcessing) return;
         isProcessing = true;
         const { filename, mimeType: headerMime } = info;
         const fullVirtualFilename = folderPrefix + filename;
@@ -303,14 +314,16 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
             if (isSpoofed) { file.resume(); return res.status(403).json({ error: "Security Violation" }); }
 
             const spokeResponse = await spokeFetch(`/internal/files`, {
-                method: 'POST', body: file, duplex: 'half', headers: { 'x-original-name': filename }
+                method: 'POST', body: file, duplex: 'half',
+                signal: controller.signal,
+                headers: { 'x-original-name': filename }
             });
 
             if (limitReached) return res.status(413).json({ error: "File Too Large" });
             if (!spokeResponse.ok) throw new Error(`Spoke rejected upload`);
 
             const data = await spokeResponse.json();
-            const { physical_path, size ,checksum} = data;
+            const { physical_path, size, checksum } = data;
 
             let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
             if (!fileRecord) {
@@ -335,7 +348,13 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
             db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
 
             res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
-        } catch (err) { file.resume(); res.status(500).json({ error: "Gateway stream interrupted." }); }
+            setImmediate(() => { req.destroy(); });
+        } catch (err) { 
+            file.resume();
+            if (err.name === 'AbortError') {
+                console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
+            }
+             res.status(500).json({ error: "Gateway stream interrupted." }); }
     });
     req.pipe(busboy);
 });
@@ -359,7 +378,7 @@ apiRouter.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, 
         res.setHeader('Content-Type', fileInfo.mime_type || 'application/octet-stream');
         const actualSize = spokeResponse.headers.get('content-length');
         if (actualSize) res.setHeader('Content-Length', actualSize);
-        
+
         let downloadName = fileInfo.filename;
         if (requestedVersion) downloadName = fileInfo.filename.includes('.') ? fileInfo.filename.replace(/(\.[^.]+)$/, `_v${requestedVersion}$1`) : `${fileInfo.filename}_v${requestedVersion}`;
         res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
@@ -370,7 +389,7 @@ apiRouter.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, 
 
 apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) => {
     const fileUuid = req.params.uuid;
-    const ttl = parseInt(req.query.ttl) || 60; 
+    const ttl = parseInt(req.query.ttl) || 60;
     const permission = req.query.permission === 'downloadable' ? 'downloadable' : 'viewable';
     try {
         const file = db.prepare('SELECT filename FROM files WHERE uuid = ?').get(fileUuid);
@@ -554,7 +573,7 @@ apiRouter.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) 
     } catch (err) { res.status(500).json({ error: "Sync failed." }); }
 });
 apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
-    
+
     // 1. BUAT "TOMBOL PANIK" (AbortController)
     const controller = new AbortController();
 
@@ -562,15 +581,15 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
         console.warn(`[GATEWAY SAFE-CATCH] Stream Error: ${err.message}`);
         controller.abort(); // 2. TEKAN TOMBOL PANIK UNTUK MEMUTUS FETCH KE SPOKE
     });
-    
+
     req.on('aborted', () => {
         console.warn(`[GATEWAY SAFE-CATCH] Klien membatalkan unggahan secara sepihak.`);
         controller.abort(); // 2. TEKAN TOMBOL PANIK UNTUK MEMUTUS FETCH KE SPOKE
     });
 
     try {
-        const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { 
-            method: 'POST', 
+        const spokeResponse = await spokeFetch(`/internal/files/test/upload`, {
+            method: 'POST',
             body: req,
             duplex: 'half',
             signal: controller.signal, // 3. SAMBUNGKAN TOMBOL PANIK KE FETCH
@@ -578,16 +597,16 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
                 'Content-Type': req.headers['content-type'] || 'application/octet-stream'
             }
         });
-        
+
         const data = await spokeResponse.json();
-        
-        res.json({ 
-            message: "Benchmark Complete", 
+
+        res.json({
+            message: "Benchmark Complete",
             spoke_received_gb: data.size_gb,
             note: data.note || "Stress test successful"
         });
         req.destroy();
-    } catch (err) { 
+    } catch (err) {
         // 4. TANGANI GALAT JIKA ABORT DILAKUKAN
         if (err.name === 'AbortError') {
             console.warn("[GATEWAY] Fetch ke Spoke dibatalkan karena klien terputus.");
@@ -597,7 +616,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
 
         // Pastikan kita hanya membalas jika header belum terkirim
         if (!res.headersSent) {
-            res.status(500).json({ error: "Stream Interrupted: " + err.message }); 
+            res.status(500).json({ error: "Stream Interrupted: " + err.message });
         }
     }
 });
@@ -612,7 +631,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
 //             }
 //         });
 //         const data = await spokeResponse.json();
-        
+
 //         res.json({ 
 //             message: "Benchmark Complete", 
 //             spoke_received_gb: data.size_gb,
@@ -653,11 +672,11 @@ app.use('/api/v1', bouncer, apiRouter);
 // ==========================================
 // 5. HOSTING FRONTEND REACT (The "Lobby")
 // ==========================================
-app.use(express.static(path.join(__dirname, 'dist'))); 
+app.use(express.static(path.join(__dirname, 'dist')));
 
 app.get(/.*/, (req, res, next) => {
     if (req.path.startsWith('/api')) {
-        return next(); 
+        return next();
     }
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
@@ -694,7 +713,7 @@ const sslOptions = {
     cert: fs.readFileSync('/etc/letsencrypt/live/richardgatewayta.duckdns.org/fullchain.pem')
 };
 
-const server =https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
+const server = https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
     console.log('--- Zero Trust Architecture Active ---');
     console.log(`Public Entry: https://richardgatewayta.duckdns.org:${PUBLIC_PORT}`);
     console.log(`Internal Destination: ${LOCAL_SPOKE_IP}:${LOCAL_PORT}`);
