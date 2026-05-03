@@ -58,7 +58,10 @@ app.use(cors({
     credentials: true
 }));
 
-app.use(express.json({ limit: '1mb', strict: true }));
+app.use(express.json({ limit: '50mb', strict: true }));
+app.use(express.raw({ type: 'application/octet-stream', limit: '50mb' })); 
+
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -527,11 +530,25 @@ apiRouter.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) 
 
 apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
     try {
-        const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { method: 'POST', body: req, duplex: 'half' });
-        res.json({ message: "Benchmark Complete", spoke_received_gb: (await spokeResponse.json()).size_gb });
-    } catch (err) { res.status(500).json({ error: "Benchmark Interrupted" }); }
+        // 🌟 PERBAIKAN: Gunakan req.body, dan kita tidak butuh duplex: 'half' lagi karena ini bukan stream
+        const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { 
+            method: 'POST', 
+            body: req.body 
+        });
+        
+        const data = await spokeResponse.json();
+        
+        // Perbaiki respons kembalian agar cocok dengan yang dibaca oleh React
+        res.json({ 
+            message: "Benchmark Complete", 
+            spoke_received_gb: data.size_gb,
+            note: data.note || "Stress test successful"
+        });
+    } catch (err) { 
+        console.error("Benchmark route error:", err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
-
 apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, res) => {
     let corruptedFiles = 0;
     for (const item of req.body) {

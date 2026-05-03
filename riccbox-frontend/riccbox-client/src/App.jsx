@@ -86,16 +86,16 @@ function App() {
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: targetEmail, permission: targetPermission })
       });
-      
+
       if (!res.ok) {
         const errData = await res.json();
         throw new Error(errData.message || errData.error);
       }
-      
+
       // Bersihkan input dan segarkan daftar anggota
       setShareEmail('');
       setSearchResults([]);
-      openManageAccess(manageAccessModal.bucket); 
+      openManageAccess(manageAccessModal.bucket);
       if (!directEmail) setDialog({ open: true, type: 'ALERT', title: 'Access Granted', message: `Invitation sent to ${targetEmail}.` });
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Sharing Error', message: err.message }); }
   };
@@ -109,7 +109,7 @@ function App() {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (!res.ok) throw new Error("Revocation failed.");
-      
+
       openManageAccess(manageAccessModal.bucket); // Segarkan daftar
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Revoke Error', message: err.message }); }
   };
@@ -254,9 +254,9 @@ function App() {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` }
         });
-        
+
         const data = await res.json();
-        
+
         // Jika backend menolak (misal: bucket belum kosong)
         if (!res.ok) throw new Error(data.message || data.error);
 
@@ -383,7 +383,7 @@ function App() {
     } catch (err) { console.error(err); } finally { setIsFetching(false); }
   };
 
-const handleUpload = async (event) => {
+  const handleUpload = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
 
@@ -393,10 +393,10 @@ const handleUpload = async (event) => {
       formData.append('file', file); // Nama field 'file' harus cocok dengan yang ditangkap Busboy di Gateway
 
       const xhr = new XMLHttpRequest();
-      
+
       // 1. Tentukan rute tujuan API Anda
       // Pastikan API_URL Anda sesuai, misalnya: "https://richardgatewayta.duckdns.org:8080"
-      const uploadUrl = `/api/v1/vault/files`; 
+      const uploadUrl = `/api/v1/vault/files`;
       xhr.open('POST', uploadUrl, true);
 
       // 2. Pasang semua Header Keamanan (Sangat Penting untuk Zero Trust!)
@@ -430,7 +430,7 @@ const handleUpload = async (event) => {
           try {
             const errResponse = JSON.parse(xhr.responseText);
             alert(`Upload Failed: ${errResponse.error || errResponse.message}`);
-          } catch(e) {
+          } catch (e) {
             alert(`Upload Failed: Server Error (${xhr.status},${e})`);
           }
         }
@@ -587,15 +587,74 @@ const handleUpload = async (event) => {
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Purge Error', message: err.message }); }
   };
 
-  const triggerBenchmark = async () => {
+  // const runNetworkBenchmark = async () => {
+  //   try {
+  //     const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+  //     const res = await fetch(`${API_BASE}/api/v1/vault/admin/test/performance`, {
+  //       method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: "DUMMY_STRESS_PAYLOAD"
+  //     });
+  //     setBenchmarkResult(await res.json());
+  //   } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Test Failed', message: "Spoke unreachable?", detail: err.message }); }
+  // }
+  const runNetworkBenchmark = async () => {
     try {
-      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
-      const res = await fetch(`${API_BASE}/api/v1/vault/admin/test/performance`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: "DUMMY_STRESS_PAYLOAD"
+      const token = await getAccessTokenSilently();
+
+      console.log("Generating 50MB of dummy payload...");
+      const payloadSize = 50 * 1024 * 1024; // 50 MB
+      const dummyPayload = new Uint8Array(payloadSize);
+
+     console.log("Transmitting payload through Jakarta Gateway to Surabaya Spoke...");
+      
+      // ⏱️ MULAI STOPWATCH
+      const startTime = performance.now();
+
+      const response = await fetch(`https://richardgatewayta.duckdns.org:8080/api/v1/vault/admin/test/performance`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/octet-stream'
+        },
+        body: dummyPayload
       });
-      setBenchmarkResult(await res.json());
-    } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Test Failed', message: "Spoke unreachable?", detail: err.message }); }
-  }
+
+      const rawText = await response.text();
+      
+      // ⏱️ HENTIKAN STOPWATCH (Karena data sudah selesai dikirim dan server sudah membalas)
+      const endTime = performance.now();
+
+      let result = {};
+
+      try {
+        result = JSON.parse(rawText);
+      } catch (parseError) {
+        // Jika peladen menolak dengan error HTML (misal: Payload Too Large)
+        console.error("Server Response (Not JSON):", rawText);
+        throw new Error(`Server returned an error: ${response.status} ${response.statusText} ${parseError.message}`);
+      }
+
+      if (response.ok) {
+        const durationInSeconds = (endTime - startTime) / 1000;
+        const speedMBps = (50 / durationInSeconds).toFixed(2); // Megabytes per second
+        const speedMbps = (speedMBps * 8).toFixed(2);
+        setBenchmarkResult({
+          sent: "50 MB",
+          received: `${result.spoke_received_gb} GB`,
+          duration: `${durationInSeconds.toFixed(2)} s`,
+          speed: `${speedMBps} MB/s (${speedMbps} Mbps)`,
+          note: result.note
+        });
+
+        alert(` STRESS TEST SUCCESS!\n\nPayload Sent: 50 MB\nSpoke Received: ${result.spoke_received_gb} GB\n\nNote: ${result.note}`);
+      } else {
+        alert(`Test Failed: ${result.error || 'Unknown Error'}`);
+      }
+
+    } catch (err) {
+      console.error("Benchmark error:", err);
+      alert(`Benchmark interrupted: ${err.message}`);
+    }
+  };
 
   const triggerBitRotScan = async () => {
     try {
@@ -632,7 +691,7 @@ const handleUpload = async (event) => {
   if (isLoading) return <div className="loading">Initializing Secure Protocol...</div>;
 
   return (
-    
+
     <div className="App">
       {/* ========================================== */}
       {/* FLOATING UPLOAD PROGRESS BAR */}
@@ -655,11 +714,11 @@ const handleUpload = async (event) => {
             <span style={{ fontSize: '1.2rem', marginRight: '10px' }}>☁️</span>
             <h4 style={{ margin: '0', fontSize: '1rem', fontWeight: '600' }}>Encrypting & Uploading</h4>
           </div>
-          
+
           <p style={{ margin: '0 0 15px 0', fontSize: '0.85rem', color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={uploadProgress.filename}>
             {uploadProgress.filename}
           </p>
-          
+
           {/* Track (Latar Belakang Bar) */}
           <div style={{ width: '100%', background: '#374151', borderRadius: '8px', overflow: 'hidden', height: '12px' }}>
             {/* Fill (Animasi Bar yang berjalan) */}
@@ -670,7 +729,7 @@ const handleUpload = async (event) => {
               transition: 'width 0.3s ease-in-out, background-color 0.3s ease'
             }}></div>
           </div>
-          
+
           {/* Angka Statistik (MB dan Persentase) */}
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '10px', fontSize: '0.8rem', color: '#9ca3af', fontWeight: '500' }}>
             <span>{uploadProgress.percent}%</span>
@@ -764,11 +823,11 @@ const handleUpload = async (event) => {
                 </form>
               )}
 
-             {/* 🆕 PANEL MANAGE ACCESS MODERN */}
+              {/* 🆕 PANEL MANAGE ACCESS MODERN */}
               {manageAccessModal.open && (
                 <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(17, 24, 39, 0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
                   <div className="modal-content" style={{ background: '#ffffff', width: '500px', maxWidth: '90%', borderRadius: '12px', border: '1px solid #e5e7eb', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)', overflow: 'hidden' }}>
-                    
+
                     {/* Header */}
                     <div style={{ padding: '20px 25px', borderBottom: '1px solid #f3f4f6', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f9fafb' }}>
                       <h3 style={{ margin: 0, color: '#111827' }}>Manage Access: {manageAccessModal.bucket.name}</h3>
@@ -799,7 +858,7 @@ const handleUpload = async (event) => {
 
                       {/* Daftar Anggota */}
                       <h4 style={{ margin: '0 0 15px 0', color: '#6b7280', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>People with Access</h4>
-                      
+
                       {manageAccessModal.isLoading ? (
                         <p style={{ color: '#9ca3af', textAlign: 'center' }}>Loading members...</p>
                       ) : (
@@ -817,15 +876,15 @@ const handleUpload = async (event) => {
                                     <div style={{ color: '#6b7280', fontSize: '0.8rem' }}>{isOwner ? 'Workspace Owner' : 'Guest Member'}</div>
                                   </div>
                                 </div>
-                                
+
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                   {isOwner ? (
                                     <span style={{ color: '#9ca3af', fontSize: '0.85rem', paddingRight: '10px' }}>Owner</span>
                                   ) : (
                                     <>
-                                      <select 
-                                        value={member.permission} 
-                                        onChange={(e) => handleShareBucket(null, member.email, e.target.value)} 
+                                      <select
+                                        value={member.permission}
+                                        onChange={(e) => handleShareBucket(null, member.email, e.target.value)}
                                         style={{ padding: '6px', fontSize: '0.85rem', backgroundColor: 'transparent', border: '1px solid #d1d5db', cursor: 'pointer' }}
                                       >
                                         <option value="READ">Viewer</option>
@@ -892,16 +951,16 @@ const handleUpload = async (event) => {
                           <td style={{ padding: '12px', textAlign: 'right' }}>
                             <button onClick={() => openBucket(bucket)} style={{ background: '#3b82f6', color: '#fff', border: 'none' }}>Enter</button>
 
-                        {/* 🔒 RBAC LOBBY: HANYA ADMIN BUCKET YANG BISA MENGUBAH / MENGUNDANG */}
+                            {/* 🔒 RBAC LOBBY: HANYA ADMIN BUCKET YANG BISA MENGUBAH / MENGUNDANG */}
                             {isOwner && (
                               <>
                                 <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}>✎ Rename</button>
-                                
+
                                 {/* 🆕 TOMBOL SAKTI MANAGE ACCESS */}
                                 <button onClick={() => openManageAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#8b5cf6', color: 'white', border: 'none' }}>
                                   👥 Manage Access
                                 </button>
-                                
+
                                 <button
                                   onClick={() => setDialog({ open: true, type: 'DELETE_BUCKET', title: `Destroy Namespace '${bucket.name}'?`, message: 'WARNING: This action is irreversible. The namespace must be completely empty before it can be destroyed.', targetData: bucket })}
                                   style={{ marginLeft: '15px', backgroundColor: '#7f1d1d', color: 'white', padding: '6px 10px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontWeight: 'bold' }}
@@ -953,22 +1012,22 @@ const handleUpload = async (event) => {
                   );
                 })}
               </div>
-                <div style={{ textAlign: 'right', backgroundColor: '#f9fafb', padding: '8px 12px', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
-                  <div style={{ fontSize: '0.75rem', color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '2px' }}>
-                    Namespace Metadata
-                  </div>
-                  <div style={{ fontSize: '0.9rem', color: '#111827', display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'flex-end' }}>
-                    {/* Tampilkan Email Pemilik */}
-                    <span title="Bucket Owner">
-                      👤 {activeBucket.permission === 'ADMIN' ? 'You (Owner)' : activeBucket.owner_email || 'Unknown Owner'}
-                    </span>
-                    <span style={{ color: '#d1d5db' }}>|</span>
-                    {/* Tampilkan Izin Pengguna Saat Ini */}
-                    <span title="Your Access Level">
-                      🔑 Access: <strong style={{ color: activeBucket.permission === 'READ' ? '#166534' : '#92400e' }}>{activeBucket.permission}</strong>
-                    </span>
-                  </div>
+              <div style={{ textAlign: 'right', backgroundColor: '#f9fafb', padding: '8px 12px', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+                <div style={{ fontSize: '0.75rem', color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '2px' }}>
+                  Namespace Metadata
                 </div>
+                <div style={{ fontSize: '0.9rem', color: '#111827', display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'flex-end' }}>
+                  {/* Tampilkan Email Pemilik */}
+                  <span title="Bucket Owner">
+                    👤 {activeBucket.permission === 'ADMIN' ? 'You (Owner)' : activeBucket.owner_email || 'Unknown Owner'}
+                  </span>
+                  <span style={{ color: '#d1d5db' }}>|</span>
+                  {/* Tampilkan Izin Pengguna Saat Ini */}
+                  <span title="Your Access Level">
+                    🔑 Access: <strong style={{ color: activeBucket.permission === 'READ' ? '#166534' : '#92400e' }}>{activeBucket.permission}</strong>
+                  </span>
+                </div>
+              </div>
 
 
               <div className="toolbar" style={{ display: 'flex', gap: '10px', marginBottom: '20px', borderBottom: '1px solid #444', paddingBottom: '15px' }}>
@@ -1054,10 +1113,10 @@ const handleUpload = async (event) => {
           {/* INSPECTOR MODAL */}
           {inspectorModal.open && inspectorModal.file && (
             <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', padding: '40px', zIndex: 1000 }}>
-              <div className="modal-content" style={{display: 'flex', flexWrap: 'wrap', background: '#ffffff', width: '100%', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
+              <div className="modal-content" style={{ display: 'flex', flexWrap: 'wrap', background: '#ffffff', width: '100%', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
 
                 {/* PANEL KIRI (PRATILIK) */}
-                <div style={{flex: '2 1 300px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
+                <div style={{ flex: '2 1 300px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
                   {previewData.isLoading ? (
                     <div className="loading">Decrypting Stream...</div>
                   ) : previewData.url && isPreviewable(inspectorModal.file.mime_type) ? (
@@ -1158,8 +1217,12 @@ const handleUpload = async (event) => {
                     </div>
                     <div style={{ padding: '20px', background: '#2a2a2a', borderLeft: '4px solid #2196F3', borderRadius: '4px' }}>
                       <h3 style={{ marginTop: 0, color: '#fff' }}>System Stress & Security</h3>
-                      <button onClick={triggerBenchmark} style={{ marginBottom: '10px', width: '100%', backgroundColor: '#2196F3', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Run Network Benchmark</button>
-                      {benchmarkResult && <p style={{ fontSize: '0.85rem', color: '#fff', fontWeight: 'bold' }}>{benchmarkResult.message}: {benchmarkResult.spoke_received_gb}GB transferred.</p>}
+                      <button onClick={runNetworkBenchmark} style={{ marginBottom: '10px', width: '100%', backgroundColor: '#2196F3', color: 'white', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Run Network Benchmark</button>
+                      {benchmarkResult && (
+                        <div style={{ marginTop: '10px', padding: '10px', background: '#a4a4a4', borderRadius: '8px' }}>
+                          <p>Last Test - Sent: {benchmarkResult.sent} | Received: {benchmarkResult.received}| duration: {benchmarkResult.duration} | speed: {benchmarkResult.speed}</p>
+                        </div>
+                      )}
                       <button onClick={triggerBitRotScan} style={{ backgroundColor: '#ff9800', color: 'white', width: '100%', padding: '8px 16px', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
                         Run Bit-Rot Detection
                       </button> </div>
@@ -1208,22 +1271,22 @@ const handleUpload = async (event) => {
 
                   {globalFiles.length > 0 ? (
                     <div style={{ overflowX: 'auto', width: '100%' }}>
-                    <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
-                      <thead style={{ borderBottom: '2px solid #444', color: '#aaa' }}><tr><th style={{ padding: '12px' }}>Filename</th><th style={{ padding: '12px' }}>Bucket ID</th><th style={{ padding: '12px' }}>Size</th><th style={{ padding: '12px' }}>UUID</th><th style={{ padding: '12px', textAlign: 'right' }}>Admin Action</th></tr></thead>
-                      <tbody>
-                        {globalFiles.map((file) => (
-                          <tr key={file.uuid} style={{ borderBottom: '1px solid #333' }}>
-                            <td style={{ padding: '12px' }}><strong style={{ color: '#673ab7' }}>{file.filename}</strong></td>
-                            <td style={{ padding: '12px', color: '#aaa' }}>{file.bucket_id}</td>
-                            <td style={{ padding: '12px', color: '#aaa' }}>{formatBytes(file.size)}</td>
-                            <td style={{ padding: '12px', fontFamily: 'monospace', fontSize: '0.8rem', color: '#aaa' }}>{file.uuid.substring(0, 13)}...</td>
-                            <td style={{ padding: '12px', textAlign: 'right' }}>
-                              <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ backgroundColor: '#f44336', color: 'white', padding: '4px 8px', fontSize: '0.8rem', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Force Purge</button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                      <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
+                        <thead style={{ borderBottom: '2px solid #444', color: '#aaa' }}><tr><th style={{ padding: '12px' }}>Filename</th><th style={{ padding: '12px' }}>Bucket ID</th><th style={{ padding: '12px' }}>Size</th><th style={{ padding: '12px' }}>UUID</th><th style={{ padding: '12px', textAlign: 'right' }}>Admin Action</th></tr></thead>
+                        <tbody>
+                          {globalFiles.map((file) => (
+                            <tr key={file.uuid} style={{ borderBottom: '1px solid #333' }}>
+                              <td style={{ padding: '12px' }}><strong style={{ color: '#673ab7' }}>{file.filename}</strong></td>
+                              <td style={{ padding: '12px', color: '#aaa' }}>{file.bucket_id}</td>
+                              <td style={{ padding: '12px', color: '#aaa' }}>{formatBytes(file.size)}</td>
+                              <td style={{ padding: '12px', fontFamily: 'monospace', fontSize: '0.8rem', color: '#aaa' }}>{file.uuid.substring(0, 13)}...</td>
+                              <td style={{ padding: '12px', textAlign: 'right' }}>
+                                <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ backgroundColor: '#f44336', color: 'white', padding: '4px 8px', fontSize: '0.8rem', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Force Purge</button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
                   ) : <p style={{ color: '#aaa' }}>No files found in the global index.</p>}
                 </div>
@@ -1235,7 +1298,7 @@ const handleUpload = async (event) => {
           {dialog.open && (() => {
             // Evaluasi logika khusus untuk fitur "Type to Confirm"
             const isDeleteAction = dialog.type === 'DELETE_FILE' || dialog.type === 'DELETE_BUCKET';
-            
+
             // 🌟 UX FIX: Untuk BUCKET, wajib ketik namanya. Untuk FILE, cukup ketik "DELETE"
             let expectedConfirmation = '';
             if (dialog.type === 'DELETE_BUCKET') {
@@ -1246,7 +1309,7 @@ const handleUpload = async (event) => {
             // Mengubah input menjadi huruf besar semua agar pengguna tidak bingung soal kapitalisasi
             const currentInput = dialog.inputValue ? dialog.inputValue.toUpperCase() : '';
             const targetConfirm = expectedConfirmation ? expectedConfirmation.toUpperCase() : '';
-            
+
             const isConfirmDisabled = isDeleteAction && currentInput !== targetConfirm;
             return (
               <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
