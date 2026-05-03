@@ -198,7 +198,7 @@ apiRouter.use((req, res, next) => {
 });
 
 // --- PUBLIC ROUTE (No Bouncer Needed) ---
-apiRouter.get('/vault/view/:uuid', async (req, res) => {
+app.get('/api/v1/vault/view/:uuid', async (req, res) => {
     const { uuid } = req.params;
     const { expires, sig, permission } = req.query;
     try {
@@ -349,12 +349,13 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
             res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
             setImmediate(() => { req.destroy(); });
-        } catch (err) { 
+        } catch (err) {
             file.resume();
             if (err.name === 'AbortError') {
                 console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
             }
-             res.status(500).json({ error: "Gateway stream interrupted." }); }
+            res.status(500).json({ error: "Gateway stream interrupted." });
+        }
     });
     req.pipe(busboy);
 });
@@ -396,7 +397,10 @@ apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) =>
         if (!file) return res.status(404).json({ error: "File not found" });
         const expires = Math.floor(Date.now() / 1000) + (ttl * 60);
         const signature = crypto.createHmac('sha256', process.env.URL_SIGNING_SECRET).update(`${fileUuid}:${expires}:${permission}`).digest('hex');
-        res.json({ share_url: `${namespace}:${PUBLIC_PORT}/vault/view/${fileUuid}?expires=${expires}&sig=${signature}`, expires_at: new Date(expires * 1000).toISOString() });
+        res.json({
+            share_url: `https://richardgatewayta.duckdns.org:${PUBLIC_PORT}/api/v1/vault/view/${fileUuid}?expires=${expires}&permission=${permission}&sig=${signature}`,
+            expires_at: new Date(expires * 1000).toISOString()
+        });
     } catch (err) { res.status(500).json({ error: "Failed to generate share link" }); }
 });
 

@@ -267,7 +267,7 @@ function App() {
       }
       else if (type === 'GENERATE_LINK') {
         if (!inputValue) return;
-        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData}/links?ttl=${inputValue}&permission=downloadable`, {
+        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData}/links?ttl=${inputValue}&permission=${dialog.permission}`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (!res.ok) throw new Error("Failed to generate link.");
@@ -481,7 +481,7 @@ function App() {
   };
 
   const triggerDeleteFile = (uuid, filename) => setDialog({ open: true, type: 'DELETE_FILE', title: `Purge '${filename}'?`, message: 'WARNING: This triggers a physical wipe on the Spoke. Are you absolutely sure?', targetData: { uuid, filename } });
-  const triggerGenerateLink = (uuid) => setDialog({ open: true, type: 'GENERATE_LINK', title: 'Secure Expiration Link', message: 'Minutes until link expires:', inputValue: '60', targetData: uuid });
+  const triggerGenerateLink = (uuid) => setDialog({ open: true, type: 'GENERATE_LINK', title: 'Secure Expiration Link', message: 'Minutes until link expires:',targetData: uuid });
 
   // ==========================================
   // INSPECTOR & PREVIEW LOGIC
@@ -1348,8 +1348,35 @@ function App() {
                   </p>
 
                   <form onSubmit={executeDialogAction}>
+                    {dialog.type === 'GENERATE_LINK' && (
+                      <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+                        <input
+                          type="number"
+                          value={dialog.inputValue}
+                          onChange={(e) => setDialog({ ...dialog, inputValue: e.target.value })}
+                          placeholder="Minutes (e.g. 60)"
+                          style={{
+                            flex: 1, padding: '12px',
+                            background: '#111', color: '#fff', border: '1px solid #555',
+                            borderRadius: '4px', boxSizing: 'border-box'
+                          }}
+                        />
+                        <select
+                          value={dialog.permission}
+                          onChange={(e) => setDialog({ ...dialog, permission: e.target.value })}
+                          style={{
+                            flex: 1, padding: '12px',
+                            background: '#111', color: '#fff', border: '1px solid #555',
+                            borderRadius: '4px', boxSizing: 'border-box', cursor: 'pointer'
+                          }}
+                        >
+                          <option value="viewable">View Only (Inline)</option>
+                          <option value="downloadable">Downloadable</option>
+                        </select>
+                      </div>
+                    )}
                     {/* Tambahkan DELETE_FILE dan DELETE_BUCKET agar input text muncul */}
-                    {['RENAME_BUCKET', 'REVOKE_ACCESS', 'GENERATE_LINK', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
+                    {['RENAME_BUCKET', 'REVOKE_ACCESS', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
                       <input
                         type="text"
                         value={dialog.inputValue}
