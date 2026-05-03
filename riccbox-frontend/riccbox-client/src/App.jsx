@@ -600,62 +600,85 @@ function App() {
     try {
       const token = await getAccessTokenSilently();
 
-      console.log("Generating 50MB of dummy payload...");
-      const payloadSize = 50 * 1024 * 1024; // 50 MB
+      console.log("Generating 1GB of dummy payload...");
+      const payloadSize = 1 * 1024 * 1024 * 1024; // 1 GB
       const dummyPayload = new Uint8Array(payloadSize);
 
-     console.log("Transmitting payload through Jakarta Gateway to Surabaya Spoke...");
-      
-      // ⏱️ MULAI STOPWATCH
+      console.log("Transmitting payload through Jakarta Gateway to Surabaya Spoke...");
+
       const startTime = performance.now();
 
-      const response = await fetch(`https://richardgatewayta.duckdns.org:8080/api/v1/vault/admin/test/performance`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/octet-stream'
-        },
-        body: dummyPayload
-      });
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE}/api/v1/vault/admin/test/performance`, true);
 
-      const rawText = await response.text();
-      
-      // ⏱️ HENTIKAN STOPWATCH (Karena data sudah selesai dikirim dan server sudah membalas)
-      const endTime = performance.now();
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
-      let result = {};
+      xhr.upload.onprogress = (progressEvent) => {
+        if (progressEvent.lengthComputable) {
+          const percentComplete = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+          setUploadProgress({
+            filename: "BENCHMARK_1GB_STRESS_TEST.bin", // Nama samaran untuk UI
+            percent: percentComplete,
+            loaded: progressEvent.loaded,
+            total: progressEvent.total
+          });
+        }
+      };
 
-      try {
-        result = JSON.parse(rawText);
-      } catch (parseError) {
-        // Jika peladen menolak dengan error HTML (misal: Payload Too Large)
-        console.error("Server Response (Not JSON):", rawText);
-        throw new Error(`Server returned an error: ${response.status} ${response.statusText} ${parseError.message}`);
-      }
+      xhr.onload = () => {
+        const endTime = performance.now();
 
-      if (response.ok) {
-        const durationInSeconds = (endTime - startTime) / 1000;
-        const speedMBps = (50 / durationInSeconds).toFixed(2); // Megabytes per second
-        const speedMbps = (speedMBps * 8).toFixed(2);
-        setBenchmarkResult({
-          sent: "50 MB",
-          received: `${result.spoke_received_gb} GB`,
-          duration: `${durationInSeconds.toFixed(2)} s`,
-          speed: `${speedMBps} MB/s (${speedMbps} Mbps)`,
-          note: result.note
-        });
+        // Bersihkan progres bar setelah 1 detik
+        setTimeout(() => setUploadProgress(null), 1000);
 
-        alert(` STRESS TEST SUCCESS!\n\nPayload Sent: 50 MB\nSpoke Received: ${result.spoke_received_gb} GB\n\nNote: ${result.note}`);
-      } else {
-        alert(`Test Failed: ${result.error || 'Unknown Error'}`);
-      }
+        let result = {};
+        try {
+          result = JSON.parse(xhr.responseText);
+        } catch (parseError) {
+          console.error("Server Response (Not JSON):", xhr.responseText);
+          alert(`Server returned an error: ${xhr.status} ${xhr.statusText} ${parseError.message}`);
+          return;
+        }
+
+        if (xhr.status === 200 || xhr.status === 201) {
+          const durationInSeconds = (endTime - startTime) / 1000;
+          const speedMBps = (1024 / durationInSeconds).toFixed(2); // Megabytes per second
+          const speedMbps = (speedMBps * 8).toFixed(2);
+
+          setBenchmarkResult({
+            sent: "1 GB",
+            received: `${result.spoke_received_gb} GB`,
+            duration: `${durationInSeconds.toFixed(2)} s`,
+            speed: `${speedMBps} MB/s (${speedMbps} Mbps)`,
+            note: result.note
+          });
+
+          alert(` STRESS TEST SUCCESS!\n\nPayload Sent: 1 GB \nSpoke Received: ${result.spoke_received_gb} GB\n\nNote: ${result.note}`);
+        } else {
+          alert(`Test Failed: ${result.error || 'Unknown Error'}`);
+        }
+      };
+
+      xhr.onerror = () => {
+        console.error("XHR Error Triggered");
+        setUploadProgress(null); // Menghapus progres bar dari layar
+        alert("Koneksi terputus (Network Error / Timeout). Peladen tetap aman, silakan klik tombol lagi untuk Retry.");
+      };
+
+      xhr.onabort = () => {
+        console.warn("XHR Aborted");
+        setUploadProgress(null); // Menghapus progres bar dari layar
+      };
+
+      xhr.send(dummyPayload);
 
     } catch (err) {
       console.error("Benchmark error:", err);
       alert(`Benchmark interrupted: ${err.message}`);
+      setUploadProgress(null);
     }
   };
-
   const triggerBitRotScan = async () => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });

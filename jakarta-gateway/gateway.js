@@ -14,7 +14,16 @@ import rateLimit from 'express-rate-limit';
 import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket } from './middleware.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { Agent, setGlobalDispatcher } from 'undici';
 
+const THIRTY_MINUTES = 30 * 60 * 1000;
+const customAgent = new Agent({
+    connectTimeout: THIRTY_MINUTES,
+    headersTimeout: THIRTY_MINUTES,
+    bodyTimeout: THIRTY_MINUTES,
+    keepAliveTimeout: THIRTY_MINUTES
+});
+setGlobalDispatcher(customAgent);
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,6 +36,7 @@ const apiRouter = express.Router();
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
 const namespace = process.env.NAMESPACE || 'unknown_namespace';
+
 
 // ==========================================
 // 1. BASIC MIDDLEWARE & SECURITY
@@ -58,10 +68,26 @@ app.use(cors({
     credentials: true
 }));
 
-app.use(express.json({ limit: '50mb', strict: true }));
-app.use(express.raw({ type: 'application/octet-stream', limit: '50mb' })); 
 
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use((req, res, next) => {
+    // KECUALIKAN rute Upload DAN rute Benchmark agar req tetap berupa Stream murni!
+    if (req.method === 'POST' && (
+        req.path === '/api/v1/vault/files' || 
+        req.path === '/api/v1/vault/admin/test/performance'
+    )) {
+        return next();
+    }
+    
+    // Untuk rute lain, gunakan JSON parser dengan limit kecil
+    express.json({ limit: '5mb', strict: true })(req, res, (err) => {
+        if (err) return next(err);
+        express.urlencoded({ extended: true, limit: '50mb' })(req, res, next);
+    });
+});
+// app.use(express.json({ limit: '50mb', strict: true }));
+// app.use(express.raw({ type: 'application/octet-stream', limit: '50mb' })); 
+
+// app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -527,28 +553,76 @@ apiRouter.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) 
         res.json({ message: "Sync Complete", report });
     } catch (err) { res.status(500).json({ error: "Sync failed." }); }
 });
-
 apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
+    
+    // 1. BUAT "TOMBOL PANIK" (AbortController)
+    const controller = new AbortController();
+
+    req.on('error', (err) => {
+        console.warn(`[GATEWAY SAFE-CATCH] Stream Error: ${err.message}`);
+        controller.abort(); // 2. TEKAN TOMBOL PANIK UNTUK MEMUTUS FETCH KE SPOKE
+    });
+    
+    req.on('aborted', () => {
+        console.warn(`[GATEWAY SAFE-CATCH] Klien membatalkan unggahan secara sepihak.`);
+        controller.abort(); // 2. TEKAN TOMBOL PANIK UNTUK MEMUTUS FETCH KE SPOKE
+    });
+
     try {
-        // 🌟 PERBAIKAN: Gunakan req.body, dan kita tidak butuh duplex: 'half' lagi karena ini bukan stream
         const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { 
             method: 'POST', 
-            body: req.body 
+            body: req,
+            duplex: 'half',
+            signal: controller.signal, // 3. SAMBUNGKAN TOMBOL PANIK KE FETCH
+            headers: {
+                'Content-Type': req.headers['content-type'] || 'application/octet-stream'
+            }
         });
         
         const data = await spokeResponse.json();
         
-        // Perbaiki respons kembalian agar cocok dengan yang dibaca oleh React
         res.json({ 
             message: "Benchmark Complete", 
             spoke_received_gb: data.size_gb,
             note: data.note || "Stress test successful"
         });
+        req.destroy();
     } catch (err) { 
-        console.error("Benchmark route error:", err);
-        res.status(500).json({ error: err.message }); 
+        // 4. TANGANI GALAT JIKA ABORT DILAKUKAN
+        if (err.name === 'AbortError') {
+            console.warn("[GATEWAY] Fetch ke Spoke dibatalkan karena klien terputus.");
+        } else {
+            console.error("[GATEWAY] Benchmark route error:", err.message);
+        }
+
+        // Pastikan kita hanya membalas jika header belum terkirim
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Stream Interrupted: " + err.message }); 
+        }
     }
 });
+// apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
+//     try {
+//         const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { 
+//             method: 'POST', 
+//             body: req,            // <-- Alirkan request mentah langsung ke Surabaya
+//             duplex: 'half',       // <-- Syarat wajib Node.js fetch untuk aliran (Stream)
+//             headers: {
+//                 'Content-Type': req.headers['content-type'] || 'application/octet-stream'
+//             }
+//         });
+//         const data = await spokeResponse.json();
+        
+//         res.json({ 
+//             message: "Benchmark Complete", 
+//             spoke_received_gb: data.size_gb,
+//             note: data.note || "Stress test successful"
+//         });
+//     } catch (err) { 
+//         console.error("Benchmark route error:", err);
+//         res.status(500).json({ error: err.message }); 
+//     }
+// });
 apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, res) => {
     let corruptedFiles = 0;
     for (const item of req.body) {
@@ -620,9 +694,14 @@ const sslOptions = {
     cert: fs.readFileSync('/etc/letsencrypt/live/richardgatewayta.duckdns.org/fullchain.pem')
 };
 
-https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
+const server =https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
     console.log('--- Zero Trust Architecture Active ---');
     console.log(`Public Entry: https://richardgatewayta.duckdns.org:${PUBLIC_PORT}`);
     console.log(`Internal Destination: ${LOCAL_SPOKE_IP}:${LOCAL_PORT}`);
     console.log('--------------------------------------');
 });
+
+const FIFTEEN_MINUTES = 30 * 60 * 1000;
+server.setTimeout(FIFTEEN_MINUTES);
+server.keepAliveTimeout = FIFTEEN_MINUTES;
+server.headersTimeout = FIFTEEN_MINUTES + 1000; // Standar Node.js: headersTimeout wajib lebih besar dari keepAlive

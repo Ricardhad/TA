@@ -351,17 +351,81 @@ app.post('/internal/files/copy', async (req, res) => {
 // ==========================================
 // 4. ALAT PENGUJIAN STRESS
 // ==========================================
+// app.post('/internal/files/test/upload', (req, res) => {
+//     let bytesReceived = 0;
+//     req.on('data', (chunk) => bytesReceived += chunk.length);
+//     req.on('end', () => {
+//         console.log(`[STRESS TEST] Received and discarded: ${(bytesReceived / 1024 / 1024 / 1024).toFixed(2)} GB`);
+//         res.json({ status: "Discarded", size_gb: bytesReceived / 1024 / 1024 / 1024 });
+//     });
+//     req.on('error', (err) => res.status(500).send("Stream broken"));
+// });
+
+// app.post('/internal/files/test/upload', (req, res) => {
+//     let receivedBytes = 0;
+
+//     // EVENT 'data': Mengalirkan data sedikit demi sedikit (chunk)
+//     // Kita hitung ukurannya, lalu biarkan Node.js membuangnya dari RAM (Black Hole)
+//     req.on('data', (chunk) => {
+//         receivedBytes += chunk.length;
+//     });
+
+//     // EVENT 'end': Terpicu saat tetes terakhir dari fail 1 GB selesai diterima
+//     req.on('end', () => {
+//         const sizeGb = (receivedBytes / (1024 * 1024 * 1024)).toFixed(3); // Konversi ke GB
+//         console.log(`[BENCHMARK] Sukses menerima ${sizeGb} GB!`);
+        
+//         res.json({ 
+//             size_gb: sizeGb, 
+//             note: "Pure Stream Test Successful. Spoke RAM remained stable!" 
+//         });
+//     });
+
+//     // EVENT 'error': Jika VPN putus atau ada masalah di tengah jalan
+//     req.on('error', (err) => {
+//         console.error("[BENCHMARK] Aliran terputus:", err);
+//         if (!res.headersSent) {
+//             res.status(500).json({ error: "Stream interrupted at Spoke" });
+//         }
+//     });
+// });
 app.post('/internal/files/test/upload', (req, res) => {
-    let bytesReceived = 0;
-    req.on('data', (chunk) => bytesReceived += chunk.length);
-    req.on('end', () => {
-        console.log(`[STRESS TEST] Received and discarded: ${(bytesReceived / 1024 / 1024 / 1024).toFixed(2)} GB`);
-        res.json({ status: "Discarded", size_gb: bytesReceived / 1024 / 1024 / 1024 });
+    let receivedBytes = 0;
+
+    req.on('data', (chunk) => {
+        receivedBytes += chunk.length;
     });
-    req.on('error', (err) => res.status(500).send("Stream broken"));
+
+    req.on('end', () => {
+        const sizeGb = (receivedBytes / (1024 * 1024 * 1024)).toFixed(3);
+        console.log(`[BENCHMARK] Sukses menerima ${sizeGb} GB!`);
+        res.json({ size_gb: sizeGb, note: "Pure Stream Test Successful" });
+        req.destroy();
+    });
+
+    req.on('error', (err) => {
+        if (err.code === 'ECONNRESET' || err.message === 'aborted') {
+            console.warn("[BENCHMARK SAFE-CATCH] Pipa diputus secara sepihak oleh Gateway. (Status: Aman, RAM otomatis dibersihkan oleh Garbage Collector).");
+        } else {
+            // Jika putusnya karena hal aneh lainnya
+            console.error("[BENCHMARK ERROR] Aliran terputus karena galat:", err);
+        }
+
+        try {
+            if (!res.headersSent) {
+                res.status(500).json({ error: "Stream interrupted at Spoke" });
+            }
+        } catch (resErr) {
+            // Abaikan jika memang socketnya sudah benar-benar mati
+        }
+    });
 });
 
-app.listen(PORT, SPOKE_IP, () => {
+const server = app.listen(PORT, SPOKE_IP, () => {
     console.log(`Surabaya Spoke Active on port ${PORT} at IP ${SPOKE_IP}`);
 });
 
+const FIFTEEN_MINUTES = 30 * 60 * 1000;
+server.setTimeout(FIFTEEN_MINUTES);
+server.keepAliveTimeout = FIFTEEN_MINUTES;
+server.headersTimeout = FIFTEEN_MINUTES + 1000;
