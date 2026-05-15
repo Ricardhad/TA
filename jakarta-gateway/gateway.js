@@ -23,6 +23,36 @@ const customAgent = new Agent({
     bodyTimeout: THIRTY_MINUTES,
     keepAliveTimeout: THIRTY_MINUTES
 });
+const autoPurgeTrash = async () => {
+    console.log("Running scheduled maintenance: Checking for expired files in trash...");
+    try {
+        // 1. Cari berkas yang deleted_at sudah lebih dari 30 hari
+        const expiredFiles = db.prepare(`
+            SELECT f.id, f.uuid, v.physical_path 
+            FROM files f
+            JOIN versions v ON f.id = v.file_id
+            WHERE f.deleted_at <= datetime('now', '-30 days')
+        `).all();
+
+        for (const file of expiredFiles) {
+            // 2. Perintahkan Spoke Surabaya untuk hapus fisik
+            const spokeRes = await fetch(`${SPOKE_URL}/internal/files/${file.physical_path}`, {
+                method: 'DELETE',
+                headers: { 'x-m2m-token': M2M_TOKEN }
+            });
+
+            if (spokeRes.ok) {
+                // 3. Jika fisik sukses dihapus, hapus metadata secara permanen
+                db.prepare("DELETE FROM versions WHERE file_id = ?").run(file.id);
+                db.prepare("DELETE FROM files WHERE id = ?").run(file.id);
+                console.log(`Permanently purged expired file: ${file.uuid}`);
+            }
+        }
+    } catch (err) {
+        console.error("Auto-purge failed:", err);
+    }
+};
+
 setGlobalDispatcher(customAgent);
 dotenv.config();
 
@@ -180,8 +210,29 @@ async function checkSpokeHealth() {
     }
 }
 setInterval(checkSpokeHealth, 5 * 60 * 1000);
+setInterval(autoPurgeTrash, 86400000);
 
-app.get('/health', (req, res) => res.send("OK"));
+app.get('/health', async (req, res) => {
+    let spokeStatus = "offline";
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1500); // Timeout pendek
+
+        // const spokeRes = await fetch(`http://${LOCAL_SPOKE_IP}:${LOCAL_PORT}/internal/health`, { signal: controller.signal });
+        const spokeRes = await spokeFetch('/internal/health', { signal: controller.signal });
+        if (spokeRes.ok) spokeStatus = "online";
+    } catch (err) {
+        console.warn("[HEALTH CHECK] Spoke health check failed:", err.message);
+        spokeStatus = "offline";
+    }
+
+    res.json({
+        status: "ok",
+        gateway: "online",
+        spoke: spokeStatus, // Ini yang akan dibaca oleh dot di navbar
+        timestamp: new Date().toISOString()
+    });
+});
 
 // ==========================================
 // 3. API ROUTER DEFINITIONS (The "Kitchen")
@@ -404,38 +455,202 @@ apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) =>
     } catch (err) { res.status(500).json({ error: "Failed to generate share link" }); }
 });
 
+// 3. HARD DELETE (Purge Full File OR Specific Version)
+apiRouter.delete('/vault/files/:uuid/purge', authorizeVault('WRITE'), async (req, res) => {
+    const { uuid } = req.params;
+
+    // 🔴 FIX: Pastikan query parameter diubah menjadi Angka (Integer) agar SQLite tidak bingung
+    const requestedVersion = req.query.v ? parseInt(req.query.v, 10) : null;
+
+    console.log(`[PURGE REQUEST] UUID: ${uuid} | Target Version: ${requestedVersion || 'ALL'}`);
+
+    try {
+        if (!requestedVersion) {
+            // LOGIKA A: Hapus SELURUH file beserta semua versinya
+            const allVersions = db.prepare(`SELECT v.physical_path, f.id as file_id FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
+
+            if (allVersions.length === 0) {
+                console.error("[PURGE ERROR] File not found in database for deletion.");
+                return res.status(404).json({ error: "File not found for purging." });
+            }
+
+            for (const v of allVersions) {
+                await spokeFetch(`/internal/files/${v.physical_path}`, { method: 'DELETE' });
+            }
+            db.prepare('DELETE FROM files WHERE id = ?').run(allVersions[0].file_id);
+            return res.status(200).json({ status: "File completely purged from physical storage." });
+
+        } else {
+            // LOGIKA B: Hapus HANYA VERSI SPESIFIK
+
+            // --- KACAMATA X-RAY: Tampilkan semua versi yang ADA di DB untuk UUID ini ---
+            const availableVersions = db.prepare(`SELECT v.id, v.version_num FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
+            console.log(`[PURGE X-RAY] Available versions in DB for this UUID:`, availableVersions);
+            // ---------------------------------------------------------------------------
+
+            // Gunakan CAST ke TEXT untuk menghindari masalah beda tipe data (String vs Integer)
+            const fileInfo = db.prepare(`
+                SELECT v.id as v_id, v.physical_path 
+                FROM files f 
+                JOIN versions v ON f.id = v.file_id 
+                WHERE f.uuid = ? AND CAST(v.version_num AS TEXT) = ?
+            `).get(uuid, String(requestedVersion));
+
+            if (!fileInfo) {
+                console.error(`[PURGE ERROR] Version ${requestedVersion} not found for UUID ${uuid}.`);
+                return res.status(404).json({ error: `Version ${requestedVersion} not found.` });
+            }
+
+            const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, { method: 'DELETE' });
+            if (!spokeResponse.ok) throw new Error("Spoke refused to delete physically.");
+
+            db.prepare('DELETE FROM versions WHERE id = ?').run(fileInfo.v_id);
+            return res.status(200).json({ status: `Version ${requestedVersion} purged.` });
+        }
+    } catch (err) {
+        console.error("[PURGE FATAL ERROR]", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+// gateway.js - Soft Delete
+// apiRouter.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
+//     const { uuid } = req.params;
+//     try {
+//         const file = db.prepare('SELECT id FROM files WHERE uuid = ?').get(uuid);
+//         if (!file) return res.status(404).json({ error: "File not found." });
+
+//         // Ubah status: isi deleted_at dengan timestamp saat ini
+//         db.prepare("UPDATE files SET deleted_at = datetime('now') WHERE id = ?").run(file.id);
+
+//         res.status(200).json({ 
+//             status: "Success", 
+//             message: "File moved to trash bin." 
+//         });
+//     } catch (err) {
+//         res.status(500).json({ error: "Failed to move file to trash." });
+//     }
+// });
+apiRouter.put('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
+    const { uuid } = req.params;
+    const { newName } = req.body;
+
+    if (!newName) return res.status(400).json({ error: "New name is required." });
+
+    try {
+        db.prepare('UPDATE files SET filename = ? WHERE uuid = ?').run(newName, uuid);
+        res.json({ status: "Success", message: "File renamed." });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to rename file." });
+    }
+});
 apiRouter.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
+    const { uuid } = req.params;
+    try {
+        const file = db.prepare('SELECT id, created_at FROM files WHERE uuid = ?').get(uuid);
+        if (!file) return res.status(404).json({ error: "File not found." });
+
+        // 2. FIX ZONA WAKTU: Ubah format "2026-05-15 15:57:38" menjadi "2026-05-15T15:57:38Z"
+        let dbTime = file.created_at; // Ganti file.timestamp menjadi file.created_at jika itu nama kolommu
+        if (!dbTime.includes('Z')) {
+            dbTime = dbTime.replace(' ', 'T') + 'Z';
+        }
+
+        const MINIMUM_RETENTION_MINUTES = 5;
+        const createdAt = new Date(dbTime); // Sekarang Node.js tahu ini UTC
+        const now = new Date();
+
+        // Hitung selisih waktu dalam menit
+        const diffMinutes = Math.floor((now - createdAt) / (1000 * 60));
+
+        // Tambahkan console.log ini untuk memastikan perhitungan sudah benar
+        console.log(`[WORM DEBUG] Created: ${createdAt.toISOString()} | Now: ${now.toISOString()} | Age: ${diffMinutes} mins`);
+
+        if (diffMinutes < MINIMUM_RETENTION_MINUTES) {
+            return res.status(403).json({
+                error: "Object Locked",
+                message: `Data integrity policy: File must exist for at least ${MINIMUM_RETENTION_MINUTES} minutes before deletion. Please try again in ${MINIMUM_RETENTION_MINUTES - diffMinutes} minutes.`
+            });
+        }
+
+        console.log(`[OBJECT LOCK] File created at: ${createdAt.toISOString()}, now: ${now.toISOString()}, age: ${diffMinutes} minutes`);
+        // 3. Jika sudah melewati batas minimum, lanjutkan Soft Delete
+        db.prepare("UPDATE files SET deleted_at = datetime('now') WHERE id = ?").run(file.id);
+
+        res.status(200).json({ status: "Success", message: "File moved to trash bin." });
+    } catch (err) {
+        console.error("DELETE ERROR DETAIL:", err);
+        res.status(500).json({ error: "Failed to move file to trash.", details: err.message });
+    }
+});
+
+// gateway.js - List Trash
+apiRouter.get('/vault/trash', (req, res) => {
+    const userId = req.auth.payload.sub; // ID dari Auth0
+    try {
+        const trashFiles = db.prepare(`
+            SELECT f.uuid, f.filename, f.mime_type, v.size, f.deleted_at, b.name as bucket_name
+            FROM files f
+            JOIN versions v ON f.id = v.file_id
+            JOIN buckets b ON f.bucket_id = b.id
+            WHERE f.owner_id = ? AND f.deleted_at IS NOT NULL
+            AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
+            ORDER BY f.deleted_at DESC
+        `).all(userId);
+
+        res.json(trashFiles);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to fetch trash bin." });
+    }
+});
+// gateway.js - Empty Trash (Batch Purge)
+apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, res) => {
+    try {
+        const userId = req.auth.payload.sub;
+        const trashedFiles = db.prepare(`
+            SELECT f.id, v.physical_path 
+            FROM files f
+            JOIN versions v ON f.id = v.file_id
+            WHERE f.deleted_at IS NOT NULL AND f.owner_id = ?
+        `).all(userId);
+
+        if (trashedFiles.length === 0) return res.status(400).json({ error: "Trash bin is already empty." });
+
+        // Hapus fisik di Spoke
+        for (const file of trashedFiles) {
+            await spokeFetch(`/internal/files/${file.physical_path}`, { method: 'DELETE' });
+        }
+        
+        // Hapus dari database Gateway
+        const stmt = db.prepare('DELETE FROM files WHERE id = ?');
+        const deleteMany = db.transaction((files) => {
+            for (const file of files) stmt.run(file.id);
+        });
+        deleteMany(trashedFiles);
+
+        res.json({ status: "Success", message: `Successfully purged ${trashedFiles.length} files.` });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to empty trash bin." });
+    }
+});
+apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     const requestedVersion = req.query.v;
     try {
         if (!requestedVersion) {
-            const allVersions = db.prepare(`SELECT v.physical_path, f.id as file_id FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
-            if (allVersions.length === 0) return res.status(404).json({ error: "File not found." });
-            for (const v of allVersions) { await spokeFetch(`/internal/files/${v.physical_path}`, { method: 'DELETE' }); }
-            db.prepare('DELETE FROM files WHERE id = ?').run(allVersions[0].file_id);
-            return res.status(200).json({ status: "File completely purged." });
+            const result = db.prepare("UPDATE files SET deleted_at = NULL WHERE uuid = ?").run(uuid);
+            if (result.changes === 0) return res.status(404).json({ error: "File not found in trash." });
+            res.status(200).json({ status: "Success", message: "File restored successfully." });
         } else {
-            const fileInfo = db.prepare(`SELECT f.filename, v.id as v_id, v.physical_path FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? AND v.version_num = ?`).get(uuid, requestedVersion);
-            if (!fileInfo) return res.status(404).json({ error: "Version not found." });
-            const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, { method: 'DELETE' });
-            if (!spokeResponse.ok) throw new Error("Spoke refused to delete.");
-            db.prepare('DELETE FROM versions WHERE id = ?').run(fileInfo.v_id);
-            return res.status(200).json({ status: `Version purged.` });
+            const fileMeta = db.prepare(`SELECT f.id, f.filename, v.physical_path FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? AND v.version_num = ?`).get(req.params.uuid, req.query.v);
+            if (!fileMeta) return res.status(404).json({ error: "Version not found." });
+            const spokeResponse = await spokeFetch(`/internal/files/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: fileMeta.physical_path }) });
+            if (!spokeResponse.ok) throw new Error("Copy failed.");
+            const { new_physical_path, size, checksum } = await spokeResponse.json();
+            const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileMeta.id);
+            const newVersionNum = (lastVersion.v || 0) + 1;
+            db.prepare(`INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))`).run(fileMeta.id, newVersionNum, new_physical_path, size, checksum);
+            res.json({ status: "Restored", new_version: newVersionNum });
         }
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req, res) => {
-    try {
-        const fileMeta = db.prepare(`SELECT f.id, f.filename, v.physical_path FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? AND v.version_num = ?`).get(req.params.uuid, req.query.v);
-        if (!fileMeta) return res.status(404).json({ error: "Version not found." });
-        const spokeResponse = await spokeFetch(`/internal/files/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: fileMeta.physical_path }) });
-        if (!spokeResponse.ok) throw new Error("Copy failed.");
-        const { new_physical_path, size, checksum } = await spokeResponse.json();
-        const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileMeta.id);
-        const newVersionNum = (lastVersion.v || 0) + 1;
-        db.prepare(`INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))`).run(fileMeta.id, newVersionNum, new_physical_path, size, checksum);
-        res.json({ status: "Restored", new_version: newVersionNum });
     } catch (err) { res.status(500).json({ error: "Restore failed." }); }
 });
 
@@ -497,16 +712,38 @@ apiRouter.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res)
     } catch (err) { res.status(500).json({ error: "Failed to update bucket." }); }
 });
 
-apiRouter.delete('/vault/buckets/:bucketUuid', permitGlobalRole('standard_user'), (req, res) => {
+// apiRouter.delete('/vault/buckets/:bucketUuid', permitGlobalRole('standard_user'), (req, res) => {
+//     try {
+//         const bucket = db.prepare('SELECT id, name, owner_id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
+//         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
+//         if (bucket.owner_id !== req.auth.payload.sub && req.globalRole !== 'admin') return res.status(403).json({ error: "Access Denied." });
+//         const fileCount = db.prepare('SELECT COUNT(*) as count FROM files WHERE bucket_id = ?').get(bucket.id);
+//         if (fileCount.count > 0) return res.status(409).json({ error: "Bucket is not empty." });
+//         db.prepare('DELETE FROM buckets WHERE id = ?').run(bucket.id);
+//         res.json({ status: "Bucket Deleted" });
+//     } catch (err) { res.status(500).json({ error: "Failed to delete bucket." }); }
+// });
+// gateway.js - Hard Delete Bucket
+apiRouter.delete('/vault/buckets/:uuid', authorizeBucket('ADMIN'), async (req, res) => {
+    const { uuid } = req.params;
     try {
-        const bucket = db.prepare('SELECT id, name, owner_id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
-        if (!bucket) return res.status(404).json({ error: "Bucket not found." });
-        if (bucket.owner_id !== req.auth.payload.sub && req.globalRole !== 'admin') return res.status(403).json({ error: "Access Denied." });
+        const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(uuid);
+
+        // Cek apakah ada file (termasuk yang di soft delete)
         const fileCount = db.prepare('SELECT COUNT(*) as count FROM files WHERE bucket_id = ?').get(bucket.id);
-        if (fileCount.count > 0) return res.status(409).json({ error: "Bucket is not empty." });
+
+        if (fileCount.count > 0) {
+            return res.status(409).json({
+                error: "Bucket not empty",
+                message: "Please purge all files in trash bin before deleting the bucket."
+            });
+        }
+
         db.prepare('DELETE FROM buckets WHERE id = ?').run(bucket.id);
-        res.json({ status: "Bucket Deleted" });
-    } catch (err) { res.status(500).json({ error: "Failed to delete bucket." }); }
+        res.json({ status: "Bucket deleted permanently." });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to delete bucket." });
+    }
 });
 
 apiRouter.get('/vault/users/search', permitGlobalRole('standard_user'), (req, res) => {

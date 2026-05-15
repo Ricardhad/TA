@@ -23,6 +23,7 @@ function App() {
   // --- Notifications State ---
   const [notifications, setNotifications] = useState([]);
   const [showNotifications, setShowNotifications] = useState(false);
+  const [isSpokeOnline, setIsSpokeOnline] = useState(false);
 
   // --- Data State ---
   const [buckets, setBuckets] = useState([]);
@@ -30,6 +31,10 @@ function App() {
   const [activeBucket, setActiveBucket] = useState(null);
   const [currentPrefix, setCurrentPrefix] = useState(''); // State untuk Virtual Folder
   const [uploadProgress, setUploadProgress] = useState(null);
+  // Cari baris uploadProgress dan ganti/tambah ini:
+  const [uploads, setUploads] = useState({}); // { fileName: progress }
+  // Di dalam function App()
+  const [trashFiles, setTrashFiles] = useState([]);
   // --- Admin State ---
   const [adminTab, setAdminTab] = useState('telemetry');
   const [adminSyncReport, setAdminSyncReport] = useState(null);
@@ -71,6 +76,38 @@ function App() {
         setManageAccessModal({ open: true, bucket, members, isLoading: false });
       }
     } catch (err) { console.error(err); }
+  };
+  const fetchTrash = async () => {
+    setIsFetching(true);
+    try {
+      const token = await getAccessTokenSilently();
+      const response = await fetch(`${API_BASE}/api/v1/vault/trash`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await response.json();
+      setTrashFiles(data);
+      setActiveView('trash'); // Pindah ke view sampah
+    } catch (err) {
+      console.error("Failed to fetch trash:", err);
+    } finally {
+      setIsFetching(false);
+    }
+
+  };
+
+  const handleRestoreFile = async (uuid) => {
+    try {
+      const token = await getAccessTokenSilently();
+      await fetch(`${API_BASE}/api/v1/vault/files/${uuid}/restore`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      // Refresh data setelah restore
+      fetchTrash();
+      if (activeBucket) fetchFiles(activeBucket.uuid);
+    } catch (err) {
+      alert("Gagal memulihkan berkas", err.message);
+    }
   };
 
   // Undang / Ubah Akses Anggota
@@ -153,13 +190,32 @@ function App() {
   }, [files, currentPrefix]);
 
   useEffect(() => {
+
     if (isAuthenticated) {
       checkIdentity();
       fetchBuckets();
       fetchUsage();
       fetchNotifications();
     }
+    const checkHealth = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/health`);
+        const data = await res.json();
+        setIsSpokeOnline(data.spoke === 'online');
+        console.log("Health Check:", data);
+      } catch {
+        setIsSpokeOnline(false);
+      }
+    };
+
+    checkHealth(); // Cek saat pertama kali load
+    const interval = setInterval(checkHealth, 30000); // Cek setiap 30 detik
+    return () => clearInterval(interval);
   }, [isAuthenticated]);
+
+  //   useEffect(() => {
+
+  // }, []);
 
   // ==========================================
   // IDENTITY, QUOTA & NOTIFICATIONS
@@ -235,16 +291,63 @@ function App() {
         closeDialog();
         setDialog({ open: true, type: 'ALERT', title: 'Success', message: 'Access revoked successfully.' });
       }
+      // Di dalam executeDialogAction
       else if (type === 'DELETE_FILE') {
+        // Sekarang ini adalah SOFT DELETE (Pindah ke Trash)
         const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData.uuid}`, {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` }
         });
-        if (!res.ok) throw new Error("Deletion failed.");
+        console.log("Delete Response:", res);
+        if (!res.ok) throw new Error("Failed to move to trash.");
 
-        if (activeView === 'admin') fetchGlobalFiles(globalSearch);
-        else fetchFiles(activeBucket.uuid);
+        fetchFiles(activeBucket.uuid);
+        fetchUsage();
+        closeDialog();
+      }
+      else if (type === 'DELETE_VERSION') {
+        const { fileUuid, versionNum } = targetData;
+        const res = await fetch(`${API_BASE}/api/v1/vault/files/${fileUuid}/purge?v=${versionNum}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
+        });
 
+        if (!res.ok) throw new Error("Failed to delete specific version.");
+
+        // Ambil daftar versi terbaru dari backend
+        const updatedVersions = await fetch(`${API_BASE}/api/v1/vault/files/${fileUuid}/versions`, {
+          headers: { Authorization: `Bearer ${token}` }
+        }).then(r => r.json());
+
+        setFileVersions(updatedVersions); // Perbarui panel kanan Inspector
+        fetchUsage();                     // Segarkan kuota storage
+        closeDialog();                    // Tutup kotak peringatan "Permanent Deletion"
+      }
+      else if (type === 'PURGE_FILE') {
+        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData.uuid}/purge`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error("Permanent deletion failed.");
+
+        // FIX: Cek sedang di halaman mana agar tabel yang di-refresh benar
+        if (activeView === 'trash') {
+          fetchTrash();
+        } else if (activeView === 'admin') {
+          fetchGlobalFiles(globalSearch);
+        }
+
+        fetchUsage();
+        closeDialog();
+      }
+      else if (type === 'EMPTY_TRASH') {
+        const res = await fetch(`${API_BASE}/api/v1/vault/trash`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error("Failed to empty trash.");
+
+        fetchTrash();
         fetchUsage();
         closeDialog();
       }
@@ -252,7 +355,10 @@ function App() {
         // Panggil endpoint DELETE Gateway
         const res = await fetch(`${API_BASE}/api/v1/vault/buckets/${targetData.uuid}`, {
           method: 'DELETE',
-          headers: { Authorization: `Bearer ${token}` }
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'x-bucket-uuid': targetData.uuid // 🔴 TAMBAHKAN HEADER INI
+          }
         });
 
         const data = await res.json();
@@ -264,6 +370,28 @@ function App() {
         fetchBuckets();
         closeDialog();
         setDialog({ open: true, type: 'ALERT', title: 'Namespace Destroyed', message: data.message });
+      }
+      else if (type === 'RENAME_FILE') {
+        if (!inputValue || inputValue === targetData.filename) return closeDialog(); // Abaikan jika nama kosong atau tidak berubah
+
+        // Jika ada prefix (folder virtual), gabungkan prefix dengan nama baru
+        // Jika tidak, gunakan nama baru langsung
+        const finalName = currentPrefix + inputValue;
+
+        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData.uuid}`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'x-bucket-uuid': activeBucket.uuid
+          },
+          body: JSON.stringify({ newName: finalName })
+        });
+
+        if (!res.ok) throw new Error("Rename failed.");
+
+        fetchFiles(activeBucket.uuid);
+        closeDialog();
       }
       else if (type === 'GENERATE_LINK') {
         if (!inputValue) return;
@@ -358,7 +486,15 @@ function App() {
 
 
   const triggerRenameBucket = (bucket) => setDialog({ open: true, type: 'RENAME_BUCKET', title: `Rename '${bucket.name}'`, message: 'Enter new bucket name:', inputValue: '', targetData: bucket });
-
+  // Letakkan di bawah triggerDeleteFile
+  const triggerRenameFile = (file) => setDialog({
+    open: true,
+    type: 'RENAME_FILE',
+    title: 'Rename Object',
+    message: 'Enter new filename:',
+    inputValue: file.filename, // Isi otomatis dengan nama saat ini
+    targetData: file
+  });
   // ==========================================
   // FILES (VAULT)
   // ==========================================
@@ -383,78 +519,145 @@ function App() {
     } catch (err) { console.error(err); } finally { setIsFetching(false); }
   };
 
-  const handleUpload = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
+  // const handleUpload = async (event) => {
+  //   const file = event.target.files[0];
+  //   if (!file) return;
+
+  //   try {
+  //     const token = await getAccessTokenSilently();
+  //     const formData = new FormData();
+  //     formData.append('file', file); // Nama field 'file' harus cocok dengan yang ditangkap Busboy di Gateway
+
+  //     const xhr = new XMLHttpRequest();
+
+  //     // 1. Tentukan rute tujuan API Anda
+  //     // Pastikan API_URL Anda sesuai, misalnya: "https://richardgatewayta.duckdns.org:8080"
+  //     const uploadUrl = `/api/v1/vault/files`;
+  //     xhr.open('POST', uploadUrl, true);
+
+  //     // 2. Pasang semua Header Keamanan (Sangat Penting untuk Zero Trust!)
+  //     xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+  //     xhr.setRequestHeader('x-bucket-uuid', activeBucket.uuid);
+  //     if (currentPrefix) {
+  //       xhr.setRequestHeader('x-file-prefix', currentPrefix);
+  //     }
+
+  //     // 3. PANTAU KEMAJUAN DI SINI!
+  //     xhr.upload.onprogress = (progressEvent) => {
+  //       if (progressEvent.lengthComputable) {
+  //         const percentComplete = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+  //         // Perbarui state yang sudah kita siapkan sebelumnya
+  //         setUploadProgress({
+  //           filename: file.name,
+  //           percent: percentComplete,
+  //           loaded: progressEvent.loaded,
+  //           total: progressEvent.total
+  //         });
+  //       }
+  //     };
+
+  //     // 4. Tangani saat unggahan selesai
+  //     xhr.onload = () => {
+  //       if (xhr.status === 200 || xhr.status === 201) {
+  //         console.log("Upload Success!");
+  //         fetchFiles(activeBucket.uuid); // Segarkan tabel fail
+  //         fetchUsage(); // Segarkan kuota
+  //       } else {
+  //         try {
+  //           const errResponse = JSON.parse(xhr.responseText);
+  //           alert(`Upload Failed: ${errResponse.error || errResponse.message}`);
+  //         } catch (e) {
+  //           alert(`Upload Failed: Server Error (${xhr.status},${e})`);
+  //         }
+  //       }
+  //       // Bersihkan state progress dan reset input file
+  //       setTimeout(() => setUploadProgress(null), 1000); // Jeda 1 detik agar animasi 100% terlihat
+  //       if (fileInputRef.current) fileInputRef.current.value = '';
+  //     };
+
+  //     // 5. Tangani jika koneksi internet terputus
+  //     xhr.onerror = () => {
+  //       alert("Network Error: Could not reach the Gateway.");
+  //       setUploadProgress(null);
+  //       if (fileInputRef.current) fileInputRef.current.value = '';
+  //     };
+
+  //     // 6. Eksekusi pengiriman data!
+  //     xhr.send(formData);
+
+  //   } catch (err) {
+  //     console.error("Upload preparation failed:", err);
+  //     alert("Failed to start upload. Please try again.");
+  //   }
+  // };
+  const handleUpload = async (filesToUpload) => {
+    const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+
+    // Proses semua fail secara paralel
+    const uploadPromises = Array.from(filesToUpload).map(async (file) => {
+      const formData = new FormData();
+      formData.append('file', file); // Hanya file yang masuk ke body/Busboy
+
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${API_BASE}/api/v1/vault/files`);
+
+        // --- HEADER KEAMANAN DAN METADATA (YANG SEBELUMNYA HILANG) ---
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.setRequestHeader('x-bucket-uuid', activeBucket.uuid);
+        if (currentPrefix) {
+          xhr.setRequestHeader('x-file-prefix', currentPrefix);
+        }
+
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const percent = Math.round((event.loaded / event.total) * 100);
+            // Update progress spesifik fail ini
+            setUploads(prev => ({ ...prev, [file.name]: percent }));
+          }
+        };
+
+        xhr.onload = () => {
+          if (xhr.status === 200 || xhr.status === 201) {
+            // Hapus dari daftar progress UI dengan jeda kecil agar user lihat angka 100%
+            setTimeout(() => {
+              setUploads(prev => {
+                const next = { ...prev };
+                delete next[file.name];
+                return next;
+              });
+            }, 500);
+            resolve();
+          } else {
+            // Tangkap pesan error dari backend dengan lebih rapi
+            try {
+              const errResponse = JSON.parse(xhr.responseText);
+              reject(new Error(errResponse.error || errResponse.message || "Upload Failed"));
+            } catch (e) {
+              reject(new Error(`Server Error (${xhr.status} ${e})`));
+            }
+          }
+        };
+
+        xhr.onerror = () => reject(new Error("Network Error: Could not reach the Gateway."));
+        xhr.send(formData);
+      });
+    });
 
     try {
-      const token = await getAccessTokenSilently();
-      const formData = new FormData();
-      formData.append('file', file); // Nama field 'file' harus cocok dengan yang ditangkap Busboy di Gateway
-
-      const xhr = new XMLHttpRequest();
-
-      // 1. Tentukan rute tujuan API Anda
-      // Pastikan API_URL Anda sesuai, misalnya: "https://richardgatewayta.duckdns.org:8080"
-      const uploadUrl = `/api/v1/vault/files`;
-      xhr.open('POST', uploadUrl, true);
-
-      // 2. Pasang semua Header Keamanan (Sangat Penting untuk Zero Trust!)
-      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-      xhr.setRequestHeader('x-bucket-uuid', activeBucket.uuid);
-      if (currentPrefix) {
-        xhr.setRequestHeader('x-file-prefix', currentPrefix);
-      }
-
-      // 3. PANTAU KEMAJUAN DI SINI!
-      xhr.upload.onprogress = (progressEvent) => {
-        if (progressEvent.lengthComputable) {
-          const percentComplete = Math.round((progressEvent.loaded / progressEvent.total) * 100);
-          // Perbarui state yang sudah kita siapkan sebelumnya
-          setUploadProgress({
-            filename: file.name,
-            percent: percentComplete,
-            loaded: progressEvent.loaded,
-            total: progressEvent.total
-          });
-        }
-      };
-
-      // 4. Tangani saat unggahan selesai
-      xhr.onload = () => {
-        if (xhr.status === 200 || xhr.status === 201) {
-          console.log("Upload Success!");
-          fetchFiles(activeBucket.uuid); // Segarkan tabel fail
-          fetchUsage(); // Segarkan kuota
-        } else {
-          try {
-            const errResponse = JSON.parse(xhr.responseText);
-            alert(`Upload Failed: ${errResponse.error || errResponse.message}`);
-          } catch (e) {
-            alert(`Upload Failed: Server Error (${xhr.status},${e})`);
-          }
-        }
-        // Bersihkan state progress dan reset input file
-        setTimeout(() => setUploadProgress(null), 1000); // Jeda 1 detik agar animasi 100% terlihat
-        if (fileInputRef.current) fileInputRef.current.value = '';
-      };
-
-      // 5. Tangani jika koneksi internet terputus
-      xhr.onerror = () => {
-        alert("Network Error: Could not reach the Gateway.");
-        setUploadProgress(null);
-        if (fileInputRef.current) fileInputRef.current.value = '';
-      };
-
-      // 6. Eksekusi pengiriman data!
-      xhr.send(formData);
-
+      // Tunggu semua proses upload paralel selesai
+      await Promise.all(uploadPromises);
+      fetchFiles(activeBucket.uuid);
+      fetchUsage();
     } catch (err) {
-      console.error("Upload preparation failed:", err);
-      alert("Failed to start upload. Please try again.");
+      setDialog({ open: true, type: 'ALERT', title: 'Upload Failed', message: err.message });
+      // Hapus progress dari layar jika error
+      setUploads({});
     }
-  };
 
+    // Bersihkan input file agar file yang sama bisa diupload ulang jika perlu
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
   const downloadFile = async (uuid, fileName, versionNum = null) => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
@@ -479,9 +682,26 @@ function App() {
       setTimeout(() => window.URL.revokeObjectURL(objUrl), 1000);
     } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Download Error', message: err.message }); }
   };
+  const triggerDeleteFile = (uuid, filename) =>
+    setDialog({
+      open: true,
+      type: 'DELETE_FILE',
+      title: `Move to Trash?`,
+      message: `File '${filename}' will be moved to the Trash Bin and kept for 30 days.`,
+      targetData: { uuid, filename }
+    });
 
-  const triggerDeleteFile = (uuid, filename) => setDialog({ open: true, type: 'DELETE_FILE', title: `Purge '${filename}'?`, message: 'WARNING: This triggers a physical wipe on the Spoke. Are you absolutely sure?', targetData: { uuid, filename } });
-  const triggerGenerateLink = (uuid) => setDialog({ open: true, type: 'GENERATE_LINK', title: 'Secure Expiration Link', message: 'Minutes until link expires:',targetData: uuid });
+  // Tambahkan trigger baru untuk Purge (di dalam view Trash)
+  const triggerPurgeFile = (file) =>
+    setDialog({
+      open: true,
+      type: 'PURGE_FILE',
+      title: `Purge Permanently?`,
+      message: `WARNING: This will physically destroy '${file.filename}'. This action cannot be undone.`,
+      targetData: file
+    });
+
+  const triggerGenerateLink = (uuid) => setDialog({ open: true, type: 'GENERATE_LINK', title: 'Secure Expiration Link', message: 'Minutes until link expires:', targetData: uuid });
 
   // ==========================================
   // INSPECTOR & PREVIEW LOGIC
@@ -536,6 +756,15 @@ function App() {
     } catch (err) {
       setDialog({ open: true, type: 'ALERT', title: 'Restore Error', message: err.message });
     }
+  };
+  const triggerDeleteVersion = (fileUuid, versionNum) => {
+    setDialog({
+      open: true,
+      type: 'DELETE_VERSION',
+      title: 'Permanent Deletion',
+      message: `WARNING: Physical data for version ${versionNum} will be permanently purged. Proceed?`,
+      targetData: { fileUuid, versionNum }
+    });
   };
 
   // ==========================================
@@ -719,47 +948,46 @@ function App() {
       {/* ========================================== */}
       {/* FLOATING UPLOAD PROGRESS BAR */}
       {/* ========================================== */}
-      {uploadProgress && (
-        <div style={{
-          position: 'fixed',
-          bottom: '25px',
-          right: '25px',
-          background: '#1f2937', // Warna gelap modern
-          color: 'white',
-          padding: '20px',
-          borderRadius: '12px',
-          boxShadow: '0 10px 25px rgba(0,0,0,0.5)',
-          width: '320px',
-          zIndex: 9999, // Pastikan selalu di paling depan
-          border: '1px solid #374151'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '10px' }}>
-            <span style={{ fontSize: '1.2rem', marginRight: '10px' }}>☁️</span>
-            <h4 style={{ margin: '0', fontSize: '1rem', fontWeight: '600' }}>Encrypting & Uploading</h4>
-          </div>
+      {(uploadProgress || Object.keys(uploads).length > 0) && (
+        <div style={{ position: 'fixed', bottom: '25px', right: '25px', background: '#1f2937', color: 'white', padding: '20px', borderRadius: '12px', boxShadow: '0 10px 25px rgba(0,0,0,0.5)', width: '320px', zIndex: 9999, border: '1px solid #374151' }}>
 
-          <p style={{ margin: '0 0 15px 0', fontSize: '0.85rem', color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={uploadProgress.filename}>
-            {uploadProgress.filename}
-          </p>
+          {/* 1. TAMPILAN UNTUK MULTI-UPLOAD (File Biasa) */}
+          {Object.keys(uploads).length > 0 && (
+            <div className="upload-stack-manager">
+              <h4 style={{ margin: '0 0 10px 0', color: 'white' }}>Uploading {Object.keys(uploads).length} files...</h4>
+              {Object.entries(uploads).map(([name, progress]) => (
+                <div key={name} className="upload-item" style={{ marginBottom: '10px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '4px' }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '220px' }}>{name}</span>
+                    <span>{progress}%</span>
+                  </div>
+                  <div style={{ width: '100%', background: '#374151', borderRadius: '4px', height: '6px', overflow: 'hidden' }}>
+                    <div style={{ width: `${progress}%`, background: progress === 100 ? '#10b981' : '#3b82f6', height: '100%', transition: 'width 0.3s' }}></div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
-          {/* Track (Latar Belakang Bar) */}
-          <div style={{ width: '100%', background: '#374151', borderRadius: '8px', overflow: 'hidden', height: '12px' }}>
-            {/* Fill (Animasi Bar yang berjalan) */}
-            <div style={{
-              width: `${uploadProgress.percent}%`,
-              background: uploadProgress.percent === 100 ? '#10b981' : '#3b82f6', // Berubah hijau saat 100%
-              height: '100%',
-              transition: 'width 0.3s ease-in-out, background-color 0.3s ease'
-            }}></div>
-          </div>
-
-          {/* Angka Statistik (MB dan Persentase) */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '10px', fontSize: '0.8rem', color: '#9ca3af', fontWeight: '500' }}>
-            <span>{uploadProgress.percent}%</span>
-            <span>
-              {(uploadProgress.loaded / 1024 / 1024).toFixed(2)} MB / {(uploadProgress.total / 1024 / 1024).toFixed(2)} MB
-            </span>
-          </div>
+          {/* 2. TAMPILAN UNTUK SINGLE UPLOAD / BENCHMARK */}
+          {uploadProgress && (
+            <div style={{ marginTop: Object.keys(uploads).length > 0 ? '15px' : '0', paddingTop: Object.keys(uploads).length > 0 ? '15px' : '0', borderTop: Object.keys(uploads).length > 0 ? '1px solid #444' : 'none' }}>
+              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '10px' }}>
+                <span style={{ fontSize: '1.2rem', marginRight: '10px' }}>⚙️</span>
+                <h4 style={{ margin: '0', fontSize: '1rem', fontWeight: '600', color: 'white' }}>System Process</h4>
+              </div>
+              <p style={{ margin: '0 0 10px 0', fontSize: '0.85rem', color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={uploadProgress.filename}>
+                {uploadProgress.filename}
+              </p>
+              <div style={{ width: '100%', background: '#374151', borderRadius: '8px', overflow: 'hidden', height: '12px' }}>
+                <div style={{ width: `${uploadProgress.percent}%`, background: uploadProgress.percent === 100 ? '#10b981' : '#8b5cf6', height: '100%', transition: 'width 0.3s' }}></div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '10px', fontSize: '0.8rem', color: '#9ca3af' }}>
+                <span>{uploadProgress.percent}%</span>
+                <span>{(uploadProgress.loaded / 1024 / 1024).toFixed(2)} MB / {(uploadProgress.total / 1024 / 1024).toFixed(2)} MB</span>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -804,7 +1032,9 @@ function App() {
                   )}
                 </div>
               </div>
-
+              <span style={{ fontWeight: 'bold', color: isSpokeOnline ? 'green' : 'red', position: 'absolute', top: '10px', right: '10px' }}>
+                {isSpokeOnline ? '✅ Spoke is Online' : '❌ Spoke is Offline'}
+              </span>
               <button onClick={logout} style={{ background: 'transparent', border: '1px solid #888' }}>End Session</button>
             </div>
 
@@ -1064,8 +1294,17 @@ function App() {
                       style={{ backgroundColor: '#2196F3', color: 'white', fontWeight: 'bold', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
                       + New Folder
                     </button>
-
-                    <input type="file" ref={fileInputRef} style={{ display: 'none' }} onChange={handleUpload} />
+                    <input
+                      type="file"
+                      multiple
+                      ref={fileInputRef}
+                      style={{ display: 'none' }}
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files.length > 0) {
+                          handleUpload(e.target.files);
+                        }
+                      }}
+                    />
                     <button onClick={() => fileInputRef.current.click()} style={{ backgroundColor: '#4CAF50', color: 'white', fontWeight: 'bold', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
                       + Upload to {currentPrefix === '' ? 'Root' : currentPrefix.split('/').slice(-2, -1)[0]}
                     </button>
@@ -1113,10 +1352,12 @@ function App() {
                               {/* 🔒 RBAC VAULT: SEMBUNYIKAN UNTUK VIEWER */}
                               {activeBucket.permission !== 'READ' && (
                                 <>
+                                  <button title="Rename File" onClick={() => triggerRenameFile(item)} style={{ marginLeft: '5px', backgroundColor: '#f3f4f6', color: '#374151', padding: '4px 8px', borderRadius: '4px', border: '1px solid #d1d5db', cursor: 'pointer' }}>✎</button>
                                   <button title="Generate Shareable Link" onClick={() => triggerGenerateLink(item.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🔗</button>
                                   <button title="Delete File" onClick={() => triggerDeleteFile(item.uuid, item.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🗑</button>
                                 </>
                               )}
+
                             </>
                           )}
                         </td>
@@ -1133,11 +1374,73 @@ function App() {
             </div>
           )}
 
+          {activeView === 'trash' && (
+            <div className="vault-container">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                <h2 style={{ margin: 0 }}>🗑️ Trash Bin</h2>
+                <button
+                  onClick={() => setDialog({
+                    open: true, type: 'EMPTY_TRASH',
+                    title: 'Empty Trash Bin?',
+                    message: 'WARNING: This will permanently purge ALL files in your trash bin. Proceed?'
+                  })}
+                  style={{ backgroundColor: '#f44336', color: 'white', border: 'none', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                  ☢️ Empty Trash
+                </button>
+              </div>
+
+              <p style={{ color: '#666', marginBottom: '20px' }}>Files here are isolated and will be purged after 30 days.</p>
+              <table className="vault-table" style={{ width: '100%', textAlign: 'left' }}>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Original Namespace</th>
+                    <th>Deleted At</th>
+                    <th style={{ textAlign: 'right' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trashFiles.map(file => (
+                    <tr key={file.uuid}>
+                      <td><strong>{file.filename}</strong></td>
+                      <td><span className="badge">{file.bucket_name}</span></td>
+                      <td>{new Date(file.deleted_at).toLocaleString()}</td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          onClick={() => handleRestoreFile(file.uuid)}
+                          style={{ backgroundColor: '#10b981', color: 'white', marginRight: '5px' }}
+                        >
+                          Restore
+                        </button>
+                        <button
+                          onClick={() => triggerPurgeFile(file)}
+                          style={{ backgroundColor: '#ef4444', color: 'white' }}
+                        >
+                          Purge
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {/* INSPECTOR MODAL */}
           {inspectorModal.open && inspectorModal.file && (
-            <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', padding: '40px', zIndex: 1000 }}>
-              <div className="modal-content" style={{ display: 'flex', flexWrap: 'wrap', background: '#ffffff', width: '100%', borderRadius: '12px', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
-
+            <div className="modal-overlay" style={{
+              position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+              backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex',
+              padding: '40px', zIndex: 1000
+            }}>
+              <div className="modal-content" style={{
+                display: 'flex', flexWrap: 'wrap', background: '#ffffff',
+                width: '100%',
+                height: '100%', // Tambahkan ini agar konten tidak melebihi overlay
+                maxHeight: 'calc(100vh - 80px)', // Batasi tinggi maksimal modal
+                borderRadius: '12px', border: '1px solid #e5e7eb',
+                overflow: 'hidden' // Penting agar sudut melengkung tetap terlihat
+              }}>
                 {/* PANEL KIRI (PRATILIK) */}
                 <div style={{ flex: '2 1 300px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
                   {previewData.isLoading ? (
@@ -1156,18 +1459,31 @@ function App() {
                     <div style={{ flex: '1 1 300px', textAlign: 'center', color: '#6b7280' }}>
                       <span style={{ fontSize: '4rem', display: 'block', marginBottom: '15px' }}>👁️</span>
                       <h3 style={{ margin: '0 0 10px 0' }}>Preview Hidden</h3>
-                      <p style={{ margin: 0, fontSize: '0.9rem' }}>Select a version and click "Preview" to load the encrypted stream.</p>
+                      <p style={{ margin: 0, fontSize: '0.9rem', color: 'black' }}>Select a version and click "Preview" to load the encrypted stream.</p>
                     </div>
                   )}
                 </div>
 
                 {/* PANEL KANAN (DAFTAR VERSI) */}
-                <div style={{ flex: 1, padding: '25px', overflowY: 'auto', backgroundColor: '#ffffff' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px', borderBottom: '1px solid #e5e7eb', paddingBottom: '15px' }}>
+                <div style={{
+                  flex: 1,
+                  padding: '25px',
+                  height: '100%', // Pastikan mengambil tinggi penuh dari modal-content
+                  overflowY: 'auto', // Aktifkan scroll jika konten melebihi tinggi
+                  backgroundColor: '#ffffff',
+                  boxSizing: 'border-box'
+                }}>
+                  <div style={{
+                    display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center', marginBottom: '25px',
+                    borderBottom: '1px solid #e5e7eb', paddingBottom: '15px',
+                    position: 'sticky', top: 0, backgroundColor: '#fff', zIndex: 10 // Opsional: Header tetap di atas saat scroll
+                  }}>
                     <h3 style={{ margin: 0, color: '#111827' }}>Version History</h3>
                     <button onClick={closeInspector} style={{ background: 'transparent', color: '#6b7280', border: '1px solid #d1d5db' }}>Close</button>
                   </div>
 
+                  {/* Map fileVersions di sini */}
                   {fileVersions.map((v, index) => {
                     const isLatest = index === 0;
                     const isBeingPreviewed = previewData.versionNum === v.version_num;
@@ -1199,22 +1515,42 @@ function App() {
                             {previewData.isLoading && isBeingPreviewed ? 'Loading...' : 'Preview'}
                           </button>
 
+
                           {/* 🔒 RBAC: Tombol Restore hanya muncul jika pengguna punya akses WRITE atau ADMIN */}
                           {activeBucket.permission !== 'READ' && !isLatest && (
-                            <button
-                              onClick={() => restoreVersion(inspectorModal.file, v.version_num)}
-                              style={{ flex: 1, backgroundColor: '#10b981', color: 'white', padding: '6px', fontSize: '0.8rem', border: 'none' }}>
-                              Restore
-                            </button>
+                            <>
+                              <button
+                                onClick={() => restoreVersion(inspectorModal.file, v.version_num)}
+                                style={{ flex: 1, backgroundColor: '#10b981', color: 'white', padding: '6px', fontSize: '0.8rem', border: 'none', cursor: 'pointer' }}>
+                                Restore
+                              </button>
+
+                              {/* 🔴 INI TAMBAHAN TOMBOL DELETE-NYA 🔴 */}
+                              <button
+                                onClick={() => triggerDeleteVersion(inspectorModal.file.uuid, v.version_num)}
+                                style={{ flex: 1, backgroundColor: '#ef4444', color: 'white', padding: '6px', fontSize: '0.8rem', border: 'none', cursor: 'pointer' }}>
+                                Delete
+                              </button>
+                            </>
                           )}
                         </div>
                       </div>
                     );
                   })}
                 </div>
+
               </div>
             </div>
+
           )}
+          {/* Sidebar Item */}
+          <div
+            className={`nav-item ${activeView === 'trash' ? 'active' : ''}`}
+            onClick={fetchTrash}
+          >
+            <i className="pi pi-trash"></i>
+            <button>Trash Bin</button>
+          </div>
           {/* VIEW 3: ADMIN PANEL (GOD MODE) */}
           {activeView === 'admin' && (
             <div className="vault-container admin-panel">
@@ -1304,7 +1640,7 @@ function App() {
                               <td style={{ padding: '12px', color: '#aaa' }}>{formatBytes(file.size)}</td>
                               <td style={{ padding: '12px', fontFamily: 'monospace', fontSize: '0.8rem', color: '#aaa' }}>{file.uuid.substring(0, 13)}...</td>
                               <td style={{ padding: '12px', textAlign: 'right' }}>
-                                <button onClick={() => triggerDeleteFile(file.uuid, file.filename)} style={{ backgroundColor: '#f44336', color: 'white', padding: '4px 8px', fontSize: '0.8rem', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Force Purge</button>
+                                <button onClick={() => triggerPurgeFile(file)} style={{ backgroundColor: '#f44336', color: 'white', padding: '4px 8px', fontSize: '0.8rem', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>Force Purge</button>
                               </td>
                             </tr>
                           ))}
@@ -1336,84 +1672,148 @@ function App() {
             const isConfirmDisabled = isDeleteAction && currentInput !== targetConfirm;
             return (
               <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}>
-                <div style={{ background: '#222', padding: '25px', borderRadius: '8px', border: '1px solid #555', width: '400px', maxWidth: '90%', boxShadow: '0 4px 20px rgba(0,0,0,0.5)' }}>
-                  <h3 style={{ marginTop: 0, color: '#fff', borderBottom: '1px solid #444', paddingBottom: '10px' }}>{dialog.title}</h3>
-                  <p style={{ color: isDeleteAction ? '#ff5252' : '#ccc', margin: '15px 0', lineHeight: '1.5' }}>
-                    {dialog.message}
-                    {isDeleteAction && (
-                      <span style={{ display: 'block', marginTop: '10px', color: '#fff' }}>
-                        Please type <strong style={{ userSelect: 'none', color: '#ff5252' }}>{expectedConfirmation}</strong> to confirm.
-                      </span>
-                    )}
-                  </p>
 
-                  <form onSubmit={executeDialogAction}>
-                    {dialog.type === 'GENERATE_LINK' && (
-                      <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
-                        <input
-                          type="number"
-                          value={dialog.inputValue}
-                          onChange={(e) => setDialog({ ...dialog, inputValue: e.target.value })}
-                          placeholder="Minutes (e.g. 60)"
-                          style={{
-                            flex: 1, padding: '12px',
-                            background: '#111', color: '#fff', border: '1px solid #555',
-                            borderRadius: '4px', boxSizing: 'border-box'
-                          }}
-                        />
-                        <select
-                          value={dialog.permission}
-                          onChange={(e) => setDialog({ ...dialog, permission: e.target.value })}
-                          style={{
-                            flex: 1, padding: '12px',
-                            background: '#111', color: '#fff', border: '1px solid #555',
-                            borderRadius: '4px', boxSizing: 'border-box', cursor: 'pointer'
-                          }}
-                        >
-                          <option value="viewable">View Only (Inline)</option>
-                          <option value="downloadable">Downloadable</option>
-                        </select>
-                      </div>
-                    )}
-                    {/* Tambahkan DELETE_FILE dan DELETE_BUCKET agar input text muncul */}
-                    {['RENAME_BUCKET', 'REVOKE_ACCESS', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
-                      <input
-                        type="text"
-                        value={dialog.inputValue}
-                        onChange={(e) => setDialog({ ...dialog, inputValue: e.target.value })}
-                        autoFocus
-                        readOnly={dialog.type === 'SHOW_LINK'}
-                        placeholder={isDeleteAction ? expectedConfirmation : ''}
-                        style={{
-                          width: '100%', padding: '12px', marginBottom: '20px',
-                          background: '#111', color: '#fff', border: '1px solid #555',
-                          borderRadius: '4px', boxSizing: 'border-box'
-                        }}
-                      />
-                    )}
+                {/* Lebar modal disesuaikan: 600px untuk VERSIONS (agar tabel muat), 400px untuk dialog biasa */}
+                <div style={{ background: '#222', padding: '25px', borderRadius: '8px', border: '1px solid #555', width: dialog.type === 'VERSIONS' ? '600px' : '400px', maxWidth: '90%', boxShadow: '0 4px 20px rgba(0,0,0,0.5)' }}>
 
-                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
-                      <button type="button" onClick={closeDialog} style={{ background: 'transparent', color: '#aaa', border: '1px solid #555', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
-                        {dialog.type === 'SHOW_LINK' || dialog.type === 'ALERT' ? 'Close' : 'Cancel'}
-                      </button>
+                  {/* === HEADER MODAL === */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #444', paddingBottom: '10px' }}>
+                    <h3 style={{ margin: 0, color: '#fff' }}>{dialog.title}</h3>
+                    {dialog.type === 'VERSIONS' && (
+                      <button type="button" onClick={closeDialog} style={{ background: 'transparent', color: '#aaa', border: 'none', cursor: 'pointer', fontSize: '1.2rem' }}>✖</button>
+                    )}
+                  </div>
 
-                      {dialog.type !== 'SHOW_LINK' && dialog.type !== 'ALERT' && (
-                        <button
-                          type="submit"
-                          disabled={isConfirmDisabled}
-                          style={{
-                            background: isDeleteAction ? (isConfirmDisabled ? '#555' : '#f44336') : '#2196F3',
-                            color: isConfirmDisabled ? '#888' : 'white',
-                            padding: '8px 16px', border: 'none', borderRadius: '4px',
-                            cursor: isConfirmDisabled ? 'not-allowed' : 'pointer',
-                            transition: 'background 0.3s'
-                          }}
-                        >
-                          {isDeleteAction ? 'Yes, Execute' : 'Confirm'}
-                        </button>
-                      )}
+                  {/* === 1. TAMPILAN KHUSUS UNTUK VERSIONS (TABEL) === */}
+                  {dialog.type === 'VERSIONS' && (
+                    <div style={{ maxHeight: '400px', overflowY: 'auto', marginTop: '15px' }}>
+                      <p style={{ color: '#ccc', marginBottom: '15px' }}>
+                        Version history for: <strong style={{ color: '#fff' }}>{dialog.targetData?.filename}</strong>
+                      </p>
+
+                      <table style={{ width: '100%', borderCollapse: 'collapse', color: '#fff', fontSize: '0.9rem' }}>
+                        <thead>
+                          <tr style={{ textAlign: 'left', borderBottom: '1px solid #444' }}>
+                            <th style={{ padding: '8px' }}>Version</th>
+                            <th style={{ padding: '8px' }}>Size</th>
+                            <th style={{ padding: '8px' }}>Created</th>
+                            <th style={{ padding: '8px', textAlign: 'right' }}>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {dialog.targetData?.versions?.map((v) => {
+                            // Cek apakah ini versi terbaru
+                            const isLatest = v.version_num === Math.max(...dialog.targetData.versions.map(i => i.version_num));
+                            return (
+                              <tr key={v.version_num} style={{ borderBottom: '1px solid #333' }}>
+                                <td style={{ padding: '8px' }}>
+                                  v{v.version_num} {isLatest && <span style={{ fontSize: '10px', background: '#2196F3', padding: '2px 4px', borderRadius: '3px', marginLeft: '5px' }}>Latest</span>}
+                                </td>
+                                <td style={{ padding: '8px' }}>{(v.size / 1024).toFixed(2)} KB</td>
+                                <td style={{ padding: '8px' }}>{new Date(v.created_at).toLocaleDateString()}</td>
+                                <td style={{ padding: '8px', textAlign: 'right' }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDialog({
+                                      ...dialog,
+                                      type: 'DELETE_VERSION',
+                                      targetData: { ...dialog.targetData, versionNum: v.version_num, fileUuid: dialog.targetData.uuid }
+                                    })}
+                                    style={{ padding: '4px 8px', backgroundColor: '#ef4444', border: 'none', borderRadius: '4px', color: 'white', cursor: 'pointer' }}
+                                  >
+                                    <i className="pi pi-trash"></i>
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
                     </div>
-                  </form>
+                  )}
+
+                  {/* === 2. TAMPILAN FORM STANDAR (Disembunyikan jika sedang melihat VERSIONS) === */}
+                  {dialog.type !== 'VERSIONS' && (
+                    <>
+                      <p style={{ color: isDeleteAction ? '#ff5252' : '#ccc', margin: '15px 0', lineHeight: '1.5' }}>
+                        {dialog.message}
+                        {isDeleteAction && (
+                          <span style={{ display: 'block', marginTop: '10px', color: '#fff' }}>
+                            Please type <strong style={{ userSelect: 'none', color: '#ff5252' }}>{expectedConfirmation}</strong> to confirm.
+                          </span>
+                        )}
+                      </p>
+
+                      <form onSubmit={executeDialogAction}>
+                        {dialog.type === 'GENERATE_LINK' && (
+                          <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+                            <input
+                              type="number"
+                              value={dialog.inputValue}
+                              onChange={(e) => setDialog({ ...dialog, inputValue: e.target.value })}
+                              placeholder="Minutes (e.g. 60)"
+                              style={{
+                                flex: 1, padding: '12px',
+                                background: '#111', color: '#fff', border: '1px solid #555',
+                                borderRadius: '4px', boxSizing: 'border-box'
+                              }}
+                            />
+                            <select
+                              value={dialog.permission}
+                              onChange={(e) => setDialog({ ...dialog, permission: e.target.value })}
+                              style={{
+                                flex: 1, padding: '12px',
+                                background: '#111', color: '#fff', border: '1px solid #555',
+                                borderRadius: '4px', boxSizing: 'border-box', cursor: 'pointer'
+                              }}
+                            >
+                              <option value="viewable">View Only (Inline)</option>
+                              <option value="downloadable">Downloadable</option>
+                            </select>
+                          </div>
+                        )}
+
+                        {['RENAME_BUCKET', 'REVOKE_ACCESS', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
+                          <input
+                            type="text"
+                            value={dialog.inputValue}
+                            onChange={(e) => setDialog({ ...dialog, inputValue: e.target.value })}
+                            autoFocus
+                            readOnly={dialog.type === 'SHOW_LINK'}
+                            placeholder={isDeleteAction ? expectedConfirmation : ''}
+                            style={{
+                              width: '100%', padding: '12px', marginBottom: '20px',
+                              background: '#111', color: '#fff', border: '1px solid #555',
+                              borderRadius: '4px', boxSizing: 'border-box'
+                            }}
+                          />
+                        )}
+
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                          <button type="button" onClick={closeDialog} style={{ background: 'transparent', color: '#aaa', border: '1px solid #555', padding: '8px 16px', borderRadius: '4px', cursor: 'pointer' }}>
+                            {dialog.type === 'SHOW_LINK' || dialog.type === 'ALERT' ? 'Close' : 'Cancel'}
+                          </button>
+
+                          {dialog.type !== 'SHOW_LINK' && dialog.type !== 'ALERT' && (
+                            <button
+                              type="submit"
+                              disabled={isConfirmDisabled}
+                              style={{
+                                background: isDeleteAction ? (isConfirmDisabled ? '#555' : '#f44336') : '#2196F3',
+                                color: isConfirmDisabled ? '#888' : 'white',
+                                padding: '8px 16px', border: 'none', borderRadius: '4px',
+                                cursor: isConfirmDisabled ? 'not-allowed' : 'pointer',
+                                transition: 'background 0.3s'
+                              }}
+                            >
+                              {isDeleteAction ? 'Yes, Execute' : 'Confirm'}
+                            </button>
+                          )}
+                        </div>
+                      </form>
+                    </>
+                  )}
+
                 </div>
               </div>
             );
