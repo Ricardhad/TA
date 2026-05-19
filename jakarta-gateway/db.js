@@ -1,6 +1,5 @@
 import Database from 'better-sqlite3';
 const db = new Database('vault.db');
-// const db = new Database('database.db');
 db.pragma('foreign_keys = ON ');
 db.pragma('journal_mode = WAL');
 

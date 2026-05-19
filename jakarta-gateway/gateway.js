@@ -91,6 +91,7 @@ app.use(helmet({
         },
     },
 }));
+
 app.use(cors({
     origin: ['http://localhost:5173', 'https://richardgatewayta.duckdns.org:8080'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -461,10 +462,32 @@ apiRouter.delete('/vault/files/:uuid/purge', authorizeVault('WRITE'), async (req
 
     // 🔴 FIX: Pastikan query parameter diubah menjadi Angka (Integer) agar SQLite tidak bingung
     const requestedVersion = req.query.v ? parseInt(req.query.v, 10) : null;
-
+    const currentUserId = req.user.id; 
+    const currentUserRole = req.user.global_role; 
     console.log(`[PURGE REQUEST] UUID: ${uuid} | Target Version: ${requestedVersion || 'ALL'}`);
 
     try {
+        const fileContext = db.prepare(`
+            SELECT id, bucket_id FROM files WHERE uuid = ?
+        `).get(uuid);
+
+        if (!fileContext) {
+            return res.status(404).json({ error: "File not found." });
+        }
+
+        // Jika BUKAN global admin, cek hak akses di tabel bucket_policies
+        if (currentUserRole !== 'admin') {
+            const hasAccess = db.prepare(`
+                SELECT id FROM bucket_policies 
+                WHERE bucket_id = ? AND user_id = ? AND role IN ('WRITE', 'ADMIN')
+            `).get(fileContext.bucket_id, currentUserId);
+
+            if (!hasAccess) {
+                console.warn(`[SECURITY ALERT] Unauthorized purge attempt by User: ${currentUserId} on File: ${uuid}`);
+                return res.status(403).json({ error: "Access Denied. You don't have permission to purge this file." });
+            }
+        }
+
         if (!requestedVersion) {
             // LOGIKA A: Hapus SELURUH file beserta semua versinya
             const allVersions = db.prepare(`SELECT v.physical_path, f.id as file_id FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
@@ -619,7 +642,7 @@ apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, 
         for (const file of trashedFiles) {
             await spokeFetch(`/internal/files/${file.physical_path}`, { method: 'DELETE' });
         }
-        
+
         // Hapus dari database Gateway
         const stmt = db.prepare('DELETE FROM files WHERE id = ?');
         const deleteMany = db.transaction((files) => {
@@ -961,7 +984,7 @@ const server = https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0'
     console.log('--------------------------------------');
 });
 
-const FIFTEEN_MINUTES = 30 * 60 * 1000;
-server.setTimeout(FIFTEEN_MINUTES);
-server.keepAliveTimeout = FIFTEEN_MINUTES;
-server.headersTimeout = FIFTEEN_MINUTES + 1000; // Standar Node.js: headersTimeout wajib lebih besar dari keepAlive
+const SERVER_TIMEOUT = 30 * 60 * 1000;
+server.setTimeout(SERVER_TIMEOUT);
+server.keepAliveTimeout = SERVER_TIMEOUT;
+server.headersTimeout = SERVER_TIMEOUT + 1000; // Standar Node.js: headersTimeout wajib lebih besar dari keepAlive
