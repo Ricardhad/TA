@@ -82,7 +82,7 @@ export const permitGlobalRole = (requiredRole) => {
 //         } else {
 //             const policy = db.prepare('SELECT permission FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
 //                 .get(fileData.bucket_id, userId);
-            
+
 //             if (policy) finalPermission = policy.permission;
 //         }
 
@@ -100,34 +100,81 @@ export const permitGlobalRole = (requiredRole) => {
 //         next();
 //     };
 // };
+export const validateFileSecurity = (filename, headerMime, detectedType, buffer) => {
+    const dangerousMimes = ['application/x-sh', 'application/x-shellscript', 'text/x-shellscript'];
+    // 1. Ekstraksi Ekstensi yang Aman
+    const lastDotIndex = filename.lastIndexOf('.');
+    if (lastDotIndex === -1) {
+        return { isSpoofed: true, finalMime: 'BLOCKED' };
+    }
+    const ext = filename.toLowerCase().substring(lastDotIndex);
 
-export const validateFileSecurity = (filename, headerMime) => {
-    const extensionMime = mime.lookup(filename);
-    const dangerousExtensions = ['.exe', '.sh', '.bat', '.php', '.js', '.msi'];
+    // 2. Blacklist Statis (Mutlak)
+    const dangerousExtensions = ['.sh', '.exe', '.bat', '.php', '.js', '.msi', '.vbs', '.scr', '.ps1'];
+    if (dangerousExtensions.includes(ext)) {
+        console.warn(`[SECURITY] BLOCKED: Ekstensi berbahaya terdeteksi: ${ext}`);
+        return { isSpoofed: true, finalMime: 'BLOCKED' };
+    }
+    // 1. Cek isi file (Magic Numbers) - PALING PENTING
+    if (detectedType && dangerousMimes.includes(detectedType.mime)) {
+        return { isSpoofed: true, finalMime: 'BLOCKED' };
+    }
 
-    const isExecutableExt = dangerousExtensions.some(ext =>
-        filename.toLowerCase().endsWith(ext)
-    );
+    // 2. Cek Header MIME (jika client mengaku-ngaku)
+    if (dangerousMimes.includes(headerMime)) {
+        return { isSpoofed: true, finalMime: 'BLOCKED' };
+    }
 
-    const isSpoofed = isExecutableExt && (
-        headerMime.startsWith('image/') || headerMime.startsWith('text/')
-    );
+    // 3. MIME Matching (Fail-safe)
+    const detectedMime = mime.lookup(filename);
 
-    return {
-        isSpoofed,
-        finalMime: (headerMime === 'application/octet-stream')
-            ? (extensionMime || headerMime)
-            : headerMime
+    // Jika MIME tidak diketahui, kita izinkan jika bukan file biner berbahaya, 
+    // tapi jika MIME terdeteksi dan sangat berbeda, maka kita blokir.
+    if (detectedMime && headerMime !== 'application/octet-stream') {
+        // Abaikan perbedaan jika headerMime adalah tipe generik
+        if (headerMime !== detectedMime) {
+            console.warn(`[SECURITY] BLOCKED: MIME Mismatch! Expected ${detectedMime}, got ${headerMime}`);
+            return { isSpoofed: true, finalMime: 'BLOCKED' };
+        }
+    }
+    const content = buffer.toString().toLowerCase();
+    const dangerousKeywords = ['#!/bin/', 'echo ', 'eval(', 'base64_decode', 'cmd.exe', 'powershell'];
+    if (dangerousKeywords.some(keyword => content.includes(keyword))) {
+        return { isSpoofed: true, finalMime: 'BLOCKED' };
+    }
+    const allowedExtensions = {
+        '.jpg': 'image/jpeg',
+        '.png': 'image/png',
+        '.txt': 'text/plain',
+        '.pdf': 'application/pdf'
     };
+    if (!allowedExtensions[ext]) return { isSpoofed: true, finalMime: 'BLOCKED' };
+
+    // Validasi MIME: Apakah headerMime yang dikirim klien sesuai dengan ekstensi yang diklaim?
+    if (headerMime !== allowedExtensions[ext]) {
+        // Pengecualian: kadang browser kirim 'image/pjpeg' untuk 'image/jpeg'
+        if (!(ext === '.jpg' && headerMime.includes('jpeg'))) {
+            return { isSpoofed: true, finalMime: 'BLOCKED' };
+        }
+    }
+    return { isSpoofed: false,  finalMime: allowedExtensions[ext]};
 };
-
-
 export const authorizeVault = (requiredPermission = 'READ') => {
     return (req, res, next) => {
+        // 1. Ambil identitas user dari JWT
+        if (!req.auth || !req.auth.payload) {
+            return res.status(401).json({ error: "Unauthorized: No token provided." });
+        }
+
         const userId = req.auth.payload.sub;
         const fileUuid = req.params.uuid;
 
-        // 1. Find the file AND its parent bucket
+        // Pastikan globalRole ada (default ke 'standard_user' jika belum diset)
+        const role = req.globalRole || 'standard_user';
+
+        console.log(`[AUTH CHECK] User: ${userId} | Role: ${role} | Required: ${requiredPermission} | File: ${fileUuid}`);
+
+        // 2. Find File & Bucket
         const fileData = db.prepare(`
             SELECT f.bucket_id, b.owner_id as bucket_owner
             FROM files f
@@ -137,28 +184,33 @@ export const authorizeVault = (requiredPermission = 'READ') => {
 
         if (!fileData) return res.status(404).json({ error: "File not found." });
 
-        // 2. Check Bucket-Level RBAC
+        // 3. Menentukan Permission
         let finalPermission = null;
 
+        // A. Owner Bucket = ADMIN
         if (fileData.bucket_owner === userId) {
-            finalPermission = 'ADMIN'; // Owner of the bucket has ultimate power
+            finalPermission = 'ADMIN';
         } else {
+            // B. Cek Policy di DB
             const policy = db.prepare('SELECT permission FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?')
                 .get(fileData.bucket_id, userId);
-            
+
             if (policy) finalPermission = policy.permission;
         }
 
-        // 3. Evalusi Keamanan (Admin Global Bypass Dihapus!)
+        // 4. Admin Bypass (Logic for Global Admin)
+        if (role === 'admin') {
+            console.log(`[AUTH] Admin bypass granted for ${userId}`);
+            req.bucket_permission = 'ADMIN';
+            return next();
+        }
+
+        // 5. Check Denied
         if (!finalPermission) {
-            // Pengecualian SATU-SATUNYA: Jika Admin Global ingin menghapus fail dari "Global File Explorer" (Force Purge)
-            if (req.globalRole === 'admin' && requiredPermission === 'WRITE' && req.path.includes(fileUuid)) {
-                 return next();
-            }
             return res.status(403).json({ error: "Access Denied: You are not invited to this namespace." });
         }
 
-        // 4. Weight Check
+        // 6. Weight Check
         const weights = { 'READ': 1, 'WRITE': 2, 'ADMIN': 3 };
         if (weights[finalPermission] < weights[requiredPermission]) {
             return res.status(403).json({ error: `Forbidden: Action requires ${requiredPermission} permission.` });
@@ -170,6 +222,7 @@ export const authorizeVault = (requiredPermission = 'READ') => {
 };
 
 export function authorizeBucket(requiredPermission) {
+    console.log(`[AUTH CHECK] Authorizing bucket access with permission: ${requiredPermission}`);
     return (req, res, next) => {
         const userId = req.auth.payload.sub;
         const bucketUuid = req.headers['x-bucket-uuid'] || req.params.bucketUuid;
@@ -188,14 +241,14 @@ export function authorizeBucket(requiredPermission) {
         let finalPermission = bucketData.permission;
 
         if (bucketData.owner_id === userId) {
-            finalPermission = 'ADMIN'; 
+            finalPermission = 'ADMIN';
         }
 
         // Evalusi Keamanan (Admin Global Bypass Dihapus!)
         if (!finalPermission) {
             return res.status(403).json({
                 error: "Access Denied: No policy found for this user.",
-                debug: { owner: bucketData.owner_id, requester: userId } 
+                debug: { owner: bucketData.owner_id, requester: userId }
             });
         }
 

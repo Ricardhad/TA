@@ -372,26 +372,38 @@ function App() {
         setDialog({ open: true, type: 'ALERT', title: 'Namespace Destroyed', message: data.message });
       }
       else if (type === 'RENAME_FILE') {
-        if (!inputValue || inputValue === targetData.filename) return closeDialog(); // Abaikan jika nama kosong atau tidak berubah
+        if (!inputValue || inputValue === targetData.filename.replace(currentPrefix, '')) {
+          return closeDialog(); // Tidak ada perubahan, tutup saja
+        }
+        let finalName = inputValue; 
 
-        // Jika ada prefix (folder virtual), gabungkan prefix dengan nama baru
-        // Jika tidak, gunakan nama baru langsung
-        const finalName = currentPrefix + inputValue;
+        if (!inputValue.startsWith(currentPrefix)) {
+          finalName = inputValue;
+        } else {
+          finalName = inputValue;
+        }
+        try {
+          const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData.uuid}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'x-bucket-uuid': activeBucket.uuid // Header bucket wajib ada
+            },
+            body: JSON.stringify({ newName: finalName })
+          });
 
-        const res = await fetch(`${API_BASE}/api/v1/vault/files/${targetData.uuid}`, {
-          method: 'PUT',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'x-bucket-uuid': activeBucket.uuid
-          },
-          body: JSON.stringify({ newName: finalName })
-        });
+          if (!res.ok) {
+            const errData = await res.json();
+            throw new Error(errData.error || "Rename failed.");
+          }
 
-        if (!res.ok) throw new Error("Rename failed.");
-
-        fetchFiles(activeBucket.uuid);
-        closeDialog();
+          // Refresh UI
+          fetchFiles(activeBucket.uuid);
+          closeDialog();
+        } catch (err) {
+          setDialog({ open: true, type: 'ALERT', title: 'Rename Error', message: err.message });
+        }
       }
       else if (type === 'GENERATE_LINK') {
         if (!inputValue) return;
@@ -1352,7 +1364,7 @@ function App() {
                               {/* 🔒 RBAC VAULT: SEMBUNYIKAN UNTUK VIEWER */}
                               {activeBucket.permission !== 'READ' && (
                                 <>
-                                  <button title="Rename File" onClick={() => triggerRenameFile(item)} style={{ marginLeft: '5px', backgroundColor: '#f3f4f6', color: '#374151', padding: '4px 8px', borderRadius: '4px', border: '1px solid #d1d5db', cursor: 'pointer' }}>✎</button>
+                                  <button title="Rename File" onClick={() => triggerRenameFile(item)} style={{ marginLeft: '5px', backgroundColor: '#f3f4f6', color: '#454545', padding: '4px 8px', borderRadius: '4px', border: '1px solid #d1d5db', cursor: 'pointer' }}>✎</button>
                                   <button title="Generate Shareable Link" onClick={() => triggerGenerateLink(item.uuid)} style={{ marginLeft: '5px', backgroundColor: '#673ab7', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🔗</button>
                                   <button title="Delete File" onClick={() => triggerDeleteFile(item.uuid, item.filename)} style={{ marginLeft: '5px', backgroundColor: '#f44336', color: 'white', padding: '4px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer' }}>🗑</button>
                                 </>
@@ -1773,7 +1785,7 @@ function App() {
                           </div>
                         )}
 
-                        {['RENAME_BUCKET', 'REVOKE_ACCESS', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
+                        {['RENAME_FILE', 'RENAME_BUCKET', 'REVOKE_ACCESS', 'SHOW_LINK', 'CREATE_FOLDER', 'DELETE_FILE', 'DELETE_BUCKET'].includes(dialog.type) && (
                           <input
                             type="text"
                             value={dialog.inputValue}

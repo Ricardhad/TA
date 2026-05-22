@@ -15,6 +15,9 @@ import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Agent, setGlobalDispatcher } from 'undici';
+import { fileTypeFromStream } from 'file-type';
+import { PassThrough } from 'stream';
+import { fileTypeFromBuffer } from 'file-type';
 
 const THIRTY_MINUTES = 30 * 60 * 1000;
 const customAgent = new Agent({
@@ -240,6 +243,7 @@ app.get('/health', async (req, res) => {
 // ==========================================
 apiRouter.use('/vault/', apiLimiter);
 apiRouter.use('/vault/files', strictLimiter);
+apiRouter.use('/vault/files', strictLimiter);
 
 // Global API Audit Log (Fires AFTER bouncer authenticates the user)
 apiRouter.use((req, res, next) => {
@@ -326,7 +330,6 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
     const contentLength = req.headers['content-length'];
     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
     const controller = new AbortController();
-
     // 2. Pasang pendengar jika koneksi klien (browser) terputus
     req.on('error', (err) => {
         console.warn(`[UPLOAD-GATEWAY] Stream Error: ${err.message}`);
@@ -342,6 +345,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
     const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 } });
     const userId = req.auth.payload.sub;
+
     const bucketUuid = req.headers['x-bucket-uuid'];
     const folderPrefix = req.headers['x-file-prefix'] || '';
     const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
@@ -356,57 +360,110 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
         isProcessing = true;
         const { filename, mimeType: headerMime } = info;
         const fullVirtualFilename = folderPrefix + filename;
-        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime);
+        const pass = new PassThrough();
+        file.pipe(pass);
+
+        // 2. Gunakan 'file' untuk type check, dan 'pass' untuk upload ke Spoke
+        const stream = file;
+        const buffer = await new Promise((resolve, reject) => {
+            const chunks = [];
+            stream.once('data', (chunk) => {
+                chunks.push(chunk);
+                // Cukup baca header pertama
+                resolve(Buffer.concat(chunks));
+            });
+            stream.on('error', reject);
+        });
+
+        const type = await fileTypeFromBuffer(buffer);
+        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime,type,buffer);
+
+        // console.log(`[DEBUG] Filename: ${info.filename}`);
+        // console.log(`[DEBUG] Header MIME: ${info.mimeType}`);
+        // console.log(`[DEBUG] Detected MIME (Magic Numbers): ${type ? type.mime : 'Unknown'}`);
+        // console.log(`[DEBUG] Is Spoofed: ${isSpoofed}`);
+        // console.log(`[DEBUG] Final MIME to use: ${finalMime}`);
+        // console.log(`[DEBUG] type: ${type ? JSON.stringify(type) : 'null'}`);
+        // const isShFile = (type && type.mime === 'application/x-sh') ||
+        //     (info.mimeType === 'application/x-sh');
+
+        // if (isShFile) {
+        //     console.warn(`[SECURITY] BLOCKED: File ${info.filename} adalah skrip shell!`);
+        //     // ... blokir file
+        //     return res.status(403).json({ error: "Security Violation: Shell scripts are not allowed." });
+        // }
 
         file.on('limit', () => { limitReached = true; });
+        (async () => {
+            try {
+                if (isSpoofed) { file.resume(); return res.status(403).json({ error: "Security Violation" }); }
+                // const type = await fileTypeFromStream(file);
 
-        try {
-            const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
-            if ((usage.total_used || 0) >= activeLimit) return res.status(403).json({ error: "Quota Exceeded" });
-            if (isSpoofed) { file.resume(); return res.status(403).json({ error: "Security Violation" }); }
+                // if (type && type.mime === 'application/x-sh') {
+                //     file.resume(); // Buang file
+                //     return res.status(403).json({ error: "Security Violation: Content Mismatch" });
+                // }
 
-            const spokeResponse = await spokeFetch(`/internal/files`, {
-                method: 'POST', body: file, duplex: 'half',
-                signal: controller.signal,
-                headers: { 'x-original-name': filename }
-            });
+                const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
+                if ((usage.total_used || 0) >= activeLimit) {
+                    file.resume();
+                    return res.status(403).json({ error: "Quota Exceeded" });
+                }
 
-            if (limitReached) return res.status(413).json({ error: "File Too Large" });
-            if (!spokeResponse.ok) throw new Error(`Spoke rejected upload`);
+                const spokeResponse = await spokeFetch(`/internal/files`, {
+                    method: 'POST', body: pass
+                    , duplex: 'half',
+                    signal: controller.signal,
+                    headers: {
+                        'x-original-name': filename,
+                        'content-type': headerMime
+                    }
+                });
 
-            const data = await spokeResponse.json();
-            const { physical_path, size, checksum } = data;
+                if (limitReached) return res.status(413).json({ error: "File Too Large" });
+                if (!spokeResponse.ok) throw new Error(`Spoke rejected upload`);
 
-            let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
-            if (!fileRecord) {
-                const uuid = randomUUID();
-                const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
-                fileRecord = { id: info.lastInsertRowid, uuid: uuid };
-            } else {
-                db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
+                const data = await spokeResponse.json();
+                const { physical_path, size, checksum } = data;
+
+                let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
+                if (!fileRecord) {
+                    const uuid = randomUUID();
+                    const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
+                    fileRecord = { id: info.lastInsertRowid, uuid: uuid };
+                } else {
+                    db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
+                }
+
+                let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+                while (versions.length >= 5) {
+                    try {
+                        await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
+                        db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+                        versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+                    } catch (e) { console.error("Cleanup failed"); }
+                }
+
+                const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
+                const newVersion = (lastVersion.v || 0) + 1;
+                db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
+
+                res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
+                setImmediate(() => { req.destroy(); });
+            } catch (err) {
+                file.resume();
+                if (err.name === 'AbortError') {
+                    console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
+                }
+                console.error("[UPLOAD ERROR]", err.message);
+                res.status(500).json({ error: "Gateway stream interrupted.", error_detail: err.message });
             }
-
-            let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-            while (versions.length >= 5) {
-                try {
-                    await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
-                    db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
-                    versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-                } catch (e) { console.error("Cleanup failed"); }
-            }
-
-            const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
-            const newVersion = (lastVersion.v || 0) + 1;
-            db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
-
-            res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
-            setImmediate(() => { req.destroy(); });
-        } catch (err) {
-            file.resume();
-            if (err.name === 'AbortError') {
-                console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
-            }
-            res.status(500).json({ error: "Gateway stream interrupted." });
+        })();
+    });
+    busboy.on('finish', () => {
+        if (!isProcessing) {
+            console.warn("[SECURITY ALERT] Request Multipart masuk tanpa menyertakan part file.");
+            return res.status(400).json({ error: "Bad Request", message: "No file payload detected in multipart form data." });
         }
     });
     req.pipe(busboy);
@@ -457,13 +514,13 @@ apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) =>
 });
 
 // 3. HARD DELETE (Purge Full File OR Specific Version)
-apiRouter.delete('/vault/files/:uuid/purge', authorizeVault('WRITE'), async (req, res) => {
+apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), authorizeVault('ADMIN'), async (req, res) => {
     const { uuid } = req.params;
 
-    // 🔴 FIX: Pastikan query parameter diubah menjadi Angka (Integer) agar SQLite tidak bingung
     const requestedVersion = req.query.v ? parseInt(req.query.v, 10) : null;
-    const currentUserId = req.user.id; 
-    const currentUserRole = req.user.global_role; 
+    const currentUserId = req.auth.payload.sub;
+    const currentUserRole = req.globalRole;
+    // console.log(`[PURGE INITIATED] User: ${currentUserId} | Role: ${currentUserRole} | UUID: ${uuid} | Requested Version: ${requestedVersion || 'ALL'}`);
     console.log(`[PURGE REQUEST] UUID: ${uuid} | Target Version: ${requestedVersion || 'ALL'}`);
 
     try {
@@ -476,33 +533,36 @@ apiRouter.delete('/vault/files/:uuid/purge', authorizeVault('WRITE'), async (req
         }
 
         // Jika BUKAN global admin, cek hak akses di tabel bucket_policies
+        // Ganti blok ini:
         if (currentUserRole !== 'admin') {
             const hasAccess = db.prepare(`
                 SELECT id FROM bucket_policies 
-                WHERE bucket_id = ? AND user_id = ? AND role IN ('WRITE', 'ADMIN')
-            `).get(fileContext.bucket_id, currentUserId);
+                WHERE bucket_id = ? AND grantee_id = ? AND permission IN ('WRITE', 'ADMIN')
+            `).get(fileContext.bucket_id, currentUserId); // grantee_id = user yang mengakses, permission = kolom role di db kamu
 
             if (!hasAccess) {
-                console.warn(`[SECURITY ALERT] Unauthorized purge attempt by User: ${currentUserId} on File: ${uuid}`);
-                return res.status(403).json({ error: "Access Denied. You don't have permission to purge this file." });
+                return res.status(403).json({ error: "Access Denied." });
             }
         }
 
         if (!requestedVersion) {
-            // LOGIKA A: Hapus SELURUH file beserta semua versinya
             const allVersions = db.prepare(`SELECT v.physical_path, f.id as file_id FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
 
-            if (allVersions.length === 0) {
-                console.error("[PURGE ERROR] File not found in database for deletion.");
-                return res.status(404).json({ error: "File not found for purging." });
-            }
+            if (allVersions.length === 0) return res.status(404).json({ error: "File not found." });
 
+            // 1. Hapus fisik di Spoke
             for (const v of allVersions) {
                 await spokeFetch(`/internal/files/${v.physical_path}`, { method: 'DELETE' });
             }
-            db.prepare('DELETE FROM files WHERE id = ?').run(allVersions[0].file_id);
-            return res.status(200).json({ status: "File completely purged from physical storage." });
 
+            // 2. Hapus DB dengan aman (anak dulu, baru induk)
+            const purgeTransaction = db.transaction((fileId) => {
+                db.prepare('DELETE FROM versions WHERE file_id = ?').run(fileId);
+                db.prepare('DELETE FROM files WHERE id = ?').run(fileId);
+            });
+
+            purgeTransaction(allVersions[0].file_id);
+            return res.status(200).json({ status: "File completely purged." });
         } else {
             // LOGIKA B: Hapus HANYA VERSI SPESIFIK
 
@@ -566,37 +626,43 @@ apiRouter.put('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) =>
         res.status(500).json({ error: "Failed to rename file." });
     }
 });
-apiRouter.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
+apiRouter.delete('/vault/files/:uuid', permitGlobalRole('standard_user'), authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     try {
-        const file = db.prepare('SELECT id, created_at FROM files WHERE uuid = ?').get(uuid);
+        // 1. BARU: Ambil ID file dan TIMESTAMP dari versi komit paling terakhir (tertinggi)
+        const file = db.prepare(`
+            SELECT f.id, v.timestamp
+            FROM files f
+            JOIN versions v ON f.id = v.file_id
+            WHERE f.uuid = ? AND f.deleted_at IS NULL
+            ORDER BY v.version_num DESC
+            LIMIT 1
+        `).get(uuid);
+
         if (!file) return res.status(404).json({ error: "File not found." });
 
-        // 2. FIX ZONA WAKTU: Ubah format "2026-05-15 15:57:38" menjadi "2026-05-15T15:57:38Z"
-        let dbTime = file.created_at; // Ganti file.timestamp menjadi file.created_at jika itu nama kolommu
+        let dbTime = file.timestamp; // Sekarang mengambil kolom timestamp milik tabel versions
         if (!dbTime.includes('Z')) {
             dbTime = dbTime.replace(' ', 'T') + 'Z';
         }
 
         const MINIMUM_RETENTION_MINUTES = 5;
-        const createdAt = new Date(dbTime); // Sekarang Node.js tahu ini UTC
+        const latestVersionTime = new Date(dbTime); // Node.js membaca ini sebagai objek UTC/ZULU
         const now = new Date();
 
-        // Hitung selisih waktu dalam menit
-        const diffMinutes = Math.floor((now - createdAt) / (1000 * 60));
+        const diffMinutes = Math.floor((now - latestVersionTime) / (1000 * 60));
 
-        // Tambahkan console.log ini untuk memastikan perhitungan sudah benar
-        console.log(`[WORM DEBUG] Created: ${createdAt.toISOString()} | Now: ${now.toISOString()} | Age: ${diffMinutes} mins`);
+        console.log(`[WORM DEBUG] Latest Version Time: ${latestVersionTime.toISOString()} | Now: ${now.toISOString()} | Age: ${diffMinutes} mins`);
 
         if (diffMinutes < MINIMUM_RETENTION_MINUTES) {
             return res.status(403).json({
                 error: "Object Locked",
-                message: `Data integrity policy: File must exist for at least ${MINIMUM_RETENTION_MINUTES} minutes before deletion. Please try again in ${MINIMUM_RETENTION_MINUTES - diffMinutes} minutes.`
+                message: `Data integrity policy: File cannot be deleted within ${MINIMUM_RETENTION_MINUTES} minutes of its latest version modification. Please try again in ${MINIMUM_RETENTION_MINUTES - diffMinutes} minutes.`
             });
         }
 
-        console.log(`[OBJECT LOCK] File created at: ${createdAt.toISOString()}, now: ${now.toISOString()}, age: ${diffMinutes} minutes`);
-        // 3. Jika sudah melewati batas minimum, lanjutkan Soft Delete
+        console.log(`[OBJECT LOCK PASS] File ID: ${file.id} passed lock enforcement. Latest version age: ${diffMinutes} minutes`);
+
         db.prepare("UPDATE files SET deleted_at = datetime('now') WHERE id = ?").run(file.id);
 
         res.status(200).json({ status: "Success", message: "File moved to trash bin." });
@@ -605,7 +671,6 @@ apiRouter.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res)
         res.status(500).json({ error: "Failed to move file to trash.", details: err.message });
     }
 });
-
 // gateway.js - List Trash
 apiRouter.get('/vault/trash', (req, res) => {
     const userId = req.auth.payload.sub; // ID dari Auth0
@@ -956,19 +1021,19 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-    if (err.name === 'UnauthorizedError') {
+    if (err.status === 401 || err.name === 'UnauthorizedError') {
         const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
         console.warn(`[SECURITY] Failed Auth attempt on ${req.path} from IP: ${ip}`);
         try {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
         } catch (dbErr) { console.error("Log fail:", dbErr.message); }
-        return res.status(401).json({ error: "Unauthorized" });
+        return res.status(401).json({ error: "Unauthorized", message: err.message });
     }
+
     console.error("[SERVER ERROR]", err);
     res.status(500).json({ error: "Internal Error" });
 });
-
 // ==========================================
 // 7. START SERVER
 // ==========================================
