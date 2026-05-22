@@ -8,8 +8,41 @@ import path, { dirname } from 'path';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { auth } from 'express-oauth2-jwt-bearer';
+import { spawn } from 'child_process';
+import { pipeline } from 'stream/promises';
+import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 
 dotenv.config();
+
+function createVideoSanitizerProcess() {
+    // 2. Ganti kata 'ffmpeg' menjadi ffmpegInstaller.path
+    const ffmpeg = spawn(ffmpegInstaller.path, [
+        '-i', 'pipe:0',             
+        '-map_metadata', '-1',      
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-f', 'mp4',                
+        '-movflags', 'frag_keyframe+empty_moov', 
+        'pipe:1'                    
+    ]);
+
+    ffmpeg.stderr.on('data', (data) => {
+        // Biarkan kosong, atau uncomment untuk melihat proses render video
+        // console.log(`[FFMPEG]: ${data.toString()}`); 
+    });
+
+    return ffmpeg;
+}
+
+const calculateFileHash = (filePath) => {
+    return new Promise((resolve, reject) => {
+        const hash = crypto.createHash('sha256');
+        const input = fs.createReadStream(filePath);
+        input.on('data', (data) => hash.update(data));
+        input.on('end', () => resolve(hash.digest('hex')));
+        input.on('error', reject);
+    });
+};
 
 const app = express();
 const PORT = 3000;
@@ -77,18 +110,18 @@ const vpnOnly = (req, res, next) => {
     next();
 };
 
-const calculateFileHash = (filePath) => {
-    return new Promise((resolve, reject) => {
-        // Kita menghitung hash dari raw file di disk (sudah terenkripsi + IV + Tag)
-        // karena itu adalah data fisik yang rentan mengalami bit rot.
-        const hash = crypto.createHash('sha256');
-        const stream = fs.createReadStream(filePath);
+// const calculateFileHash = (filePath) => {
+//     return new Promise((resolve, reject) => {
+//         // Kita menghitung hash dari raw file di disk (sudah terenkripsi + IV + Tag)
+//         // karena itu adalah data fisik yang rentan mengalami bit rot.
+//         const hash = crypto.createHash('sha256');
+//         const stream = fs.createReadStream(filePath);
 
-        stream.on('data', (chunk) => hash.update(chunk));
-        stream.on('end', () => resolve(hash.digest('hex')));
-        stream.on('error', (err) => reject(err));
-    });
-};
+//         stream.on('data', (chunk) => hash.update(chunk));
+//         stream.on('end', () => resolve(hash.digest('hex')));
+//         stream.on('error', (err) => reject(err));
+//     });
+// };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -113,6 +146,56 @@ app.use((err, req, res, next) => {
 // ==========================================
 // 1. RUTE UNGGAH DAN ENKRIPSI + HASING
 // ==========================================
+app.post('/internal/files', async (req, res) => {
+    const originalName = req.headers['x-original-name'] || 'uploaded-file';
+    const isVideo = ['.mp4', '.mov', '.webm'].some(ext => originalName.toLowerCase().endsWith(ext));
+    
+    const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
+    const vaultPath = path.join(STORAGE_DIR, safeName);
+
+    console.log(`[SPOKE] Menerima request untuk: ${originalName} (Video: ${isVideo})`);
+
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+    const writeStream = fs.createWriteStream(vaultPath);
+
+    // Tulis IV di awal file
+    writeStream.write(iv);
+
+    try {
+        if (isVideo) {
+            console.log("[SPOKE] Menjalankan fungsi Video Sanitizer On-the-Fly...");
+            // 1. Panggil fungsi yang sudah kita perbarui
+            const sanitizer = createVideoSanitizerProcess();
+
+            // 2. Alirkan: Request -> Mulut Sanitizer (stdin)
+            pipeline(req, sanitizer.stdin).catch(err => console.error("Input Stream Error:", err));
+
+            // 3. Alirkan: Muntahan Sanitizer (stdout) -> Cipher -> Disk
+            await pipeline(sanitizer.stdout, cipher, writeStream);
+        } else {
+            console.log("[SPOKE] Memulai enkripsi dokumen...");
+            // Jalur Normal: Langsung ke cipher
+            await pipeline(req, cipher, writeStream);
+        }
+
+        // Tulis AuthTag di akhir
+        const authTag = cipher.getAuthTag();
+        fs.appendFileSync(vaultPath, authTag);
+
+        const finalChecksum = await calculateFileHash(vaultPath);
+        const stats = fs.statSync(vaultPath);
+
+        console.log(`[SPOKE] Tersimpan: ${safeName} | Hash: ${finalChecksum}`);
+
+        res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
+
+    } catch (err) {
+        console.error("[SPOKE ERROR] Pipeline gagal:", err);
+        if (!res.headersSent) res.status(500).json({ error: "Storage or Encryption Failure" });
+    }
+});
+
 app.post('/internal/files', (req, res) => {
     const originalName = req.headers['x-original-name'] || 'uploaded-file';
     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
@@ -126,8 +209,6 @@ app.post('/internal/files', (req, res) => {
 
     writeStream.write(iv);
 
-    // KITA AKAN MENGHITUNG HASH DARI DATA FISIK YANG TERSIMPAN DI DISK
-    // Ini berarti hash mencakup IV + Ciphertext + Tag
     const hash = crypto.createHash('sha256');
     let rawFileSize = 0; // Ukuran sebelum enkripsi (sebagai informasi)
 

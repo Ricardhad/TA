@@ -326,6 +326,8 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
     const USER_QUOTA = 5 * 1024 * 1024 * 1024;
     const MAX_SIZE = 1 * 1024 * 1024 * 1024;
+    const VIDEO_MAX_SIZE = 50 * 1024 * 1024; // 50 MB
+    const DEFAULT_MAX_SIZE = 5 * 1024 * 1024;  // 5 MB untuk dokumen
     const contentType = req.headers['content-type'];
     const contentLength = req.headers['content-length'];
     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
@@ -362,8 +364,10 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
         const fullVirtualFilename = folderPrefix + filename;
         const pass = new PassThrough();
         file.pipe(pass);
-
-        // 2. Gunakan 'file' untuk type check, dan 'pass' untuk upload ke Spoke
+        file.on('end', () => {
+            pass.end(); // INI PENTING: Memberi sinyal EOF ke Spoke
+        });
+        // 2. Gunakan 'file' untuk type check, dan 'pass    ' untuk upload ke Spoke
         const stream = file;
         const buffer = await new Promise((resolve, reject) => {
             const chunks = [];
@@ -376,7 +380,15 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
         });
 
         const type = await fileTypeFromBuffer(buffer);
-        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime,type,buffer);
+        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, buffer);
+        const lastDotIndex = filename.lastIndexOf('.');
+        const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
+        const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
+        const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
+
+        if (info.size > limit) { // Pastikan busboy mengirim info size
+            return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
+        }
 
         // console.log(`[DEBUG] Filename: ${info.filename}`);
         // console.log(`[DEBUG] Header MIME: ${info.mimeType}`);
