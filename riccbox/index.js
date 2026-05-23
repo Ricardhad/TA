@@ -17,13 +17,15 @@ dotenv.config();
 function createVideoSanitizerProcess() {
     // 2. Ganti kata 'ffmpeg' menjadi ffmpegInstaller.path
     const ffmpeg = spawn(ffmpegInstaller.path, [
-        '-i', 'pipe:0',             
-        '-map_metadata', '-1',      
+        '-i', 'pipe:0',
+        '-map_metadata', '-1',
         '-c:v', 'libx264',
+        '-preset', 'ultrafast',    
+        '-tune', 'zerolatency',
         '-c:a', 'aac',
-        '-f', 'mp4',                
-        '-movflags', 'frag_keyframe+empty_moov', 
-        'pipe:1'                    
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov',
+        'pipe:1'
     ]);
 
     ffmpeg.stderr.on('data', (data) => {
@@ -149,7 +151,7 @@ app.use((err, req, res, next) => {
 app.post('/internal/files', async (req, res) => {
     const originalName = req.headers['x-original-name'] || 'uploaded-file';
     const isVideo = ['.mp4', '.mov', '.webm'].some(ext => originalName.toLowerCase().endsWith(ext));
-    
+
     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
     const vaultPath = path.join(STORAGE_DIR, safeName);
 
@@ -167,7 +169,6 @@ app.post('/internal/files', async (req, res) => {
             console.log("[SPOKE] Menjalankan fungsi Video Sanitizer On-the-Fly...");
             // 1. Panggil fungsi yang sudah kita perbarui
             const sanitizer = createVideoSanitizerProcess();
-
             // 2. Alirkan: Request -> Mulut Sanitizer (stdin)
             pipeline(req, sanitizer.stdin).catch(err => console.error("Input Stream Error:", err));
 
@@ -185,77 +186,78 @@ app.post('/internal/files', async (req, res) => {
 
         const finalChecksum = await calculateFileHash(vaultPath);
         const stats = fs.statSync(vaultPath);
-
+        console.log(`[SPOKE] Tersimpan: ${safeName} | Peak RAM RSS: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`);
         console.log(`[SPOKE] Tersimpan: ${safeName} | Hash: ${finalChecksum}`);
 
         res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
 
     } catch (err) {
-        console.error("[SPOKE ERROR] Pipeline gagal:", err);
+        console.error(`[SPOKE ERROR] Pipeline gagal! RAM RSS saat putus: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`);
+        console.error("[SPOKE ERROR] Detail:", err.message);
         if (!res.headersSent) res.status(500).json({ error: "Storage or Encryption Failure" });
     }
 });
 
-app.post('/internal/files', (req, res) => {
-    const originalName = req.headers['x-original-name'] || 'uploaded-file';
-    const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
-    const vaultPath = path.join(STORAGE_DIR, safeName);
+// app.post('/internal/files', (req, res) => {
+//     const originalName = req.headers['x-original-name'] || 'uploaded-file';
+//     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
+//     const vaultPath = path.join(STORAGE_DIR, safeName);
 
-    console.log(`[SPOKE] Receiving stream: ${originalName}`);
+//     console.log(`[SPOKE] Receiving stream: ${originalName}`);
 
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
-    const writeStream = fs.createWriteStream(vaultPath);
+//     const iv = crypto.randomBytes(12);
+//     const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+//     const writeStream = fs.createWriteStream(vaultPath);
 
-    writeStream.write(iv);
+//     writeStream.write(iv);
 
-    const hash = crypto.createHash('sha256');
-    let rawFileSize = 0; // Ukuran sebelum enkripsi (sebagai informasi)
+//     const hash = crypto.createHash('sha256');
+//     let rawFileSize = 0; // Ukuran sebelum enkripsi (sebagai informasi)
 
-    req.on('data', (chunk) => {
-        rawFileSize += chunk.length;
-    });
+//     req.on('data', (chunk) => {
+//         rawFileSize += chunk.length;
+//     });
 
-    // Pipa 1: Enkripsi aliran data
-    req.pipe(cipher);
+//     // Pipa 1: Enkripsi aliran data
+//     req.pipe(cipher);
 
-    // Pipa 2: Menulis hasil enkripsi ke file
-    cipher.on('data', (chunk) => {
-        writeStream.write(chunk);
-    });
+//     // Pipa 2: Menulis hasil enkripsi ke file
+//     cipher.on('data', (chunk) => {
+//         writeStream.write(chunk);
+//     });
 
-    cipher.on('end', () => {
-        const authTag = cipher.getAuthTag();
-        writeStream.write(authTag); // Tulis tag di akhir
-        writeStream.end(); // Tutup aliran penulisan
-    });
+//     cipher.on('end', () => {
+//         const authTag = cipher.getAuthTag();
+//         writeStream.write(authTag); // Tulis tag di akhir
+//         writeStream.end(); // Tutup aliran penulisan
+//     });
 
-    // Pipa 3: Setelah file selesai ditulis, hitung hash-nya
-    writeStream.on('finish', async () => {
-        try {
-            // Setelah file utuh di disk, hitung hash SHA-256-nya
-            const finalChecksum = await calculateFileHash(vaultPath);
-            const stats = fs.statSync(vaultPath);
+//     // Pipa 3: Setelah file selesai ditulis, hitung hash-nya
+//     writeStream.on('finish', async () => {
+//         try {
+//             // Setelah file utuh di disk, hitung hash SHA-256-nya
+//             const finalChecksum = await calculateFileHash(vaultPath);
+//             const stats = fs.statSync(vaultPath);
 
-            console.log(`[SPOKE] Saved: ${safeName} | Physical Size: ${stats.size} | Hash: ${finalChecksum}`);
+//             console.log(`[SPOKE] Saved: ${safeName} | Physical Size: ${stats.size} | Hash: ${finalChecksum}`);
 
-            res.status(200).json({
-                status: "Success",
-                physical_path: safeName,
-                size: stats.size, // Menggunakan ukuran fisik file di disk
-                checksum: finalChecksum
-            });
-        } catch (hashErr) {
-            console.error("Hashing Error:", hashErr);
-            res.status(500).send("Hashing Failure");
-        }
-    });
+//             res.status(200).json({
+//                 status: "Success",
+//                 physical_path: safeName,
+//                 size: stats.size, // Menggunakan ukuran fisik file di disk
+//                 checksum: finalChecksum
+//             });
+//         } catch (hashErr) {
+//             console.error("Hashing Error:", hashErr);
+//             res.status(500).send("Hashing Failure");
+//         }
+//     });
 
-    writeStream.on('error', (err) => {
-        console.error("Stream Error:", err);
-        res.status(500).send("Storage Failure");
-    });
-});
+//     writeStream.on('error', (err) => {
+//         console.error("Stream Error:", err);
+//         res.status(500).send("Storage Failure");
+//     });
+// });
 
 // ==========================================
 // 2. RUTE PERAWATAN DAN BIT ROT

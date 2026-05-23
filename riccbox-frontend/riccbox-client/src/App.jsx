@@ -18,8 +18,7 @@ function App() {
   const [activeView, setActiveView] = useState('lobby');
   const [userRole, setUserRole] = useState('standard_user');
   const [isFetching, setIsFetching] = useState(false);
-  const [usage, setUsage] = useState(null);
-
+  const activeRequests = useRef(new Map());
   // --- Notifications State ---
   const [notifications, setNotifications] = useState([]);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -31,6 +30,8 @@ function App() {
   const [activeBucket, setActiveBucket] = useState(null);
   const [currentPrefix, setCurrentPrefix] = useState(''); // State untuk Virtual Folder
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [usage, setUsage] = useState(null);
+  const benchmarkRequestRef = useRef(null); // 🆕 REFERENSI KHUSUS UNTUK BENCHMARK
   // Cari baris uploadProgress dan ganti/tambah ini:
   const [uploads, setUploads] = useState({}); // { fileName: progress }
   // Di dalam function App()
@@ -375,7 +376,7 @@ function App() {
         if (!inputValue || inputValue === targetData.filename.replace(currentPrefix, '')) {
           return closeDialog(); // Tidak ada perubahan, tutup saja
         }
-        let finalName = inputValue; 
+        let finalName = inputValue;
 
         if (!inputValue.startsWith(currentPrefix)) {
           finalName = inputValue;
@@ -602,19 +603,89 @@ function App() {
   //     alert("Failed to start upload. Please try again.");
   //   }
   // };
+  // const handleUpload = async (filesToUpload) => {
+  //   const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+
+  //   // Proses semua fail secara paralel
+  //   const uploadPromises = Array.from(filesToUpload).map(async (file) => {
+  //     const formData = new FormData();
+  //     formData.append('file', file); // Hanya file yang masuk ke body/Busboy
+
+  //     return new Promise((resolve, reject) => {
+  //       const xhr = new XMLHttpRequest();
+  //       xhr.open('POST', `${API_BASE}/api/v1/vault/files`);
+
+  //       // --- HEADER KEAMANAN DAN METADATA (YANG SEBELUMNYA HILANG) ---
+  //       xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+  //       xhr.setRequestHeader('x-bucket-uuid', activeBucket.uuid);
+  //       if (currentPrefix) {
+  //         xhr.setRequestHeader('x-file-prefix', currentPrefix);
+  //       }
+
+  //       xhr.upload.onprogress = (event) => {
+  //         if (event.lengthComputable) {
+  //           const percent = Math.round((event.loaded / event.total) * 100);
+  //           // Update progress spesifik fail ini
+  //           setUploads(prev => ({ ...prev, [file.name]: percent }));
+  //         }
+  //       };
+
+  //       xhr.onload = () => {
+  //         if (xhr.status === 200 || xhr.status === 201) {
+  //           // Hapus dari daftar progress UI dengan jeda kecil agar user lihat angka 100%
+  //           setTimeout(() => {
+  //             setUploads(prev => {
+  //               const next = { ...prev };
+  //               delete next[file.name];
+  //               return next;
+  //             });
+  //           }, 500);
+  //           resolve();
+  //         } else {
+  //           // Tangkap pesan error dari backend dengan lebih rapi
+  //           try {
+  //             const errResponse = JSON.parse(xhr.responseText);
+  //             reject(new Error(errResponse.error || errResponse.message || "Upload Failed"));
+  //           } catch (e) {
+  //             reject(new Error(`Server Error (${xhr.status} ${e})`));
+  //           }
+  //         }
+  //       };
+
+  //       xhr.onerror = () => reject(new Error("Network Error: Could not reach the Gateway."));
+  //       xhr.send(formData);
+  //     });
+  //   });
+
+  //   try {
+  //     // Tunggu semua proses upload paralel selesai
+  //     await Promise.all(uploadPromises);
+  //     fetchFiles(activeBucket.uuid);
+  //     fetchUsage();
+  //   } catch (err) {
+  //     setDialog({ open: true, type: 'ALERT', title: 'Upload Failed', message: err.message });
+  //     // Hapus progress dari layar jika error
+  //     setUploads({});
+  //   }
+
+  //   // Bersihkan input file agar file yang sama bisa diupload ulang jika perlu
+  //   if (fileInputRef.current) fileInputRef.current.value = '';
+  // };
   const handleUpload = async (filesToUpload) => {
     const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
 
     // Proses semua fail secara paralel
     const uploadPromises = Array.from(filesToUpload).map(async (file) => {
       const formData = new FormData();
-      formData.append('file', file); // Hanya file yang masuk ke body/Busboy
+      formData.append('file', file);
 
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', `${API_BASE}/api/v1/vault/files`);
 
-        // --- HEADER KEAMANAN DAN METADATA (YANG SEBELUMNYA HILANG) ---
+        // --- 1. SIMPAN XHR KE DALAM REFERENSI ---
+        activeRequests.current.set(file.name, xhr);
+
+        xhr.open('POST', `${API_BASE}/api/v1/vault/files`);
         xhr.setRequestHeader('Authorization', `Bearer ${token}`);
         xhr.setRequestHeader('x-bucket-uuid', activeBucket.uuid);
         if (currentPrefix) {
@@ -624,14 +695,15 @@ function App() {
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable) {
             const percent = Math.round((event.loaded / event.total) * 100);
-            // Update progress spesifik fail ini
             setUploads(prev => ({ ...prev, [file.name]: percent }));
           }
         };
 
         xhr.onload = () => {
+          // --- 2. HAPUS REFERENSI JIKA SELESAI ---
+          activeRequests.current.delete(file.name);
+
           if (xhr.status === 200 || xhr.status === 201) {
-            // Hapus dari daftar progress UI dengan jeda kecil agar user lihat angka 100%
             setTimeout(() => {
               setUploads(prev => {
                 const next = { ...prev };
@@ -641,7 +713,6 @@ function App() {
             }, 500);
             resolve();
           } else {
-            // Tangkap pesan error dari backend dengan lebih rapi
             try {
               const errResponse = JSON.parse(xhr.responseText);
               reject(new Error(errResponse.error || errResponse.message || "Upload Failed"));
@@ -651,24 +722,54 @@ function App() {
           }
         };
 
-        xhr.onerror = () => reject(new Error("Network Error: Could not reach the Gateway."));
+        // --- 3. TANGANI EVENT ABORT ---
+        xhr.onabort = () => {
+          activeRequests.current.delete(file.name);
+          reject(new Error("ABORTED_BY_USER")); // Error khusus agar tidak memicu popup Alert biasa
+        };
+
+        xhr.onerror = () => {
+          activeRequests.current.delete(file.name);
+          reject(new Error("Network Error: Could not reach the Gateway."));
+        };
+
         xhr.send(formData);
       });
     });
 
     try {
-      // Tunggu semua proses upload paralel selesai
       await Promise.all(uploadPromises);
       fetchFiles(activeBucket.uuid);
       fetchUsage();
     } catch (err) {
-      setDialog({ open: true, type: 'ALERT', title: 'Upload Failed', message: err.message });
-      // Hapus progress dari layar jika error
+      // Abaikan popup error jika pembatalan sengaja dilakukan oleh pengguna
+      if (err.message !== "ABORTED_BY_USER") {
+        setDialog({ open: true, type: 'ALERT', title: 'Upload Failed', message: err.message });
+      }
       setUploads({});
     }
 
-    // Bersihkan input file agar file yang sama bisa diupload ulang jika perlu
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+  const handleAbortSingle = (fileName) => {
+    const xhr = activeRequests.current.get(fileName);
+    if (xhr) {
+      xhr.abort(); // Memutus koneksi TCP ke Gateway seketika
+      // Hapus dari UI progress bar
+      setUploads(prev => {
+        const next = { ...prev };
+        delete next[fileName];
+        return next;
+      });
+    }
+  };
+  const handleAbortBenchmark = () => {
+    if (benchmarkRequestRef.current) {
+      benchmarkRequestRef.current.abort(); // Memutus koneksi TCP benchmark 1GB
+      benchmarkRequestRef.current = null;
+      setUploadProgress(null); // Sembunyikan progress bar dari layar
+      console.log("Sinyal Abort dikirim untuk menghentikan Benchmark!");
+    }
   };
   const downloadFile = async (uuid, fileName, versionNum = null) => {
     try {
@@ -909,9 +1010,9 @@ function App() {
 
       xhr.onabort = () => {
         console.warn("XHR Aborted");
-        setUploadProgress(null); // Menghapus progres bar dari layar
+        setUploadProgress(null);
+        benchmarkRequestRef.current = null;
       };
-
       xhr.send(dummyPayload);
 
     } catch (err) {
@@ -969,9 +1070,17 @@ function App() {
               <h4 style={{ margin: '0 0 10px 0', color: 'white' }}>Uploading {Object.keys(uploads).length} files...</h4>
               {Object.entries(uploads).map(([name, progress]) => (
                 <div key={name} className="upload-item" style={{ marginBottom: '10px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '4px' }}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '220px' }}>{name}</span>
-                    <span>{progress}%</span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.8rem', marginBottom: '4px' }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '200px' }}>{name}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <span>{progress}%</span>
+                      <button
+                        onClick={() => handleAbortSingle(name)}
+                        title="Batalkan Unggahan"
+                        style={{ background: '#ef4444', color: 'white', border: 'none', borderRadius: '40%', width: '18px', height: '18px', fontSize: '0.6rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold' }}>
+                        ✕
+                      </button>
+                    </div>
                   </div>
                   <div style={{ width: '100%', background: '#374151', borderRadius: '4px', height: '6px', overflow: 'hidden' }}>
                     <div style={{ width: `${progress}%`, background: progress === 100 ? '#10b981' : '#3b82f6', height: '100%', transition: 'width 0.3s' }}></div>
@@ -984,9 +1093,18 @@ function App() {
           {/* 2. TAMPILAN UNTUK SINGLE UPLOAD / BENCHMARK */}
           {uploadProgress && (
             <div style={{ marginTop: Object.keys(uploads).length > 0 ? '15px' : '0', paddingTop: Object.keys(uploads).length > 0 ? '15px' : '0', borderTop: Object.keys(uploads).length > 0 ? '1px solid #444' : 'none' }}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: '10px' }}>
-                <span style={{ fontSize: '1.2rem', marginRight: '10px' }}>⚙️</span>
-                <h4 style={{ margin: '0', fontSize: '1rem', fontWeight: '600', color: 'white' }}>System Process</h4>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center' }}>
+                  <span style={{ fontSize: '1.2rem', marginRight: '10px' }}>⚙️</span>
+                  <h4 style={{ margin: '0', fontSize: '1rem', fontWeight: '600', color: 'white' }}>System Process</h4>
+                </div>
+
+                <button
+                  onClick={handleAbortBenchmark}
+                  title="Batalkan Benchmark"
+                  style={{ background: '#ef4444', color: 'white', border: 'none', borderRadius: '50%', width: '22px', height: '22px', fontSize: '0.7rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold' }}>
+                  ✕
+                </button>
               </div>
               <p style={{ margin: '0 0 10px 0', fontSize: '0.85rem', color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={uploadProgress.filename}>
                 {uploadProgress.filename}

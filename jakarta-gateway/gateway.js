@@ -345,7 +345,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
     if (!contentType || !contentType.includes('multipart/form-data')) return res.status(400).json({ error: "Invalid Request" });
     if (contentLength && parseInt(contentLength) > MAX_SIZE) return res.status(413).json({ error: "File Too Large" });
 
-    const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 } });
+    const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 }, highWaterMark: 16 * 1024 });
     const userId = req.auth.payload.sub;
 
     const bucketUuid = req.headers['x-bucket-uuid'];
@@ -362,7 +362,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
         isProcessing = true;
         const { filename, mimeType: headerMime } = info;
         const fullVirtualFilename = folderPrefix + filename;
-        const pass = new PassThrough();
+        const pass = new PassThrough({ highWaterMark: 16 * 1024 });
         file.pipe(pass);
         file.on('end', () => {
             pass.end(); // INI PENTING: Memberi sinyal EOF ke Spoke
@@ -385,10 +385,43 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
         const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
         const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
         const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
-
+        // console.log(limit, info.size)
+        let uploadedBytes = 0;
+        let dynamicLimitReached = false;
         if (info.size > limit) { // Pastikan busboy mengirim info size
             return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
         }
+        file.on('data', (chunk) => {
+            uploadedBytes += chunk.length;
+
+            // Jika ukuran melewati batas
+            if (uploadedBytes > limit && !dynamicLimitReached) {
+                dynamicLimitReached = true;
+
+                console.warn(`[GATEWAY] Ditolak: ${filename} melewati limit ${limit / 1024 / 1024}MB.`);
+
+                file.resume();
+
+                pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+                if (!res.headersSent) {
+                    return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
+                }
+                return;
+            }
+            const bufferPenuh = !pass.write(chunk);
+            if (bufferPenuh) {
+                // Jika Spoke/VPN lambat, paksa browser klien berhenti mengirim data dulu!
+                file.pause(); 
+            }
+            
+        });
+        pass.on('drain', () => {
+            file.resume(); 
+        });
+
+        file.on('end', () => {
+            pass.end(); // Akhiri pipa jika semua data sudah mengalir aman
+        });
 
         // console.log(`[DEBUG] Filename: ${info.filename}`);
         // console.log(`[DEBUG] Header MIME: ${info.mimeType}`);
@@ -466,6 +499,8 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
                 file.resume();
                 if (err.name === 'AbortError') {
                     console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
+                } else if (err.message !== "DYNAMIC_LIMIT_EXCEEDED") {
+                    console.error("[UPLOAD ERROR]", err.message);
                 }
                 console.error("[UPLOAD ERROR]", err.message);
                 res.status(500).json({ error: "Gateway stream interrupted.", error_detail: err.message });
@@ -479,6 +514,9 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
         }
     });
     req.pipe(busboy);
+    busboy.on('drain', () => {
+        req.resume();
+    });
 });
 
 apiRouter.get('/vault/files/:uuid/versions', authorizeVault('READ'), (req, res) => {
