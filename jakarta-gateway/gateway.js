@@ -748,7 +748,7 @@ busboy.on('file', async (name, file, info) => {
     file.on('data', (chunk) => {
         if (dynamicLimitReached) return;
         uploadedBytes += chunk.length;
-        console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
+        // console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
 
         if (uploadedBytes > limit) {
             dynamicLimitReached = true;

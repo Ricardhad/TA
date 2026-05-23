@@ -1021,14 +1021,14 @@ function App() {
   //     setUploadProgress(null);
   //   }
   // };
-const runNetworkBenchmark = async () => {
+  const runNetworkBenchmark = async () => {
     const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
-    
+
     // Total target: 1 GB (1024 MB)
-    const targetSize = 1024 * 1024 * 1024; 
-    
-    setUploadProgress({ 
-      filename: "Executing 1GB Zero-Trust Network Stress Test...", 
+    const targetSize = 1024 * 1024 * 1024;
+
+    setUploadProgress({
+      filename: "Executing 1GB Zero-Trust Network Stress Test...",
       percent: 0,
       loaded: 0,
       total: targetSize
@@ -1037,7 +1037,7 @@ const runNetworkBenchmark = async () => {
     // Alokasikan objek Blob 1 GB tiruan di sisi browser
     // Blob tidak memakan RAM fisik browser karena hanya berupa pointer referensi data kosong
     const dummyBlob = new Blob([new Uint8Array(targetSize)], { type: 'application/octet-stream' });
-    
+
     const startTime = performance.now();
 
     const xhr = new XMLHttpRequest();
@@ -1076,8 +1076,8 @@ const runNetworkBenchmark = async () => {
 
           const endTime = performance.now();
           const durationInSeconds = (endTime - startTime) / 1000;
-          
-          const sentMB = (targetSize / (1024 * 1024)).toFixed(0); 
+
+          const sentMB = (targetSize / (1024 * 1024)).toFixed(0);
           const receivedBytes = responseData.size || responseData.spoke_received_bytes || targetSize;
           const receivedMB = (receivedBytes / (1024 * 1024)).toFixed(0);
 
@@ -1673,28 +1673,46 @@ const runNetworkBenchmark = async () => {
                 overflow: 'hidden' // Penting agar sudut melengkung tetap terlihat
               }}>
                 {/* PANEL KIRI (PRATILIK) */}
-                <div style={{ flex: '2 1 300px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb' }}>
+                <div style={{ flex: '2 1 300px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #e5e7eb', padding: '20px', backgroundColor: '#f9fafb', overflow: 'hidden' }}>
                   {previewData.isLoading ? (
                     <div className="loading">Decrypting Stream...</div>
-                  ) : previewData.url && isPreviewable(inspectorModal.file.mime_type) ? (
-                    <iframe src={previewData.url} style={{ width: '100%', height: '100%', border: 'none', background: 'white', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }} />
                   ) : previewData.url ? (
-                    <div style={{ textAlign: 'center', color: '#374151' }}>
-                      <span style={{ fontSize: '4rem', display: 'block', marginBottom: '15px' }}>🔒</span>
-                      <h3 style={{ margin: '0 0 15px 0' }}>No visual preview available</h3>
-                      <button onClick={() => downloadFile(inspectorModal.file.uuid, inspectorModal.file.filename, previewData.versionNum)} style={{ backgroundColor: '#3b82f6', color: 'white', fontWeight: 'bold' }}>
-                        Download Securely
-                      </button>
-                    </div>
+
+                    /* 1. LOGIKA VIDEO */
+                    inspectorModal.file.mime_type.startsWith('video/') ? (
+                      <video controls src={previewData.url} style={{ width: '100%', borderRadius: '8px' }} />
+                    )
+
+                      /* 2. LOGIKA GAMBAR (DENGAN ZOOM CSS) */
+                      : inspectorModal.file.mime_type.startsWith('image/') ? (
+                        <div style={{ width: '100%', height: '100%', overflow: 'auto' }}>
+                          <img src={previewData.url} style={{ width: '100%', cursor: 'zoom-in', transition: 'transform 0.2s' }}
+                            onMouseOver={(e) => e.target.style.transform = 'scale(1.2)'}
+                            onMouseOut={(e) => e.target.style.transform = 'scale(1)'} />
+                        </div>
+                      )
+
+                        /* 3. LOGIKA PDF/TEXT (IFRAME) */
+                        : isPreviewable(inspectorModal.file.mime_type) ? (
+                          <iframe src={previewData.url} style={{ width: '100%', height: '100%', border: 'none', background: 'white' }} />
+                        )
+
+                          /* 4. FALLBACK OFFICE (PPT/EXCEL) */
+                          : (
+                            <div style={{ textAlign: 'center' }}>
+                              <p>Preview tidak tersedia untuk format ini. Silakan download untuk melihat.</p>
+                              <button onClick={() => downloadFile(inspectorModal.file.uuid, inspectorModal.file.filename, previewData.versionNum)}
+                                style={{ backgroundColor: '#3b82f6', color: 'white', padding: '10px' }}>Download File</button>
+                            </div>
+                          )
+
                   ) : (
-                    <div style={{ flex: '1 1 300px', textAlign: 'center', color: '#6b7280' }}>
+                    <div style={{ textAlign: 'center', color: '#6b7280' }}>
                       <span style={{ fontSize: '4rem', display: 'block', marginBottom: '15px' }}>👁️</span>
-                      <h3 style={{ margin: '0 0 10px 0' }}>Preview Hidden</h3>
-                      <p style={{ margin: 0, fontSize: '0.9rem', color: 'black' }}>Select a version and click "Preview" to load the encrypted stream.</p>
+                      <p>Klik "Preview" untuk memuat stream.</p>
                     </div>
                   )}
                 </div>
-
                 {/* PANEL KANAN (DAFTAR VERSI) */}
                 <div style={{
                   flex: 1,

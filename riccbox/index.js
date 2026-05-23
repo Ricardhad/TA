@@ -560,6 +560,10 @@ app.post('/internal/files/test/upload', (req, res) => {
 const server = app.listen(PORT, SPOKE_IP, () => {
     console.log(`Surabaya Spoke Active on port ${PORT} at IP ${SPOKE_IP}`);
 });
+// const server = app.listen(PORT,'0.0.0.0', () => {
+//     console.log(`Surabaya Spoke Active on port ${PORT} at IP ${SPOKE_IP}`);UTC Arrival Time: May 23, 2026 14:30:39.757472600 UTC
+    
+// });
 
 const SERVER_TIMEOUT = 30 * 60 * 1000;
 server.setTimeout(SERVER_TIMEOUT);
