@@ -15,27 +15,44 @@ import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 dotenv.config();
 
 function createVideoSanitizerProcess() {
-    // 2. Ganti kata 'ffmpeg' menjadi ffmpegInstaller.path
     const ffmpeg = spawn(ffmpegInstaller.path, [
+        '-hide_banner',
+        '-loglevel', 'error',
+
+        // 🚨 CONFIGURASI KESABARAN MAKSIMAL
+        '-probesize', '500M',
+        '-analyzeduration', '500M',
+
+        // Memaksa FFmpeg jangan error kalau ada data sampah/tidak lengkap
+        '-err_detect', 'ignore_err',
+        '-fflags', '+genpts+discardcorrupt+igndts',
+
+        // Input tanpa format paksaan agar dia auto-detect
         '-i', 'pipe:0',
+
         '-map_metadata', '-1',
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',    
+        '-preset', 'ultrafast',
         '-tune', 'zerolatency',
         '-c:a', 'aac',
+
+        // Output tetap mp4, tapi dengan flag agar metadata di awal
         '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov',
+        '-movflags', 'frag_keyframe+empty_moov+faststart',
         'pipe:1'
     ]);
 
+    // 🚨 WAJIB: Tangkap error agar tidak mati diam-diam
     ffmpeg.stderr.on('data', (data) => {
-        // Biarkan kosong, atau uncomment untuk melihat proses render video
-        // console.log(`[FFMPEG]: ${data.toString()}`); 
+        console.error(`[FFMPEG ERROR]: ${data.toString()}`);
+    });
+
+    ffmpeg.on('error', (err) => {
+        console.error(`[FFMPEG FATAL]: ${err.message}`);
     });
 
     return ffmpeg;
 }
-
 const calculateFileHash = (filePath) => {
     return new Promise((resolve, reject) => {
         const hash = crypto.createHash('sha256');
@@ -148,53 +165,129 @@ app.use((err, req, res, next) => {
 // ==========================================
 // 1. RUTE UNGGAH DAN ENKRIPSI + HASING
 // ==========================================
+// app.post('/internal/files', async (req, res) => {
+//     const originalName = req.headers['x-original-name'] || 'uploaded-file';
+//     const isVideo = ['.mp4', '.mov', '.webm'].some(ext => originalName.toLowerCase().endsWith(ext));
+
+//     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
+//     const vaultPath = path.join(STORAGE_DIR, safeName);
+
+//     console.log(`[SPOKE] Menerima request untuk: ${originalName} (Video: ${isVideo})`);
+
+//     const iv = crypto.randomBytes(12);
+//     const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+//     const writeStream = fs.createWriteStream(vaultPath);
+
+//     // Tulis IV di awal file
+//     writeStream.write(iv);
+
+//     try {
+//         if (isVideo) {
+//             console.log("[SPOKE] Menjalankan Video Sanitizer...");
+//             const sanitizer = createVideoSanitizerProcess();
+
+//             // 1. Tangani error FFmpeg agar tidak silent
+//             const ffmpegError = new Promise((_, reject) => {
+//                 sanitizer.on('error', (err) => reject(new Error(`FFmpeg Process Error: ${err.message}`)));
+//                 sanitizer.stderr.on('data', (data) => {
+//                     const msg = data.toString();
+//                     if (msg.includes('Error')) reject(new Error(`FFmpeg: ${msg}`));
+//                 });
+//                 sanitizer.on('close', (code) => {
+//                     if (code !== 0) reject(new Error(`FFmpeg exited with code ${code}`));
+//                 });
+//             });
+
+//             // 2. Hubungkan Pipeline dengan benar
+//             // req -> sanitizer (stdin)
+//             // sanitizer (stdout) -> cipher -> writeStream
+//             await Promise.all([
+//                 pipeline(req, sanitizer.stdin).catch(e => {
+//                     // Abaikan EPIPE jika FFmpeg sudah mati duluan
+//                     if (e.code !== 'EPIPE') throw e;
+//                 }),
+//                 pipeline(sanitizer.stdout, cipher, writeStream),
+//                 ffmpegError
+//             ]);
+
+//             console.log("[SPOKE] Sanitasi dan enkripsi video 100% Selesai.");
+//         } else {
+//             await pipeline(req, cipher, writeStream);
+//         }
+
+//         // --- HANYA JIKA PIPELINE SUKSES TANPA ERROR ---
+//         const authTag = cipher.getAuthTag();
+//         fs.appendFileSync(vaultPath, authTag);
+
+//         const finalChecksum = await calculateFileHash(vaultPath);
+//         const stats = fs.statSync(vaultPath);
+
+//         res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
+
+//     } catch (err) {
+//         console.error(`[SPOKE ERROR] Pipeline Gagal: ${err.message}`);
+
+//         // 🚨 HAPUS FILE SAMPAH JIKA GAGAL
+//         if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+
+//         if (!res.headersSent) res.status(500).json({ error: "Storage or Encryption Failure" });
+//     }
+// });
 app.post('/internal/files', async (req, res) => {
     const originalName = req.headers['x-original-name'] || 'uploaded-file';
     const isVideo = ['.mp4', '.mov', '.webm'].some(ext => originalName.toLowerCase().endsWith(ext));
 
+    // 1. Tentukan path file sementara untuk proses sanitasi
+    const tempFilePath = path.join(STORAGE_DIR, `temp-${Date.now()}.tmp`);
     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
     const vaultPath = path.join(STORAGE_DIR, safeName);
 
-    console.log(`[SPOKE] Menerima request untuk: ${originalName} (Video: ${isVideo})`);
-
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
-    const writeStream = fs.createWriteStream(vaultPath);
-
-    // Tulis IV di awal file
-    writeStream.write(iv);
-
     try {
-        if (isVideo) {
-            console.log("[SPOKE] Menjalankan fungsi Video Sanitizer On-the-Fly...");
-            // 1. Panggil fungsi yang sudah kita perbarui
-            const sanitizer = createVideoSanitizerProcess();
-            // 2. Alirkan: Request -> Mulut Sanitizer (stdin)
-            pipeline(req, sanitizer.stdin).catch(err => console.error("Input Stream Error:", err));
+        // 2. Buffer file ke disk dulu sampai selesai (Ini menjamin FFmpeg punya data utuh)
+        await pipeline(req, fs.createWriteStream(tempFilePath));
+        console.log("[SPOKE] Upload selesai, memulai sanitasi...");
 
-            // 3. Alirkan: Muntahan Sanitizer (stdout) -> Cipher -> Disk
+        // 3. Konfigurasi Cipher
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+        const writeStream = fs.createWriteStream(vaultPath);
+        writeStream.write(iv);
+
+        if (isVideo) {
+            // Jalankan FFmpeg membaca dari file .tmp
+            const sanitizer = spawn(ffmpegInstaller.path, [
+                '-hide_banner', '-loglevel', 'error',
+                '-i', tempFilePath, // Baca dari file temp yang sudah utuh
+                '-map_metadata', '-1',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+                '-c:a', 'aac',
+                '-f', 'mp4',
+                '-movflags', '+faststart',
+                'pipe:1'
+            ]);
+
             await pipeline(sanitizer.stdout, cipher, writeStream);
         } else {
-            console.log("[SPOKE] Memulai enkripsi dokumen...");
-            // Jalur Normal: Langsung ke cipher
-            await pipeline(req, cipher, writeStream);
+            await pipeline(fs.createReadStream(tempFilePath), cipher, writeStream);
         }
 
-        // Tulis AuthTag di akhir
+        // Finalisasi
         const authTag = cipher.getAuthTag();
         fs.appendFileSync(vaultPath, authTag);
 
+        // 4. Cleanup
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+
         const finalChecksum = await calculateFileHash(vaultPath);
         const stats = fs.statSync(vaultPath);
-        console.log(`[SPOKE] Tersimpan: ${safeName} | Peak RAM RSS: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`);
-        console.log(`[SPOKE] Tersimpan: ${safeName} | Hash: ${finalChecksum}`);
 
         res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
 
     } catch (err) {
-        console.error(`[SPOKE ERROR] Pipeline gagal! RAM RSS saat putus: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`);
-        console.error("[SPOKE ERROR] Detail:", err.message);
-        if (!res.headersSent) res.status(500).json({ error: "Storage or Encryption Failure" });
+        console.error(`[SPOKE ERROR]: ${err.message}`);
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+        if (!res.headersSent) res.status(500).json({ error: "Processing Failed" });
     }
 });
 

@@ -18,6 +18,7 @@ import { Agent, setGlobalDispatcher } from 'undici';
 import { fileTypeFromStream } from 'file-type';
 import { PassThrough } from 'stream';
 import { fileTypeFromBuffer } from 'file-type';
+import http from 'http';
 
 const THIRTY_MINUTES = 30 * 60 * 1000;
 const customAgent = new Agent({
@@ -321,22 +322,209 @@ apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
         res.json(query.all(...params));
     } catch (err) { res.status(500).json({ error: "Database query failed" }); }
 });
+// menggunakan fetch
+// apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
+//     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
+//     const USER_QUOTA = 5 * 1024 * 1024 * 1024;
+//     const MAX_SIZE = 1 * 1024 * 1024 * 1024;
+//     const VIDEO_MAX_SIZE = 50 * 1024 * 1024;
+//     const DEFAULT_MAX_SIZE = 5 * 1024 * 1024;
 
+//     const contentType = req.headers['content-type'];
+//     const contentLength = req.headers['content-length'];
+//     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
+//     const controller = new AbortController();
+
+//     req.on('error', (err) => {
+//         console.warn(`[UPLOAD-GATEWAY] Stream Error: ${err.message}`);
+//         controller.abort();
+//     });
+//     req.on('aborted', () => {
+//         console.warn(`[UPLOAD-GATEWAY] User membatalkan unggahan.`);
+//         controller.abort();
+//     });
+
+//     if (!contentType || !contentType.includes('multipart/form-data')) return res.status(400).json({ error: "Invalid Request" });
+//     if (contentLength && parseInt(contentLength) > MAX_SIZE) return res.status(413).json({ error: "File Too Large" });
+
+//     // 🚨 STABILISASI HIGHWATERMARK PADA BUSBOY
+//     const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 }, highWaterMark: 16 * 1024 });
+//     const userId = req.auth.payload.sub;
+
+//     const bucketUuid = req.headers['x-bucket-uuid'];
+//     const folderPrefix = req.headers['x-file-prefix'] || '';
+//     const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
+
+//     if (!bucket) return res.status(404).json({ error: "Target bucket does not exist." });
+
+//     let isProcessing = false;
+//     let limitReached = false;
+
+//     busboy.on('file', async (name, file, info) => {
+//         if (isProcessing) return;
+//         isProcessing = true;
+
+//         const { filename, mimeType: headerMime } = info;
+//         const fullVirtualFilename = folderPrefix + filename;
+
+//         // 🚨 KUNCI MATI UKURAN PASSTHROUGH MAKSIMAL KECIL
+//         const pass = new PassThrough({ highWaterMark: 16 * 1024 });
+
+//         // Baca magic byte secara aman tanpa merusak rantai pipe utama
+//         const stream = file;
+//         const buffer = await new Promise((resolve, reject) => {
+//             const chunks = [];
+//             stream.once('data', (chunk) => {
+//                 chunks.push(chunk);
+//                 resolve(Buffer.concat(chunks));
+//             });
+//             stream.on('error', reject);
+//         });
+//         pass.write(buffer);
+
+//         const type = await fileTypeFromBuffer(buffer);
+//         const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, buffer);
+//         const lastDotIndex = filename.lastIndexOf('.');
+//         const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
+//         const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
+//         const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
+
+//         let uploadedBytes = buffer.length;
+//         let dynamicLimitReached = false;
+
+//         if (info.size > limit) {
+//             return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
+//         }
+
+//         // --- SISTEM MANAJEMEN BACKPRESSURE OTOMATIS DAN AKURAT ---
+//         // Alirkan data dari Busboy ke PassThrough dengan pengawasan
+//         file.pipe(pass);
+
+//         file.on('data', (chunk) => {
+//             uploadedBytes += chunk.length;
+
+//             if (uploadedBytes > limit && !dynamicLimitReached) {
+//                 dynamicLimitReached = true;
+//                 console.warn(`[GATEWAY] Ditolak: ${filename} melewati limit ${limit / 1024 / 1024}MB.`);
+
+//                 file.unpipe(pass); // Putus hubungan aliran secara fisik
+//                 file.resume();     // Buang sisa data dari memori browser
+//                 pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+
+//                 if (!res.headersSent) {
+//                     res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
+//                 }
+//             }
+//         });
+
+//         file.on('limit', () => { limitReached = true; });
+
+//         // Eksekusi pengiriman ke Spoke
+//         (async () => {
+//             try {
+//                 if (isSpoofed) {
+//                     file.resume();
+//                     if (!res.headersSent) return res.status(403).json({ error: "Security Violation" });
+//                     return;
+//                 }
+
+//                 const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
+//                 if ((usage.total_used || 0) >= activeLimit) {
+//                     file.resume();
+//                     if (!res.headersSent) return res.status(403).json({ error: "Quota Exceeded" });
+//                     return;
+//                 }
+
+//                 const spokeResponse = await spokeFetch(`/internal/files`, {
+//                     method: 'POST',
+//                     body: pass,
+//                     duplex: 'half',
+//                     signal: controller.signal,
+//                     headers: {
+//                         'x-original-name': filename,
+//                         'content-type': headerMime
+//                     }
+//                 });
+
+//                 if (limitReached) {
+//                     if (!res.headersSent) return res.status(413).json({ error: "File Too Large" });
+//                     return;
+//                 }
+//                 if (!spokeResponse.ok) throw new Error(`Spoke rejected upload`);
+
+//                 const data = await spokeResponse.json();
+//                 const { physical_path, size, checksum } = data;
+
+//                 let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
+//                 if (!fileRecord) {
+//                     const uuid = randomUUID();
+//                     const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
+//                     fileRecord = { id: info.lastInsertRowid, uuid: uuid };
+//                 } else {
+//                     db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
+//                 }
+
+//                 let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+//                 while (versions.length >= 5) {
+//                     try {
+//                         await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
+//                         db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+//                         versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+//                     } catch (e) { console.error("Cleanup failed"); }
+//                 }
+
+//                 const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
+//                 const newVersion = (lastVersion.v || 0) + 1;
+//                 db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
+
+//                 if (!res.headersSent) {
+//                     res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
+//                 }
+//                 setImmediate(() => { req.destroy(); });
+//             } catch (err) {
+//                 file.resume();
+//                 if (err.name === 'AbortError') {
+//                     console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
+//                 } else if (err.message !== "DYNAMIC_LIMIT_EXCEEDED") {
+//                     console.error("[UPLOAD ERROR]", err.message);
+//                 }
+
+//                 if (!res.headersSent) {
+//                     res.status(500).json({ error: "Gateway stream interrupted.", error_detail: err.message });
+//                 }
+//             }
+//         })();
+//     });
+
+//     busboy.on('finish', () => {
+//         if (!isProcessing) {
+//             console.warn("[SECURITY ALERT] Request Multipart masuk tanpa menyertakan part file.");
+//             if (!res.headersSent) {
+//                 return res.status(400).json({ error: "Bad Request", message: "No file payload detected in multipart form data." });
+//             }
+//         }
+//     });
+
+//     req.pipe(busboy);
+// });
+// menggunakan http request 
 apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
     const USER_QUOTA = 5 * 1024 * 1024 * 1024;
     const MAX_SIZE = 1 * 1024 * 1024 * 1024;
-    const VIDEO_MAX_SIZE = 50 * 1024 * 1024; // 50 MB
-    const DEFAULT_MAX_SIZE = 5 * 1024 * 1024;  // 5 MB untuk dokumen
+    const VIDEO_MAX_SIZE = 50 * 1024 * 1024;
+    const DEFAULT_MAX_SIZE = 5 * 1024 * 1024;
+
     const contentType = req.headers['content-type'];
     const contentLength = req.headers['content-length'];
     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
     const controller = new AbortController();
-    // 2. Pasang pendengar jika koneksi klien (browser) terputus
+
     req.on('error', (err) => {
         console.warn(`[UPLOAD-GATEWAY] Stream Error: ${err.message}`);
         controller.abort();
     });
+
     req.on('aborted', () => {
         console.warn(`[UPLOAD-GATEWAY] User membatalkan unggahan.`);
         controller.abort();
@@ -356,167 +544,257 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
     let isProcessing = false;
     let limitReached = false;
+busboy.on('file', async (name, file, info) => {
+    if (isProcessing) return;
+    isProcessing = true;
+    console.log(`[UPLOAD] 1. File event fired: ${info.filename} (${info.mimeType})`);
 
-    busboy.on('file', async (name, file, info) => {
-        if (isProcessing) return;
-        isProcessing = true;
-        const { filename, mimeType: headerMime } = info;
-        const fullVirtualFilename = folderPrefix + filename;
-        const pass = new PassThrough({ highWaterMark: 16 * 1024 });
-        file.pipe(pass);
-        file.on('end', () => {
-            pass.end(); // INI PENTING: Memberi sinyal EOF ke Spoke
-        });
-        // 2. Gunakan 'file' untuk type check, dan 'pass    ' untuk upload ke Spoke
-        const stream = file;
-        const buffer = await new Promise((resolve, reject) => {
-            const chunks = [];
-            stream.once('data', (chunk) => {
-                chunks.push(chunk);
-                // Cukup baca header pertama
-                resolve(Buffer.concat(chunks));
-            });
-            stream.on('error', reject);
-        });
+    const { filename, mimeType: headerMime } = info;
+    const fullVirtualFilename = folderPrefix + filename;
 
-        const type = await fileTypeFromBuffer(buffer);
-        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, buffer);
-        const lastDotIndex = filename.lastIndexOf('.');
-        const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
-        const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
-        const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
-        // console.log(limit, info.size)
-        let uploadedBytes = 0;
-        let dynamicLimitReached = false;
-        if (info.size > limit) { // Pastikan busboy mengirim info size
-            return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
-        }
-        file.on('data', (chunk) => {
-            uploadedBytes += chunk.length;
-
-            // Jika ukuran melewati batas
-            if (uploadedBytes > limit && !dynamicLimitReached) {
-                dynamicLimitReached = true;
-
-                console.warn(`[GATEWAY] Ditolak: ${filename} melewati limit ${limit / 1024 / 1024}MB.`);
-
-                file.resume();
-
-                pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
-                if (!res.headersSent) {
-                    return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
-                }
-                return;
-            }
-            const bufferPenuh = !pass.write(chunk);
-            if (bufferPenuh) {
-                // Jika Spoke/VPN lambat, paksa browser klien berhenti mengirim data dulu!
-                file.pause(); 
-            }
-            
-        });
-        pass.on('drain', () => {
-            file.resume(); 
-        });
-
-        file.on('end', () => {
-            pass.end(); // Akhiri pipa jika semua data sudah mengalir aman
-        });
-
-        // console.log(`[DEBUG] Filename: ${info.filename}`);
-        // console.log(`[DEBUG] Header MIME: ${info.mimeType}`);
-        // console.log(`[DEBUG] Detected MIME (Magic Numbers): ${type ? type.mime : 'Unknown'}`);
-        // console.log(`[DEBUG] Is Spoofed: ${isSpoofed}`);
-        // console.log(`[DEBUG] Final MIME to use: ${finalMime}`);
-        // console.log(`[DEBUG] type: ${type ? JSON.stringify(type) : 'null'}`);
-        // const isShFile = (type && type.mime === 'application/x-sh') ||
-        //     (info.mimeType === 'application/x-sh');
-
-        // if (isShFile) {
-        //     console.warn(`[SECURITY] BLOCKED: File ${info.filename} adalah skrip shell!`);
-        //     // ... blokir file
-        //     return res.status(403).json({ error: "Security Violation: Shell scripts are not allowed." });
-        // }
-
-        file.on('limit', () => { limitReached = true; });
-        (async () => {
-            try {
-                if (isSpoofed) { file.resume(); return res.status(403).json({ error: "Security Violation" }); }
-                // const type = await fileTypeFromStream(file);
-
-                // if (type && type.mime === 'application/x-sh') {
-                //     file.resume(); // Buang file
-                //     return res.status(403).json({ error: "Security Violation: Content Mismatch" });
-                // }
-
-                const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
-                if ((usage.total_used || 0) >= activeLimit) {
-                    file.resume();
-                    return res.status(403).json({ error: "Quota Exceeded" });
-                }
-
-                const spokeResponse = await spokeFetch(`/internal/files`, {
-                    method: 'POST', body: pass
-                    , duplex: 'half',
-                    signal: controller.signal,
-                    headers: {
-                        'x-original-name': filename,
-                        'content-type': headerMime
-                    }
-                });
-
-                if (limitReached) return res.status(413).json({ error: "File Too Large" });
-                if (!spokeResponse.ok) throw new Error(`Spoke rejected upload`);
-
-                const data = await spokeResponse.json();
-                const { physical_path, size, checksum } = data;
-
-                let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
-                if (!fileRecord) {
-                    const uuid = randomUUID();
-                    const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
-                    fileRecord = { id: info.lastInsertRowid, uuid: uuid };
-                } else {
-                    db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
-                }
-
-                let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-                while (versions.length >= 5) {
-                    try {
-                        await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
-                        db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
-                        versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-                    } catch (e) { console.error("Cleanup failed"); }
-                }
-
-                const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
-                const newVersion = (lastVersion.v || 0) + 1;
-                db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
-
-                res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
-                setImmediate(() => { req.destroy(); });
-            } catch (err) {
-                file.resume();
-                if (err.name === 'AbortError') {
-                    console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
-                } else if (err.message !== "DYNAMIC_LIMIT_EXCEEDED") {
-                    console.error("[UPLOAD ERROR]", err.message);
-                }
-                console.error("[UPLOAD ERROR]", err.message);
-                res.status(500).json({ error: "Gateway stream interrupted.", error_detail: err.message });
-            }
-        })();
+    const firstChunk = await new Promise((resolve, reject) => {
+        const cleanup = () => {
+            file.removeListener('data', onData);
+            file.removeListener('end', onEnd);
+            file.removeListener('error', onError);
+        };
+        const onData = (chunk) => {
+            console.log(`[UPLOAD] 2. First chunk received: ${chunk.length} bytes`);
+            cleanup();
+            file.pause();
+            resolve(chunk);
+        };
+        const onEnd = () => {
+            console.log(`[UPLOAD] 2. File ended before first chunk (empty file?)`);
+            cleanup();
+            resolve(Buffer.alloc(0));
+        };
+        const onError = (err) => {
+            console.error(`[UPLOAD] 2. File stream error during sniff: ${err.message}`);
+            cleanup();
+            reject(err);
+        };
+        file.on('data', onData);
+        file.once('end', onEnd);
+        file.once('error', onError);
+        file.resume(); // ✅ THE MISSING LINE — busboy file streams start paused
     });
+
+    console.log(`[UPLOAD] 3. MIME sniffing...`);
+    const type = await fileTypeFromBuffer(firstChunk);
+    const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, firstChunk);
+    console.log(`[UPLOAD] 4. MIME result: finalMime=${finalMime}, isSpoofed=${isSpoofed}`);
+
+    const lastDotIndex = filename.lastIndexOf('.');
+    const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
+    const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
+    const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
+
+    if (isSpoofed) {
+        file.resume();
+        if (!res.headersSent) return res.status(403).json({ error: "Security Violation" });
+        return;
+    }
+
+    const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
+    if ((usage.total_used || 0) >= activeLimit) {
+        file.resume();
+        if (!res.headersSent) return res.status(403).json({ error: "Quota Exceeded" });
+        return;
+    }
+
+    console.log(`[UPLOAD] 5. Getting spoke token...`);
+    const token = await getSpokeToken();
+    console.log(`[UPLOAD] 6. Spoke token acquired, opening request...`);
+
+    const pass = new PassThrough({ highWaterMark: 16 * 1024 });
+    const options = {
+        hostname: LOCAL_SPOKE_IP,
+        port: LOCAL_PORT,
+        path: '/internal/files',
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+            'x-original-name': filename,
+            'content-type': headerMime,
+            'Authorization': `Bearer ${token}`
+        }
+    };
+
+
+
+        const spokeReq = http.request(options, (spokeRes) => {
+
+            let responseData = '';
+
+            spokeRes.on('data', (chunk) => { responseData += chunk; });
+
+  
+
+            spokeRes.on('end', async () => {
+
+                if (limitReached) {
+
+                    if (!res.headersSent) return res.status(413).json({ error: "File Too Large" });
+
+                    return;
+
+                }
+
+                if (spokeRes.statusCode !== 200 && spokeRes.statusCode !== 201) {
+
+                    if (!res.headersSent) return res.status(spokeRes.statusCode).json({ error: "Spoke rejected upload" });
+
+                    return;
+
+                }
+
+  
+
+                try {
+
+                    const data = JSON.parse(responseData);
+
+                    const { physical_path, size, checksum } = data;
+
+  
+
+                    // DATABASE SQLITE EXECUTION
+
+                    let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
+
+                    if (!fileRecord) {
+
+                        const uuid = randomUUID();
+
+                        const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
+
+                        fileRecord = { id: info.lastInsertRowid, uuid: uuid };
+
+                    } else {
+
+                        db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
+
+                    }
+
+  
+
+                    let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+
+                    while (versions.length >= 5) {
+
+                        try {
+
+                            await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
+
+                            db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+
+                            versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+
+                        } catch (e) { console.error("Cleanup failed"); }
+
+                    }
+
+  
+
+                    const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
+
+                    const newVersion = (lastVersion.v || 0) + 1;
+
+                    db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
+
+  
+
+                    if (!res.headersSent) res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
+
+                    setImmediate(() => { req.destroy(); });
+
+  
+
+                } catch (dbErr) {
+
+                    console.error("[DATABASE ERROR]", dbErr.message);
+
+                    if (!res.headersSent) res.status(500).json({ error: "Failed to save file metadata." });
+
+                }
+
+            });
+
+        });
+    spokeReq.setTimeout(30_000, () => {
+        console.error('[UPLOAD] Spoke timeout after 30s');
+        spokeReq.destroy(new Error('SPOKE_TIMEOUT'));
+    });
+
+    spokeReq.on('error', (err) => {
+        console.error(`[UPLOAD] spokeReq error: ${err.message}`);
+        if (err.name === 'AbortError') {
+            console.warn("[UPLOAD] Aborted by user.");
+        } else if (err.message === 'SPOKE_TIMEOUT') {
+            if (!res.headersSent) res.status(504).json({ error: "Spoke did not respond in time." });
+        } else {
+            if (!res.headersSent) res.status(500).json({ error: "Gateway stream interrupted." });
+        }
+    });
+
+    pass.pipe(spokeReq);
+    pass.write(firstChunk);
+    console.log(`[UPLOAD] 7. Pipeline open, streaming to spoke...`);
+
+    let uploadedBytes = firstChunk.length;
+    let dynamicLimitReached = false;
+
+    file.on('data', (chunk) => {
+        if (dynamicLimitReached) return;
+        uploadedBytes += chunk.length;
+        console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
+
+        if (uploadedBytes > limit) {
+            dynamicLimitReached = true;
+            console.warn(`[UPLOAD] Dynamic limit hit at ${uploadedBytes} bytes`);
+            file.removeAllListeners('data');
+            file.removeAllListeners('end');
+            file.removeAllListeners('error');
+            file.resume();
+            pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+            spokeReq.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+            if (!res.headersSent) res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext || 'file'} adalah ${limit / 1024 / 1024}MB` });
+            return;
+        }
+
+        if (!pass.write(chunk)) {
+            file.pause();
+            pass.once('drain', () => { if (!dynamicLimitReached) file.resume(); });
+        }
+    });
+
+    file.once('end', () => {
+        console.log(`[UPLOAD] 8. File stream ended. Total: ${(uploadedBytes / 1024).toFixed(1)} KB — ending pass`);
+        if (!dynamicLimitReached) pass.end();
+    });
+
+    file.once('error', (err) => {
+        console.error(`[FILE STREAM ERROR] ${err.message}`);
+        pass.destroy(err);
+        if (!res.headersSent) res.status(500).json({ error: "File read error." });
+    });
+
+    file.on('limit', () => { limitReached = true; });
+
+    file.resume(); // resume from post-sniff pause
+});
     busboy.on('finish', () => {
+
         if (!isProcessing) {
             console.warn("[SECURITY ALERT] Request Multipart masuk tanpa menyertakan part file.");
-            return res.status(400).json({ error: "Bad Request", message: "No file payload detected in multipart form data." });
+            if (!res.headersSent) {
+                return res.status(400).json({ error: "Bad Request", message: "No file payload detected in multipart form data." });
+            }
         }
     });
+
     req.pipe(busboy);
-    busboy.on('drain', () => {
-        req.resume();
-    });
 });
 
 apiRouter.get('/vault/files/:uuid/versions', authorizeVault('READ'), (req, res) => {
@@ -635,8 +913,13 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
             }
 
             const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, { method: 'DELETE' });
-            if (!spokeResponse.ok) throw new Error("Spoke refused to delete physically.");
-
+            if (!spokeResponse.ok) {
+                if (spokeResponse.status === 404) {
+                    console.warn(`[PURGE] File fisik tidak ditemukan di Spoke (Aman, mungkin diblokir sebelum terkirim).`);
+                } else {
+                    throw new Error(`Spoke refused to delete physically. Status: ${spokeResponse.status}`);
+                }
+            }
             db.prepare('DELETE FROM versions WHERE id = ?').run(fileInfo.v_id);
             return res.status(200).json({ status: `Version ${requestedVersion} purged.` });
         }
@@ -951,54 +1234,105 @@ apiRouter.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) 
         res.json({ message: "Sync Complete", report });
     } catch (err) { res.status(500).json({ error: "Sync failed." }); }
 });
-apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
+// apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
+//     const controller = new AbortController();
+//     req.setTimeout(0);
 
-    // 1. BUAT "TOMBOL PANIK" (AbortController)
-    const controller = new AbortController();
+//     req.on('error', (err) => {
+//         console.warn(`[GATEWAY SAFE-CATCH] Stream Error: ${err.message}`);
+//         controller.abort();
+//         pass.destroy(new Error("client stream error"));
+//     });
 
-    req.on('error', (err) => {
-        console.warn(`[GATEWAY SAFE-CATCH] Stream Error: ${err.message}`);
-        controller.abort(); // 2. TEKAN TOMBOL PANIK UNTUK MEMUTUS FETCH KE SPOKE
-    });
+//     const pass = new PassThrough({ highWaterMark: 16 * 1024 });
 
-    req.on('aborted', () => {
-        console.warn(`[GATEWAY SAFE-CATCH] Klien membatalkan unggahan secara sepihak.`);
-        controller.abort(); // 2. TEKAN TOMBOL PANIK UNTUK MEMUTUS FETCH KE SPOKE
-    });
+//     req.on('aborted', () => {
+//         console.warn(`[GATEWAY SAFE-CATCH] Klien membatalkan unggahan secara sepihak.`);
+//         controller.abort();
+//         pass.destroy(new Error("client aborted"));
+//     });
 
-    try {
-        const spokeResponse = await spokeFetch(`/internal/files/test/upload`, {
-            method: 'POST',
-            body: req,
-            duplex: 'half',
-            signal: controller.signal, // 3. SAMBUNGKAN TOMBOL PANIK KE FETCH
-            headers: {
-                'Content-Type': req.headers['content-type'] || 'application/octet-stream'
-            }
-        });
+//     // 🚨 1. DEKLARASI BATAS MAKSIMAL TRANSFER (1 GB + Toleransi 50 MB)
+//     const MAX_BENCHMARK_SIZE = (1024 * 1024 * 1024) + (50 * 1024 * 1024);
+//     let uploadedBytes = 0;
+//     let limitReached = false;
 
-        const data = await spokeResponse.json();
+//     req.on('data', (chunk) => {
+//         uploadedBytes += chunk.length;
 
-        res.json({
-            message: "Benchmark Complete",
-            spoke_received_gb: data.size_gb,
-            note: data.note || "Stress test successful"
-        });
-        req.destroy();
-    } catch (err) {
-        // 4. TANGANI GALAT JIKA ABORT DILAKUKAN
-        if (err.name === 'AbortError') {
-            console.warn("[GATEWAY] Fetch ke Spoke dibatalkan karena klien terputus.");
-        } else {
-            console.error("[GATEWAY] Benchmark route error:", err.message);
-        }
+//         if (uploadedBytes > MAX_BENCHMARK_SIZE && !limitReached) {
+//             limitReached = true;
+//             console.warn(`[SECURITY] Transfer dihentikan! Benchmark melebihi batas aman 1 GB.`);
 
-        // Pastikan kita hanya membalas jika header belum terkirim
-        if (!res.headersSent) {
-            res.status(500).json({ error: "Stream Interrupted: " + err.message });
-        }
-    }
-});
+//             req.pause(); // Rem paksa
+//             req.destroy(new Error("PAYLOAD_TOO_LARGE")); // Tebas hulu (koneksi React)
+//             pass.destroy(new Error("PAYLOAD_TOO_LARGE")); // Tebas hilir (pipa internal)
+
+//             if (!res.headersSent) {
+//                 return res.status(413).json({ error: "Benchmark melebihi kapasitas maksimal (1 GB)." });
+//             }
+//             return;
+//         }
+//         const currentRAM_MB = process.memoryUsage().rss / (1024 * 1024);
+
+//         // --- BACKPRESSURE RAM (Pembatas Kecepatan Memori) ---
+//         const canContinue = pass.write(chunk);
+//         if (!canContinue || currentRAM_MB > 400) {
+//             if (currentRAM_MB > 400) {
+//                 console.warn(`[RAM GUARD] Mengerem jaringan! RAM kritis: ${currentRAM_MB.toFixed(2)} MB`);
+//             }
+//             req.pause(); // Rem paksa hulu dari localhost agar RAM tidak menabrak 450 MB PM2
+//         }
+//     });
+
+//     pass.on('drain', () => {
+//         setTimeout(() => {
+//             if (req.readable && !limitReached) {
+//                 req.resume();
+//             }
+//         }, 50);
+//     });
+
+//     req.on('end', () => {
+//         if (!limitReached) pass.end();
+//     });
+
+//     try {
+//         const spokeResponse = await spokeFetch(`/internal/files/test/upload`, {
+//             method: 'POST',
+//             body: pass,
+//             duplex: 'half',
+//             signal: controller.signal,
+//             headers: {
+//                 'Content-Type': req.headers['content-type'] || 'application/octet-stream'
+//             }
+//         });
+
+//         if (!spokeResponse.ok) {
+//             throw new Error(`Spoke menolak paket. Status: ${spokeResponse.status}`);
+//         }
+
+//         const data = await spokeResponse.json();
+
+//         if (!res.headersSent) {
+//             res.json({
+//                 message: "Benchmark Complete",
+//                 spoke_received_gb: data.size_gb,
+//                 note: data.note || "Stress test successful"
+//             });
+//         }
+//     } catch (err) {
+//         if (err.name === 'AbortError') {
+//             console.warn("[GATEWAY] Fetch ke Spoke dibatalkan karena klien terputus.");
+//         } else if (err.message !== "PAYLOAD_TOO_LARGE") {
+//             console.error("[GATEWAY] Benchmark route error:", err.message);
+//         }
+
+//         if (!res.headersSent) {
+//             res.status(500).json({ error: "Stream Interrupted: " + err.message });
+//         }
+//     }
+// });
 // apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
 //     try {
 //         const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { 
@@ -1021,6 +1355,92 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
 //         res.status(500).json({ error: err.message }); 
 //     }
 // });
+apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
+    req.setTimeout(0);
+
+    const controller = new AbortController();
+    const pass = new PassThrough({ highWaterMark: 16 * 1024 }); // Ransel terkunci 16 KB
+
+    // 1. KENDALI BACKPRESSURE HARDSIDE
+    req.on('data', (chunk) => {
+        const canContinue = pass.write(chunk);
+        if (!canContinue) {
+            req.pause(); // Rem mutlak dari hulu jika pipa tersumbat
+        }
+    });
+
+    pass.on('drain', () => {
+        req.resume(); // Buka keran kembali hanya jika pipa benar-benar plong
+    });
+
+    // 2. GENERATE TOKEN SPOKE SECARA MANUAL (Meniru kelakuan spokeFetch)
+    const token = await getSpokeToken();
+
+    // 3. ATUR KONFIGURASI HTTP REQUEST MURNI
+    const options = {
+        hostname: LOCAL_SPOKE_IP, // Menggunakan variabel globalmu
+        port: LOCAL_PORT,         // Menggunakan port globalmu
+        path: '/internal/files/test/upload',
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+            'Content-Type': req.headers['content-type'] || 'application/octet-stream',
+            'Authorization': `Bearer ${token}` // Masukkan token pengaman antar-node
+        }
+    };
+
+    // 4. BUKA SOKET ALIRAN MURNI KE SPOKE SURABAYA
+    const spokeReq = http.request(options, (spokeRes) => {
+        let responseData = '';
+
+        spokeRes.on('data', (chunk) => {
+            responseData += chunk;
+        });
+
+        spokeRes.on('end', () => {
+            if (spokeRes.statusCode === 200 || spokeRes.statusCode === 201) {
+                try {
+                    const data = JSON.parse(responseData);
+                    if (!res.headersSent) {
+                        res.json({
+                            message: "Benchmark Complete",
+                            spoke_received_gb: data.size_gb,
+                            note: data.note || "Stress test successful"
+                        });
+                    }
+                } catch (e) {
+                    if (!res.headersSent) res.json({ message: "Benchmark Complete", note: "Raw Success" });
+                }
+            } else {
+                if (!res.headersSent) res.status(spokeRes.statusCode).json({ error: `Spoke rejected: ${spokeRes.statusCode}` });
+            }
+        });
+    });
+
+    spokeReq.on('error', (err) => {
+        if (err.name === 'AbortError') {
+            console.warn("[GATEWAY] Aliran ke Spoke diputus karena pembatalan.");
+        } else {
+            console.error("[SPOKE LINK ERROR]", err.message);
+            if (!res.headersSent) res.status(500).json({ error: "Spoke stream broken" });
+        }
+    });
+
+    // 🚨 KUNCI UTAMA KESELAMATAN: Hubungkan pipa pass langsung ke request!
+    // http.request akan otomatis menghentikan pembacaan 'pass' jika buffer kernel OS penuh.
+    pass.pipe(spokeReq);
+
+    req.on('end', () => {
+        pass.end();
+    });
+
+    req.on('aborted', () => {
+        console.warn(`[GATEWAY SAFE-CATCH] Klien membatalkan unggahan.`);
+        controller.abort();
+        spokeReq.destroy();
+        pass.destroy();
+    });
+});
 apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, res) => {
     let corruptedFiles = 0;
     for (const item of req.body) {

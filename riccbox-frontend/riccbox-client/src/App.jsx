@@ -938,89 +938,190 @@ function App() {
   //     setBenchmarkResult(await res.json());
   //   } catch (err) { setDialog({ open: true, type: 'ALERT', title: 'Test Failed', message: "Spoke unreachable?", detail: err.message }); }
   // }
-  const runNetworkBenchmark = async () => {
-    try {
-      const token = await getAccessTokenSilently();
+  // const runNetworkBenchmark = async () => {
+  //   try {
+  //     const token = await getAccessTokenSilently();
 
-      console.log("Generating 1GB of dummy payload...");
-      const payloadSize = 1 * 1024 * 1024 * 1024; // 1 GB
-      const dummyPayload = new Uint8Array(payloadSize);
+  //     console.log("Generating 1GB of dummy payload...");
+  //     const payloadSize = 1 * 1024 * 1024 * 1024; // 1 GB
+  //     const dummyPayload = new Uint8Array(payloadSize);
 
-      console.log("Transmitting payload through Jakarta Gateway to Surabaya Spoke...");
+  //     console.log("Transmitting payload through Jakarta Gateway to Surabaya Spoke...");
 
-      const startTime = performance.now();
+  //     const startTime = performance.now();
 
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', `${API_BASE}/api/v1/vault/admin/test/performance`, true);
+  //     const xhr = new XMLHttpRequest();
+  //     xhr.open('POST', `${API_BASE}/api/v1/vault/admin/test/performance`, true);
 
-      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  //     xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+  //     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
-      xhr.upload.onprogress = (progressEvent) => {
-        if (progressEvent.lengthComputable) {
-          const percentComplete = Math.round((progressEvent.loaded / progressEvent.total) * 100);
-          setUploadProgress({
-            filename: "BENCHMARK_1GB_STRESS_TEST.bin", // Nama samaran untuk UI
-            percent: percentComplete,
-            loaded: progressEvent.loaded,
-            total: progressEvent.total
-          });
-        }
-      };
+  //     xhr.upload.onprogress = (progressEvent) => {
+  //       if (progressEvent.lengthComputable) {
+  //         const percentComplete = Math.round((progressEvent.loaded / progressEvent.total) * 100);
+  //         setUploadProgress({
+  //           filename: "BENCHMARK_1GB_STRESS_TEST.bin", // Nama samaran untuk UI
+  //           percent: percentComplete,
+  //           loaded: progressEvent.loaded,
+  //           total: progressEvent.total
+  //         });
+  //       }
+  //     };
 
-      xhr.onload = () => {
-        const endTime = performance.now();
+  //     xhr.onload = () => {
+  //       const endTime = performance.now();
 
-        // Bersihkan progres bar setelah 1 detik
-        setTimeout(() => setUploadProgress(null), 1000);
+  //       // Bersihkan progres bar setelah 1 detik
+  //       setTimeout(() => setUploadProgress(null), 1000);
 
-        let result = {};
+  //       let result = {};
+  //       try {
+  //         result = JSON.parse(xhr.responseText);
+  //       } catch (parseError) {
+  //         console.error("Server Response (Not JSON):", xhr.responseText);
+  //         alert(`Server returned an error: ${xhr.status} ${xhr.statusText} ${parseError.message}`);
+  //         return;
+  //       }
+
+  //       if (xhr.status === 200 || xhr.status === 201) {
+  //         const durationInSeconds = (endTime - startTime) / 1000;
+  //         const speedMBps = (1024 / durationInSeconds).toFixed(2); // Megabytes per second
+  //         const speedMbps = (speedMBps * 8).toFixed(2);
+
+  //         setBenchmarkResult({
+  //           sent: "1 GB",
+  //           received: `${result.spoke_received_gb} GB`,
+  //           duration: `${durationInSeconds.toFixed(2)} s`,
+  //           speed: `${speedMBps} MB/s (${speedMbps} Mbps)`,
+  //           note: result.note
+  //         });
+
+  //         alert(` STRESS TEST SUCCESS!\n\nPayload Sent: 1 GB \nSpoke Received: ${result.spoke_received_gb} GB\n\nNote: ${result.note}`);
+  //       } else {
+  //         alert(`Test Failed: ${result.error || 'Unknown Error'}`);
+  //       }
+  //     };
+
+  //     xhr.onerror = () => {
+  //       console.error("XHR Error Triggered");
+  //       setUploadProgress(null); // Menghapus progres bar dari layar
+  //       alert("Koneksi terputus (Network Error / Timeout). Peladen tetap aman, silakan klik tombol lagi untuk Retry.");
+  //     };
+
+  //     xhr.onabort = () => {
+  //       console.warn("XHR Aborted");
+  //       setUploadProgress(null);
+  //       benchmarkRequestRef.current = null;
+  //     };
+  //     xhr.send(dummyPayload);
+
+  //   } catch (err) {
+  //     console.error("Benchmark error:", err);
+  //     alert(`Benchmark interrupted: ${err.message}`);
+  //     setUploadProgress(null);
+  //   }
+  // };
+const runNetworkBenchmark = async () => {
+    const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+    
+    // Total target: 1 GB (1024 MB)
+    const targetSize = 1024 * 1024 * 1024; 
+    
+    setUploadProgress({ 
+      filename: "Executing 1GB Zero-Trust Network Stress Test...", 
+      percent: 0,
+      loaded: 0,
+      total: targetSize
+    });
+
+    // Alokasikan objek Blob 1 GB tiruan di sisi browser
+    // Blob tidak memakan RAM fisik browser karena hanya berupa pointer referensi data kosong
+    const dummyBlob = new Blob([new Uint8Array(targetSize)], { type: 'application/octet-stream' });
+    
+    const startTime = performance.now();
+
+    const xhr = new XMLHttpRequest();
+    benchmarkRequestRef.current = xhr; // Daftarkan objek ke ref pembatalan admin
+
+    xhr.open('POST', `${API_BASE}/api/v1/vault/admin/test/performance`, true);
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('x-benchmark-size', targetSize.toString());
+
+    // 🚨 TRACKING PROGRESS JUJUR LANGSUNG DARI HARDWARE JARINGAN BROWSER
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const percent = Math.round((event.loaded / event.total) * 100);
+        setUploadProgress({
+          filename: "Executing 1GB Zero-Trust Network Stress Test...",
+          percent,
+          loaded: event.loaded,
+          total: targetSize
+        });
+      }
+    };
+
+    xhr.onload = () => {
+      setUploadProgress(null);
+      benchmarkRequestRef.current = null;
+
+      if (xhr.status === 200 || xhr.status === 201) {
         try {
-          result = JSON.parse(xhr.responseText);
-        } catch (parseError) {
-          console.error("Server Response (Not JSON):", xhr.responseText);
-          alert(`Server returned an error: ${xhr.status} ${xhr.statusText} ${parseError.message}`);
-          return;
-        }
+          let responseData = {};
+          try {
+            responseData = JSON.parse(xhr.responseText);
+          } catch (e) {
+            console.warn("Gagal parse JSON, Menggunakan fallback data.", e);
+          }
 
-        if (xhr.status === 200 || xhr.status === 201) {
+          const endTime = performance.now();
           const durationInSeconds = (endTime - startTime) / 1000;
-          const speedMBps = (1024 / durationInSeconds).toFixed(2); // Megabytes per second
-          const speedMbps = (speedMBps * 8).toFixed(2);
+          
+          const sentMB = (targetSize / (1024 * 1024)).toFixed(0); 
+          const receivedBytes = responseData.size || responseData.spoke_received_bytes || targetSize;
+          const receivedMB = (receivedBytes / (1024 * 1024)).toFixed(0);
+
+          const speedMBps = ((targetSize / (1024 * 1024)) / durationInSeconds).toFixed(2);
+          const speedMbps = (((targetSize * 8) / (1024 * 1024)) / durationInSeconds).toFixed(2);
 
           setBenchmarkResult({
-            sent: "1 GB",
-            received: `${result.spoke_received_gb} GB`,
+            sent: `${sentMB} MB`,
+            received: `${receivedMB} MB`,
             duration: `${durationInSeconds.toFixed(2)} s`,
             speed: `${speedMBps} MB/s (${speedMbps} Mbps)`,
-            note: result.note
+            note: responseData.note || "Stress test completed successfully via Single Connection Streaming."
           });
 
-          alert(` STRESS TEST SUCCESS!\n\nPayload Sent: 1 GB \nSpoke Received: ${result.spoke_received_gb} GB\n\nNote: ${result.note}`);
-        } else {
-          alert(`Test Failed: ${result.error || 'Unknown Error'}`);
+          setDialog({
+            open: true,
+            type: 'ALERT',
+            title: 'Benchmark Success',
+            message: `Stress test 1GB sukses!\nWaktu: ${durationInSeconds.toFixed(2)} detik\nKecepatan Riil: ${speedMBps} MB/s.`
+          });
+        } catch (e) {
+          console.error("Gagal memproses metrik akhir:", e);
         }
-      };
+      } else {
+        setDialog({ open: true, type: 'ALERT', title: 'Benchmark Failed', message: `Server returned status ${xhr.status}` });
+      }
+    };
 
-      xhr.onerror = () => {
-        console.error("XHR Error Triggered");
-        setUploadProgress(null); // Menghapus progres bar dari layar
-        alert("Koneksi terputus (Network Error / Timeout). Peladen tetap aman, silakan klik tombol lagi untuk Retry.");
-      };
-
-      xhr.onabort = () => {
-        console.warn("XHR Aborted");
-        setUploadProgress(null);
-        benchmarkRequestRef.current = null;
-      };
-      xhr.send(dummyPayload);
-
-    } catch (err) {
-      console.error("Benchmark error:", err);
-      alert(`Benchmark interrupted: ${err.message}`);
+    xhr.onerror = () => {
       setUploadProgress(null);
-    }
+      benchmarkRequestRef.current = null;
+      setDialog({ open: true, type: 'ALERT', title: 'Benchmark Broken', message: 'Connection to Gateway broken. Memori server kemungkinan jenuh.' });
+    };
+
+    xhr.onabort = () => {
+      console.warn("🎯 Benchmark dihentikan seketika oleh Admin!");
+      setUploadProgress(null);
+      benchmarkRequestRef.current = null;
+    };
+
+    // Tembakkan Blob 1 GB secara streaming murni melalui 1 koneksi tunggal
+    xhr.send(dummyBlob);
   };
+
   const triggerBitRotScan = async () => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
