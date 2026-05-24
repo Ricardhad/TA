@@ -70,7 +70,21 @@ const apiRouter = express.Router();
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
 const namespace = process.env.NAMESPACE || 'unknown_namespace';
-
+const shareFiturLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // Jendela waktu: 1 Menit
+    max: 10,
+    keyGenerator: (req) => {
+        return req.auth?.payload?.sub || req.ip;
+    },
+    handler: (req, res) => {
+        res.status(429).json({
+            error: "Too Many Requests",
+            message: "Aktivitas manajemen kolaborasi terlalu cepat. Sila tunggu 1 menit demi menjaga integritas data."
+        });
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 
 // ==========================================
 // 1. BASIC MIDDLEWARE & SECURITY
@@ -544,246 +558,195 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
     let isProcessing = false;
     let limitReached = false;
-busboy.on('file', async (name, file, info) => {
-    if (isProcessing) return;
-    isProcessing = true;
-    console.log(`[UPLOAD] 1. File event fired: ${info.filename} (${info.mimeType})`);
-
-    const { filename, mimeType: headerMime } = info;
-    const fullVirtualFilename = folderPrefix + filename;
-
-    const firstChunk = await new Promise((resolve, reject) => {
-        const cleanup = () => {
-            file.removeListener('data', onData);
-            file.removeListener('end', onEnd);
-            file.removeListener('error', onError);
-        };
-        const onData = (chunk) => {
-            console.log(`[UPLOAD] 2. First chunk received: ${chunk.length} bytes`);
-            cleanup();
-            file.pause();
-            resolve(chunk);
-        };
-        const onEnd = () => {
-            console.log(`[UPLOAD] 2. File ended before first chunk (empty file?)`);
-            cleanup();
-            resolve(Buffer.alloc(0));
-        };
-        const onError = (err) => {
-            console.error(`[UPLOAD] 2. File stream error during sniff: ${err.message}`);
-            cleanup();
-            reject(err);
-        };
-        file.on('data', onData);
-        file.once('end', onEnd);
-        file.once('error', onError);
-        file.resume(); // ✅ THE MISSING LINE — busboy file streams start paused
-    });
-
-    console.log(`[UPLOAD] 3. MIME sniffing...`);
-    const type = await fileTypeFromBuffer(firstChunk);
-    const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, firstChunk);
-    console.log(`[UPLOAD] 4. MIME result: finalMime=${finalMime}, isSpoofed=${isSpoofed}`);
-
-    const lastDotIndex = filename.lastIndexOf('.');
-    const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
-    const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
-    const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
-
-    if (isSpoofed) {
-        file.resume();
-        if (!res.headersSent) return res.status(403).json({ error: "Security Violation" });
-        return;
-    }
-
-    const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
-    if ((usage.total_used || 0) >= activeLimit) {
-        file.resume();
-        if (!res.headersSent) return res.status(403).json({ error: "Quota Exceeded" });
-        return;
-    }
-
-    console.log(`[UPLOAD] 5. Getting spoke token...`);
-    const token = await getSpokeToken();
-    console.log(`[UPLOAD] 6. Spoke token acquired, opening request...`);
-
-    const pass = new PassThrough({ highWaterMark: 16 * 1024 });
-    const options = {
-        hostname: LOCAL_SPOKE_IP,
-        port: LOCAL_PORT,
-        path: '/internal/files',
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-            'x-original-name': filename,
-            'content-type': headerMime,
-            'Authorization': `Bearer ${token}`
-        }
-    };
-
-
-
-        const spokeReq = http.request(options, (spokeRes) => {
-
-            let responseData = '';
-
-            spokeRes.on('data', (chunk) => { responseData += chunk; });
-
-  
-
-            spokeRes.on('end', async () => {
-
-                if (limitReached) {
-
-                    if (!res.headersSent) return res.status(413).json({ error: "File Too Large" });
-
-                    return;
-
-                }
-
-                if (spokeRes.statusCode !== 200 && spokeRes.statusCode !== 201) {
-
-                    if (!res.headersSent) return res.status(spokeRes.statusCode).json({ error: "Spoke rejected upload" });
-
-                    return;
-
-                }
-
-  
-
-                try {
-
-                    const data = JSON.parse(responseData);
-
-                    const { physical_path, size, checksum } = data;
-
-  
-
-                    // DATABASE SQLITE EXECUTION
-
-                    let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
-
-                    if (!fileRecord) {
-
-                        const uuid = randomUUID();
-
-                        const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
-
-                        fileRecord = { id: info.lastInsertRowid, uuid: uuid };
-
-                    } else {
-
-                        db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
-
-                    }
-
-  
-
-                    let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-
-                    while (versions.length >= 5) {
-
-                        try {
-
-                            await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
-
-                            db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
-
-                            versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-
-                        } catch (e) { console.error("Cleanup failed"); }
-
-                    }
-
-  
-
-                    const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
-
-                    const newVersion = (lastVersion.v || 0) + 1;
-
-                    db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
-
-  
-
-                    if (!res.headersSent) res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
-
-                    setImmediate(() => { req.destroy(); });
-
-  
-
-                } catch (dbErr) {
-
-                    console.error("[DATABASE ERROR]", dbErr.message);
-
-                    if (!res.headersSent) res.status(500).json({ error: "Failed to save file metadata." });
-
-                }
-
-            });
-
-        });
-    spokeReq.setTimeout(30_000, () => {
-        console.error('[UPLOAD] Spoke timeout after 30s');
-        spokeReq.destroy(new Error('SPOKE_TIMEOUT'));
-    });
-
-    spokeReq.on('error', (err) => {
-        console.error(`[UPLOAD] spokeReq error: ${err.message}`);
-        if (err.name === 'AbortError') {
-            console.warn("[UPLOAD] Aborted by user.");
-        } else if (err.message === 'SPOKE_TIMEOUT') {
-            if (!res.headersSent) res.status(504).json({ error: "Spoke did not respond in time." });
-        } else {
-            if (!res.headersSent) res.status(500).json({ error: "Gateway stream interrupted." });
-        }
-    });
-
-    pass.pipe(spokeReq);
-    pass.write(firstChunk);
-    console.log(`[UPLOAD] 7. Pipeline open, streaming to spoke...`);
-
-    let uploadedBytes = firstChunk.length;
-    let dynamicLimitReached = false;
-
-    file.on('data', (chunk) => {
-        if (dynamicLimitReached) return;
-        uploadedBytes += chunk.length;
-        // console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
-
-        if (uploadedBytes > limit) {
-            dynamicLimitReached = true;
-            console.warn(`[UPLOAD] Dynamic limit hit at ${uploadedBytes} bytes`);
-            file.removeAllListeners('data');
-            file.removeAllListeners('end');
-            file.removeAllListeners('error');
+    busboy.on('file', async (name, file, info) => {
+        if (isProcessing) return;
+        isProcessing = true;
+        console.log(`[UPLOAD] 1. File event fired: ${info.filename} (${info.mimeType})`);
+
+        const { filename, mimeType: headerMime } = info;
+        const fullVirtualFilename = folderPrefix + filename;
+
+        const firstChunk = await new Promise((resolve, reject) => {
+            const cleanup = () => {
+                file.removeListener('data', onData);
+                file.removeListener('end', onEnd);
+                file.removeListener('error', onError);
+            };
+            const onData = (chunk) => {
+                console.log(`[UPLOAD] 2. First chunk received: ${chunk.length} bytes`);
+                cleanup();
+                file.pause();
+                resolve(chunk);
+            };
+            const onEnd = () => {
+                console.log(`[UPLOAD] 2. File ended before first chunk (empty file?)`);
+                cleanup();
+                resolve(Buffer.alloc(0));
+            };
+            const onError = (err) => {
+                console.error(`[UPLOAD] 2. File stream error during sniff: ${err.message}`);
+                cleanup();
+                reject(err);
+            };
+            file.on('data', onData);
+            file.once('end', onEnd);
+            file.once('error', onError);
+            file.resume(); // ✅ THE MISSING LINE — busboy file streams start paused
+        });
+
+        console.log(`[UPLOAD] 3. MIME sniffing...`);
+        const type = await fileTypeFromBuffer(firstChunk);
+        const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, firstChunk);
+        console.log(`[UPLOAD] 4. MIME result: finalMime=${finalMime}, isSpoofed=${isSpoofed}`);
+
+        const lastDotIndex = filename.lastIndexOf('.');
+        const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
+        const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
+        const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
+
+        if (isSpoofed) {
             file.resume();
-            pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
-            spokeReq.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
-            if (!res.headersSent) res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext || 'file'} adalah ${limit / 1024 / 1024}MB` });
+            if (!res.headersSent) return res.status(403).json({ error: "Security Violation" });
             return;
         }
 
-        if (!pass.write(chunk)) {
-            file.pause();
-            pass.once('drain', () => { if (!dynamicLimitReached) file.resume(); });
+        const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
+        if ((usage.total_used || 0) >= activeLimit) {
+            file.resume();
+            if (!res.headersSent) return res.status(403).json({ error: "Quota Exceeded" });
+            return;
         }
+
+        console.log(`[UPLOAD] 5. Getting spoke token...`);
+        const token = await getSpokeToken();
+        console.log(`[UPLOAD] 6. Spoke token acquired, opening request...`);
+
+        const pass = new PassThrough({ highWaterMark: 16 * 1024 });
+        const options = {
+            hostname: LOCAL_SPOKE_IP,
+            port: LOCAL_PORT,
+            path: '/internal/files',
+            method: 'POST',
+            signal: controller.signal,
+            headers: {
+                'x-original-name': filename,
+                'content-type': headerMime,
+                'Authorization': `Bearer ${token}`
+            }
+        };
+
+        const spokeReq = http.request(options, (spokeRes) => {
+            let responseData = '';
+            spokeRes.on('data', (chunk) => { responseData += chunk; });
+            spokeRes.on('end', async () => {
+                if (limitReached) {
+                    if (!res.headersSent) return res.status(413).json({ error: "File Too Large" });
+                    return;
+                }
+
+                if (spokeRes.statusCode !== 200 && spokeRes.statusCode !== 201) {
+                    if (!res.headersSent) return res.status(spokeRes.statusCode).json({ error: "Spoke rejected upload" });
+                    return;
+                }
+
+                try {
+                    const data = JSON.parse(responseData);
+                    const { physical_path, size, checksum } = data;
+
+                    let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
+                    if (!fileRecord) {
+                        const uuid = randomUUID();
+                        const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
+                        fileRecord = { id: info.lastInsertRowid, uuid: uuid };
+                    } else {
+                        db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
+                    }
+
+                    let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+                    while (versions.length >= 5) {
+                        try {
+                            await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
+                            db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+                            versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
+                        } catch (e) { console.error("Cleanup failed"); }
+                    }
+
+                    const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
+
+                    const newVersion = (lastVersion.v || 0) + 1;
+                    db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
+
+                    if (!res.headersSent) res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
+                    setImmediate(() => { req.destroy(); });
+
+                } catch (dbErr) {
+                    console.error("[DATABASE ERROR]", dbErr.message);
+                    if (!res.headersSent) res.status(500).json({ error: "Failed to save file metadata." });
+                }
+            });
+        });
+        spokeReq.setTimeout(30_000, () => {
+            console.error('[UPLOAD] Spoke timeout after 30s');
+            spokeReq.destroy(new Error('SPOKE_TIMEOUT'));
+        });
+
+        spokeReq.on('error', (err) => {
+            console.error(`[UPLOAD] spokeReq error: ${err.message}`);
+            if (err.name === 'AbortError') {
+                console.warn("[UPLOAD] Aborted by user.");
+            } else if (err.message === 'SPOKE_TIMEOUT') {
+                if (!res.headersSent) res.status(504).json({ error: "Spoke did not respond in time." });
+            } else {
+                if (!res.headersSent) res.status(500).json({ error: "Gateway stream interrupted." });
+            }
+        });
+
+        pass.pipe(spokeReq);
+        pass.write(firstChunk);
+        console.log(`[UPLOAD] 7. Pipeline open, streaming to spoke...`);
+
+        let uploadedBytes = firstChunk.length;
+        let dynamicLimitReached = false;
+
+        file.on('data', (chunk) => {
+            if (dynamicLimitReached) return;
+            uploadedBytes += chunk.length;
+            // console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
+
+            if (uploadedBytes > limit) {
+                dynamicLimitReached = true;
+                console.warn(`[UPLOAD] Dynamic limit hit at ${uploadedBytes} bytes`);
+                file.removeAllListeners('data');
+                file.removeAllListeners('end');
+                file.removeAllListeners('error');
+                file.resume();
+                pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+                spokeReq.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+                if (!res.headersSent) res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext || 'file'} adalah ${limit / 1024 / 1024}MB` });
+                return;
+            }
+
+            if (!pass.write(chunk)) {
+                file.pause();
+                pass.once('drain', () => { if (!dynamicLimitReached) file.resume(); });
+            }
+        });
+
+        file.once('end', () => {
+            console.log(`[UPLOAD] 8. File stream ended. Total: ${(uploadedBytes / 1024).toFixed(1)} KB — ending pass`);
+            if (!dynamicLimitReached) pass.end();
+        });
+
+        file.once('error', (err) => {
+            console.error(`[FILE STREAM ERROR] ${err.message}`);
+            pass.destroy(err);
+            if (!res.headersSent) res.status(500).json({ error: "File read error." });
+        });
+
+        file.on('limit', () => { limitReached = true; });
+
+        file.resume(); // resume from post-sniff pause
     });
-
-    file.once('end', () => {
-        console.log(`[UPLOAD] 8. File stream ended. Total: ${(uploadedBytes / 1024).toFixed(1)} KB — ending pass`);
-        if (!dynamicLimitReached) pass.end();
-    });
-
-    file.once('error', (err) => {
-        console.error(`[FILE STREAM ERROR] ${err.message}`);
-        pass.destroy(err);
-        if (!res.headersSent) res.status(500).json({ error: "File read error." });
-    });
-
-    file.on('limit', () => { limitReached = true; });
-
-    file.resume(); // resume from post-sniff pause
-});
     busboy.on('finish', () => {
 
         if (!isProcessing) {
@@ -1075,11 +1038,35 @@ apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req
     } catch (err) { res.status(500).json({ error: "Restore failed." }); }
 });
 
-apiRouter.post('/vault/buckets', (req, res) => {
+const bucketCreationLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // Jeda waktu: 15 Menit
+    max: 5,
+    keyGenerator: (req) => {
+        return req.auth?.payload?.sub || req.ip;
+    },
+    handler: (req, res) => {
+        res.status(429).json({
+            error: "Too Many Requests",
+            message: "Batas pembuatan brankas tercapai. Sila tunggu 15 menit lagi demi alasan keamanan."
+        });
+    },
+    standardHeaders: true, // Kembalikan info rate limit di isi header RateLimit-*
+    legacyHeaders: false,  // Matikan header X-RateLimit-* yang sudah usang
+});
+
+apiRouter.post('/vault/buckets', bucketCreationLimiter, (req, res) => {
     const { name, region } = req.body || {};
     const userId = req.auth.payload.sub;
     const bucketUuid = randomUUID();
     try {
+        const countRow = db.prepare(`SELECT COUNT(*) as total FROM buckets WHERE owner_id = ?`).get(userId);
+
+        if (countRow && countRow.total >= 30) {
+            return res.status(403).json({
+                error: "Quota Exceeded",
+                message: "Anda telah mencapai batas kuota maksimal kepemilikan brankas digital (Maksimal 25 brankas per pengguna)."
+            });
+        }
         db.transaction(() => {
             const info = db.prepare(`INSERT INTO buckets (uuid, name, owner_id, region) VALUES (?, ?, ?, ?)`).run(bucketUuid, name, userId, region || 'sub-01');
             db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, 'ADMIN')`).run(info.lastInsertRowid, userId);
@@ -1102,7 +1089,8 @@ apiRouter.get('/vault/buckets/:bucketUuid/members', authorizeBucket('ADMIN'), (r
     } catch (err) { res.status(500).json({ error: "Failed to fetch members." }); }
 });
 
-apiRouter.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
+
+apiRouter.post('/vault/buckets/:bucketUuid/share', shareFiturLimiter, permitGlobalRole('standard_user'), authorizeBucket('ADMIN'), (req, res) => {
     const { email, permission } = req.body;
     if (!email || !['READ', 'WRITE'].includes(permission)) return res.status(400).json({ error: "Invalid payload." });
     try {
@@ -1115,7 +1103,7 @@ apiRouter.post('/vault/buckets/:bucketUuid/share', permitGlobalRole('standard_us
     } catch (err) { res.status(500).json({ error: "Failed to invite user." }); }
 });
 
-apiRouter.delete('/vault/buckets/:bucketUuid/share/:userId', authorizeBucket('ADMIN'), (req, res) => {
+apiRouter.delete('/vault/buckets/:bucketUuid/share/:userId', shareFiturLimiter, authorizeBucket('ADMIN'), (req, res) => {
     try {
         const bucket = db.prepare('SELECT id, owner_id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (req.params.userId === bucket.owner_id) return res.status(400).json({ error: "Cannot revoke access from the bucket owner." });
@@ -1128,6 +1116,8 @@ apiRouter.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res)
     try {
         const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
+        if (!req.body.name) return res.status(400).json({ error: "Bucket name is required." });
+        if (req.body.name.length > 20) return res.status(400).json({ error: "Bucket name must be 20 characters or less." });
         db.prepare('UPDATE buckets SET name = ?, region = ? WHERE id = ?').run(req.body.name, req.body.region, bucket.id);
         res.json({ status: "Bucket updated successfully." });
     } catch (err) { res.status(500).json({ error: "Failed to update bucket." }); }
