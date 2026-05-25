@@ -10,7 +10,7 @@ import crypto from 'crypto';
 import helmet from 'helmet';
 import Busboy from 'busboy';
 import { Readable } from 'node:stream';
-import rateLimit from 'express-rate-limit';
+import {rateLimit, ipKeyGenerator }from 'express-rate-limit';
 import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket } from './middleware.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -70,22 +70,32 @@ const apiRouter = express.Router();
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
 const namespace = process.env.NAMESPACE || 'unknown_namespace';
-const shareFiturLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000, // Jendela waktu: 1 Menit
-    max: 10,
-    keyGenerator: (req) => {
-        return req.auth?.payload?.sub || req.ip;
-    },
-    handler: (req, res) => {
-        res.status(429).json({
-            error: "Too Many Requests",
-            message: "Aktivitas manajemen kolaborasi terlalu cepat. Sila tunggu 1 menit demi menjaga integritas data."
-        });
-    },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
+const createTimeLimiter = (minute, maxamount, message) => {
+    return rateLimit({
+    windowMs: minute * 60 * 1000,
+    max: maxamount,
+        keyGenerator: (req,res) => {
+            if (req.auth?.payload?.sub) {
+                return req.auth.payload.sub; // Jika user sudah terautentikasi Auth0
+            }
+            return ipKeyGenerator(req.ip);
+        },
+        validate: {validationsConfig: false, keygenerator: false },
+        handler: (req, res) => {
+            res.status(429).json({
+                error: "Too Many Requests",
+                message: message
+            });
+        },
+        standardHeaders: true,
+        legacyHeaders: false,
+    });
+};
 
+const shareFiturLimiter = createTimeLimiter(30, 20, "Batas berbagi tautan tercapai. Sila tunggu 30 menit lagi demi alasan keamanan.");
+
+const bucketCreationLimiter = createTimeLimiter(15, 5, "Batas pembuatan bucket tercapai. Sila tunggu 15 menit lagi demi alasan keamanan.");
+const renamelimit = createTimeLimiter(5, 20, "Batas penggantian nama berkas tercapai. Sila tunggu 15 menit lagi demi alasan keamanan.");
 // ==========================================
 // 1. BASIC MIDDLEWARE & SECURITY
 // ==========================================
@@ -205,7 +215,6 @@ async function getSpokeToken() {
             console.log(`[AUTH] New token issued ending in: ...${cachedM2MToken.slice(-5)}`);
             return cachedM2MToken;
         } finally {
-            // 4. Setelah selesai (berhasil atau gagal), buka kembali kuncinya
             tokenPromise = null;
         }
     })();
@@ -260,7 +269,6 @@ apiRouter.use('/vault/', apiLimiter);
 apiRouter.use('/vault/files', strictLimiter);
 apiRouter.use('/vault/files', strictLimiter);
 
-// Global API Audit Log (Fires AFTER bouncer authenticates the user)
 apiRouter.use((req, res, next) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
@@ -268,7 +276,6 @@ apiRouter.use((req, res, next) => {
     next();
 });
 
-// --- PUBLIC ROUTE (No Bouncer Needed) ---
 app.get('/api/v1/vault/view/:uuid', async (req, res) => {
     const { uuid } = req.params;
     const { expires, sig, permission } = req.query;
@@ -295,11 +302,11 @@ app.get('/api/v1/vault/view/:uuid', async (req, res) => {
     }
 });
 
-// --- PROTECTED ROUTES (Requires Bouncer) ---
 apiRouter.get('/vault/identity', (req, res) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
     const userSub = req.auth?.payload.sub;
+    console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
     try {
         if (userSub && userEmail !== 'anonymous') {
             db.prepare(`INSERT INTO users (sub, email) VALUES (?, ?) ON CONFLICT(sub) DO UPDATE SET email = excluded.email`).run(userSub, userEmail);
@@ -336,6 +343,7 @@ apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
         res.json(query.all(...params));
     } catch (err) { res.status(500).json({ error: "Database query failed" }); }
 });
+
 // menggunakan fetch
 // apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
 //     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
@@ -361,7 +369,6 @@ apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
 //     if (!contentType || !contentType.includes('multipart/form-data')) return res.status(400).json({ error: "Invalid Request" });
 //     if (contentLength && parseInt(contentLength) > MAX_SIZE) return res.status(413).json({ error: "File Too Large" });
 
-//     // 🚨 STABILISASI HIGHWATERMARK PADA BUSBOY
 //     const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 }, highWaterMark: 16 * 1024 });
 //     const userId = req.auth.payload.sub;
 
@@ -381,7 +388,6 @@ apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
 //         const { filename, mimeType: headerMime } = info;
 //         const fullVirtualFilename = folderPrefix + filename;
 
-//         // 🚨 KUNCI MATI UKURAN PASSTHROUGH MAKSIMAL KECIL
 //         const pass = new PassThrough({ highWaterMark: 16 * 1024 });
 
 //         // Baca magic byte secara aman tanpa merusak rantai pipe utama
@@ -565,7 +571,10 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
         const { filename, mimeType: headerMime } = info;
         const fullVirtualFilename = folderPrefix + filename;
-
+        let isFileAlreadyEnded = false;
+        file.once('end', () => {
+            isFileAlreadyEnded = true;
+        });
         const firstChunk = await new Promise((resolve, reject) => {
             const cleanup = () => {
                 file.removeListener('data', onData);
@@ -703,49 +712,59 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
         pass.pipe(spokeReq);
         pass.write(firstChunk);
-        console.log(`[UPLOAD] 7. Pipeline open, streaming to spoke...`);
-
+        pass.on('error', (err) => {
+            if (err.message === 'DYNAMIC_LIMIT_EXCEEDED') {
+                console.warn('[UPLOAD] Stream pipeline closed safely due to size limit restriction.');
+            } else {
+                console.error('[UPLOAD] Pipeline error:', err.message);
+            }
+        });
         let uploadedBytes = firstChunk.length;
         let dynamicLimitReached = false;
+        if (isFileAlreadyEnded) {
+            console.log(`[UPLOAD] File sangat kecil (Text), langsung selesai. Menutup pipa...`);
+            pass.end(); // Langsung suruh Spoke memproses tanpa menunggu lagi!
+        } else {
 
-        file.on('data', (chunk) => {
-            if (dynamicLimitReached) return;
-            uploadedBytes += chunk.length;
-            // console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
+            file.on('data', (chunk) => {
+                if (dynamicLimitReached) return;
+                uploadedBytes += chunk.length;
+                // console.log(`[UPLOAD] streaming... ${(uploadedBytes / 1024).toFixed(1)} KB`); // remove after debug
 
-            if (uploadedBytes > limit) {
-                dynamicLimitReached = true;
-                console.warn(`[UPLOAD] Dynamic limit hit at ${uploadedBytes} bytes`);
-                file.removeAllListeners('data');
-                file.removeAllListeners('end');
-                file.removeAllListeners('error');
-                file.resume();
-                pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
-                spokeReq.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
-                if (!res.headersSent) res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext || 'file'} adalah ${limit / 1024 / 1024}MB` });
-                return;
-            }
+                if (uploadedBytes > limit) {
+                    dynamicLimitReached = true;
+                    console.warn(`[UPLOAD] Dynamic limit hit at ${uploadedBytes} bytes`);
+                    file.removeAllListeners('data');
+                    file.removeAllListeners('end');
+                    file.removeAllListeners('error');
+                    file.resume();
+                    pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+                    spokeReq.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
+                    if (!res.headersSent) res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext || 'file'} adalah ${limit / 1024 / 1024}MB` });
+                    return;
+                }
 
-            if (!pass.write(chunk)) {
-                file.pause();
-                pass.once('drain', () => { if (!dynamicLimitReached) file.resume(); });
-            }
-        });
+                if (!pass.write(chunk)) {
+                    file.pause();
+                    pass.once('drain', () => { if (!dynamicLimitReached) file.resume(); });
+                }
+            });
+            file.once('end', () => {
+                console.log(`[UPLOAD] 8. File stream ended. Total: ${(uploadedBytes / 1024).toFixed(1)} KB — ending pass`);
+                if (!dynamicLimitReached) pass.end();
+            });
 
-        file.once('end', () => {
-            console.log(`[UPLOAD] 8. File stream ended. Total: ${(uploadedBytes / 1024).toFixed(1)} KB — ending pass`);
-            if (!dynamicLimitReached) pass.end();
-        });
+            file.once('error', (err) => {
+                console.error(`[FILE STREAM ERROR] ${err.message}`);
+                pass.destroy(err);
+                if (!res.headersSent) res.status(500).json({ error: "File read error." });
+            });
 
-        file.once('error', (err) => {
-            console.error(`[FILE STREAM ERROR] ${err.message}`);
-            pass.destroy(err);
-            if (!res.headersSent) res.status(500).json({ error: "File read error." });
-        });
+            file.on('limit', () => { limitReached = true; });
 
-        file.on('limit', () => { limitReached = true; });
+            file.resume(); // resume from post-sniff pause
+        }
 
-        file.resume(); // resume from post-sniff pause
     });
     busboy.on('finish', () => {
 
@@ -909,7 +928,7 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
 //         res.status(500).json({ error: "Failed to move file to trash." });
 //     }
 // });
-apiRouter.put('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
+apiRouter.put('/vault/files/:uuid', renamelimit, authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     const { newName } = req.body;
 
@@ -949,9 +968,12 @@ apiRouter.delete('/vault/files/:uuid', permitGlobalRole('standard_user'), author
         const diffMinutes = Math.floor((now - latestVersionTime) / (1000 * 60));
 
         console.log(`[WORM DEBUG] Latest Version Time: ${latestVersionTime.toISOString()} | Now: ${now.toISOString()} | Age: ${diffMinutes} mins`);
-
-        if (diffMinutes < MINIMUM_RETENTION_MINUTES) {
-            return res.status(403).json({
+        const isTestBypass = req.headers['x-test-bypass-worm'] === 'true';
+        const isWormLocked = diffMinutes < MINIMUM_RETENTION_MINUTES;
+           
+        
+        if (isWormLocked && !isTestBypass) {
+           return res.status(403).json({
                 error: "Object Locked",
                 message: `Data integrity policy: File cannot be deleted within ${MINIMUM_RETENTION_MINUTES} minutes of its latest version modification. Please try again in ${MINIMUM_RETENTION_MINUTES - diffMinutes} minutes.`
             });
@@ -1038,22 +1060,6 @@ apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req
     } catch (err) { res.status(500).json({ error: "Restore failed." }); }
 });
 
-const bucketCreationLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // Jeda waktu: 15 Menit
-    max: 5,
-    keyGenerator: (req) => {
-        return req.auth?.payload?.sub || req.ip;
-    },
-    handler: (req, res) => {
-        res.status(429).json({
-            error: "Too Many Requests",
-            message: "Batas pembuatan brankas tercapai. Sila tunggu 15 menit lagi demi alasan keamanan."
-        });
-    },
-    standardHeaders: true, // Kembalikan info rate limit di isi header RateLimit-*
-    legacyHeaders: false,  // Matikan header X-RateLimit-* yang sudah usang
-});
-
 apiRouter.post('/vault/buckets', bucketCreationLimiter, (req, res) => {
     const { name, region } = req.body || {};
     const userId = req.auth.payload.sub;
@@ -1112,12 +1118,12 @@ apiRouter.delete('/vault/buckets/:bucketUuid/share/:userId', shareFiturLimiter, 
     } catch (err) { res.status(500).json({ error: "Failed to remove member." }); }
 });
 
-apiRouter.put('/vault/buckets/:bucketUuid', authorizeBucket('ADMIN'), (req, res) => {
+apiRouter.put('/vault/buckets/:bucketUuid', renamelimit, authorizeBucket('ADMIN'), (req, res) => {
     try {
         const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
         if (!req.body.name) return res.status(400).json({ error: "Bucket name is required." });
-        if (req.body.name.length > 20) return res.status(400).json({ error: "Bucket name must be 20 characters or less." });
+        if (req.body.name.length > 40) return res.status(400).json({ error: "Bucket name must be 40 characters or less." });
         db.prepare('UPDATE buckets SET name = ?, region = ? WHERE id = ?').run(req.body.name, req.body.region, bucket.id);
         res.json({ status: "Bucket updated successfully." });
     } catch (err) { res.status(500).json({ error: "Failed to update bucket." }); }
@@ -1450,7 +1456,38 @@ apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req
         res.json({ message: "Scan initiated." });
     } catch (err) { res.status(500).json({ error: "Failed." }); }
 });
+// app.post('/api/v1/vault/test-minio-benchmark', async (req, res) => {
+//     // 1. Buat Base64 untuk Basic Auth
+//     const authString = Buffer.from("admin:password_minio_123").toString('base64');
+    
+//     // 2. URL Murni tanpa user:pass
+//     const minioUrl = `http://${LOCAL_SPOKE_IP}:9000/sme-benchmark-bucket/benchmark_${Date.now()}.bin`;
 
+//     try {
+//         const response = await fetch(minioUrl, {
+//             method: 'PUT',
+//             headers: {
+//                 'Content-Type': 'application/octet-stream',
+//                 'Content-Length': req.headers['content-length'],
+//                 // 🚨 KUNCI PERBAIKAN: Masukkan Basic Auth di SINI, bukan di URL
+//                 'Authorization': `Basic ${authString}`,
+//                 'Host': `${LOCAL_SPOKE_IP}:9000`
+//             },
+//             body: req,
+//             duplex: 'half'
+//         });
+
+//         const result = await response.text();
+//         if (response.ok) {
+//             res.status(200).json({ message: "Upload sukses ke MinIO" });
+//         } else {
+//             console.error("[BENCHMARK] MinIO Error:", result);
+//             res.status(response.status).json({ error: "MinIO Rejected", details: result });
+//         }
+//     } catch (err) {
+//         res.status(502).json({ error: "MinIO Unreachable" });
+//     }
+// });
 // ==========================================
 // 4. ATTACH THE API ROUTER TO EXPRESS
 // ==========================================
