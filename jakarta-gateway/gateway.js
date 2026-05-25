@@ -10,7 +10,7 @@ import crypto from 'crypto';
 import helmet from 'helmet';
 import Busboy from 'busboy';
 import { Readable } from 'node:stream';
-import {rateLimit, ipKeyGenerator }from 'express-rate-limit';
+import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket } from './middleware.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -72,15 +72,15 @@ const LOCAL_PORT = process.env.GATEWAY_PORT;
 const namespace = process.env.NAMESPACE || 'unknown_namespace';
 const createTimeLimiter = (minute, maxamount, message) => {
     return rateLimit({
-    windowMs: minute * 60 * 1000,
-    max: maxamount,
-        keyGenerator: (req,res) => {
+        windowMs: minute * 60 * 1000,
+        max: maxamount,
+        keyGenerator: (req, res) => {
             if (req.auth?.payload?.sub) {
                 return req.auth.payload.sub; // Jika user sudah terautentikasi Auth0
             }
             return ipKeyGenerator(req.ip);
         },
-        validate: {validationsConfig: false, keygenerator: false },
+        validate: { validationsConfig: false, keygenerator: false },
         handler: (req, res) => {
             res.status(429).json({
                 error: "Too Many Requests",
@@ -674,10 +674,18 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
                     let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
                     while (versions.length >= 5) {
                         try {
-                            await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
+                            const response = await spokeFetch(`/internal/files/${versions[0].physical_path}`, { method: 'DELETE' });
+                            console.log(`[UPLOAD] Old version purged to maintain version limit.`, response.ok ? "Spoke purge successful." : "Spoke purge failed.");
+                            if (!response.ok) {
+                                console.error(`[UPLOAD] Failed to purge old version from Spoke. Status: ${response.status}, Response: ${await response.text()}`);
+                                break;
+                            }
                             db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
                             versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-                        } catch (e) { console.error("Cleanup failed"); }
+
+                        } catch (e) { console.error("Cleanup failed"); 
+                            break;
+                        }
                     }
 
                     const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
@@ -970,10 +978,10 @@ apiRouter.delete('/vault/files/:uuid', permitGlobalRole('standard_user'), author
         console.log(`[WORM DEBUG] Latest Version Time: ${latestVersionTime.toISOString()} | Now: ${now.toISOString()} | Age: ${diffMinutes} mins`);
         const isTestBypass = req.headers['x-test-bypass-worm'] === 'true';
         const isWormLocked = diffMinutes < MINIMUM_RETENTION_MINUTES;
-           
-        
+
+
         if (isWormLocked && !isTestBypass) {
-           return res.status(403).json({
+            return res.status(403).json({
                 error: "Object Locked",
                 message: `Data integrity policy: File cannot be deleted within ${MINIMUM_RETENTION_MINUTES} minutes of its latest version modification. Please try again in ${MINIMUM_RETENTION_MINUTES - diffMinutes} minutes.`
             });
@@ -1459,7 +1467,7 @@ apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req
 // app.post('/api/v1/vault/test-minio-benchmark', async (req, res) => {
 //     // 1. Buat Base64 untuk Basic Auth
 //     const authString = Buffer.from("admin:password_minio_123").toString('base64');
-    
+
 //     // 2. URL Murni tanpa user:pass
 //     const minioUrl = `http://${LOCAL_SPOKE_IP}:9000/sme-benchmark-bucket/benchmark_${Date.now()}.bin`;
 
