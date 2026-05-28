@@ -1,6 +1,16 @@
 
 import mime from 'mime-types';
 import db from './db.js';
+import { auth } from 'express-oauth2-jwt-bearer';
+import dotenv from 'dotenv';
+dotenv.config();
+
+
+export const bouncer = auth({
+    audience: process.env.NAMESPACE,
+    issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
+    tokenSigningAlg: 'RS256'
+});
 
 export const permitGlobalRole = (requiredRole) => {
     return (req, res, next) => {
@@ -22,6 +32,19 @@ export const permitGlobalRole = (requiredRole) => {
         next();
     };
 };
+export const validateFingerprint = (req, res, next) => {
+    const tokenFingerprint = req.auth.payload['https://richardgatewayta.duckdns.org/fingerprint'];
+    
+    const currentIp = req.ip;
+    const currentUserAgent = req.headers['user-agent'];
+    const currentFingerprint = `${currentIp}-${currentUserAgent}`;
+    console.warn(`[SECURITY] Validating fingerprint: Token=${tokenFingerprint} | Current=${currentFingerprint}`);
+    if (tokenFingerprint !== currentFingerprint) {
+        return res.status(401).json({ error: "Contextual Identity Mismatch! Token Hijacking suspected. please login again." });
+    }
+    next();
+};
+export const strictBouncer = [bouncer, validateFingerprint];
 // export const authorizeVault = (requiredRole = 'VIEWER') => {
 //     return (req, res, next) => {
 //         const userId = req.auth.payload.sub;

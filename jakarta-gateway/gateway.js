@@ -11,7 +11,7 @@ import helmet from 'helmet';
 import Busboy from 'busboy';
 import { Readable } from 'node:stream';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
-import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket } from './middleware.js';
+import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket,strictBouncer } from './middleware.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -162,11 +162,6 @@ const strictLimiter = rateLimit({
     message: { error: "Action rate limit exceeded." }
 });
 
-const bouncer = auth({
-    audience: namespace,
-    issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
-    tokenSigningAlg: 'RS256'
-});
 
 // ==========================================
 // 2. M2M AUTH & HEALTH CHECKS
@@ -1496,11 +1491,7 @@ apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req
 //         res.status(502).json({ error: "MinIO Unreachable" });
 //     }
 // });
-// ==========================================
-// 4. ATTACH THE API ROUTER TO EXPRESS
-// ==========================================
-// Apply the bouncer middleware BEFORE all /api/v1 routes
-app.use('/api/v1', bouncer, apiRouter);
+app.use('/api/v1', strictBouncer, apiRouter);
 
 
 // ==========================================

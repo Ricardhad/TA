@@ -251,8 +251,11 @@ app.post('/internal/files', async (req, res) => {
         const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
         const writeStream = fs.createWriteStream(vaultPath);
+        
+        // let encrypted = cipher.update(MASTER_KEY, 'utf8', 'hex');
+        // encrypted += cipher.final('hex');
         writeStream.write(iv);
-
+        // writeStream.write(encrypted, 'hex');
         if (isVideo) {
             // Jalankan FFmpeg membaca dari file .tmp
             const sanitizer = spawn(ffmpegInstaller.path, [
@@ -559,10 +562,11 @@ app.post('/internal/files/test/upload', (req, res) => {
 
 const server = app.listen(PORT, SPOKE_IP, () => {
     console.log(`Surabaya Spoke Active on port ${PORT} at IP ${SPOKE_IP}`);
+    console.log(`[SPOKE START] Server running on PID: ${process.pid}`);
 });
 // const server = app.listen(PORT,'0.0.0.0', () => {
 //     console.log(`Surabaya Spoke Active on port ${PORT} at IP ${SPOKE_IP}`);UTC Arrival Time: May 23, 2026 14:30:39.757472600 UTC
-    
+
 // });
 
 const SERVER_TIMEOUT = 30 * 60 * 1000;
