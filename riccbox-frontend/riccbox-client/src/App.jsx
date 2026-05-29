@@ -63,7 +63,7 @@ function App() {
   });
   // --- MANAGE ACCESS STATES ---
   const [manageAccessModal, setManageAccessModal] = useState({ open: false, bucket: null, members: [], isLoading: false });
-
+  const [bucketAuditModal, setBucketAuditModal] = useState({ open: false, bucket: null, logs: [], isLoading: false });
   // Buka Modal & Ambil Daftar Anggota
   const openManageAccess = async (bucket) => {
     setManageAccessModal({ open: true, bucket, members: [], isLoading: true });
@@ -78,6 +78,27 @@ function App() {
       }
     } catch (err) { console.error(err); }
   };
+  const openBucketAudit = async (bucket) => {
+    setBucketAuditModal({ open: true, bucket, logs: [], isLoading: true });
+    try {
+      const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      const res = await fetch(`${API_BASE}/api/v1/vault/audit?bucket_uuid=${bucket.uuid}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const logs = await res.json();
+        setBucketAuditModal({ open: true, bucket, logs, isLoading: false });
+
+      } else {
+        throw new Error("Failed to fetch logs. Are you the owner?");
+      }
+    } catch (err) {
+      console.error(err);
+      setBucketAuditModal({ open: false, bucket: null, logs: [], isLoading: false });
+      setDialog({ open: true, type: 'ALERT', title: 'Audit Log Error', message: err.message });
+    }
+  };
+
   const fetchTrash = async () => {
     setIsFetching(true);
     try {
@@ -1332,6 +1353,7 @@ function App() {
                               ))}
                             </ul>
                           )}
+
                         </div>
                         <select value={sharePermission} onChange={(e) => setSharePermission(e.target.value)} style={{ flex: 1, padding: '10px' }}>
                           <option value="READ">Viewer</option>
@@ -1389,6 +1411,49 @@ function App() {
                   </div>
                 </div>
               )}
+              {/* 🆕 PANEL AUDIT LOG KHUSUS OWNER */}
+              {bucketAuditModal.open && (
+                <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(17, 24, 39, 0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+                  <div className="modal-content" style={{ background: '#ffffff', width: '800px', maxWidth: '95%', borderRadius: '12px', border: '1px solid #e5e7eb', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)', overflow: 'hidden', display: 'flex', flexDirection: 'column', maxHeight: '85vh' }}>
+
+                    {/* Header */}
+                    <div style={{ padding: '20px 25px', borderBottom: '1px solid #f3f4f6', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f9fafb' }}>
+                      <h3 style={{ margin: 0, color: '#111827' }}>📜 Security Audit Logs: {bucketAuditModal.bucket.name}</h3>
+                      <button onClick={() => setBucketAuditModal({ open: false, bucket: null, logs: [], isLoading: false })} style={{ background: 'transparent', border: 'none', color: '#9ca3af', fontSize: '1.2rem', cursor: 'pointer' }}>✖</button>
+                    </div>
+
+                    {/* Body Tabel Gelap (Bergaya Hacker/Admin) */}
+                    <div style={{ padding: '20px', overflowY: 'auto', flex: 1, backgroundColor: '#1e1e1e' }}>
+                      {bucketAuditModal.isLoading ? (
+                        <p style={{ color: '#fff', textAlign: 'center' }}>Fetching verifiable logs...</p>
+                      ) : bucketAuditModal.logs.length === 0 ? (
+                        <p style={{ color: '#aaa', textAlign: 'center' }}>No audit trail found for this namespace yet.</p>
+                      ) : (
+                        <table className="vault-table" style={{ fontSize: '0.85rem', color: '#fff', width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+                          <thead style={{ background: '#333' }}>
+                            <tr>
+                              <th style={{ padding: '10px' }}>Timestamp</th>
+                              <th style={{ padding: '10px' }}>Identity (Email)</th>
+                              <th style={{ padding: '10px' }}>Action</th>
+                              <th style={{ padding: '10px' }}>Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bucketAuditModal.logs.map(log => (
+                              <tr key={log.id} style={{ borderBottom: '1px solid #333' }}>
+                                <td style={{ padding: '10px' }}>{new Date(log.timestamp).toLocaleString()}</td>
+                                <td style={{ padding: '10px', color: '#aaa' }}>{log.user_email}</td>
+                                <td style={{ fontFamily: 'monospace', padding: '10px', color: '#2196F3' }}>{log.action}</td>
+                                <td style={{ color: log.status === 'FAILED' || log.status === 'BLOCKED' ? '#f44336' : '#4CAF50', padding: '10px', fontWeight: 'bold' }}>{log.status}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
               {buckets.length > 0 ? (
                 <table className="vault-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
                   <thead>
@@ -1440,9 +1505,13 @@ function App() {
                               <>
                                 <button onClick={() => triggerRenameBucket(bucket)} style={{ marginLeft: '5px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}>✎ Rename</button>
 
-                                {/* 🆕 TOMBOL SAKTI MANAGE ACCESS */}
+                                {/* TOMBOL SAKTI MANAGE ACCESS */}
                                 <button onClick={() => openManageAccess(bucket)} style={{ marginLeft: '5px', backgroundColor: '#8b5cf6', color: 'white', border: 'none' }}>
                                   👥 Manage Access
+                                </button>
+
+                                <button onClick={() => openBucketAudit(bucket)} style={{ marginLeft: '5px', backgroundColor: '#475569', color: 'white', border: 'none', padding: '6px 10px', borderRadius: '4px', cursor: 'pointer' }}>
+                                  📜 Logs
                                 </button>
 
                                 <button

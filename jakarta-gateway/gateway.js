@@ -11,7 +11,7 @@ import helmet from 'helmet';
 import Busboy from 'busboy';
 import { Readable } from 'node:stream';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
-import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket,strictBouncer } from './middleware.js';
+import { authorizeVault, validateFileSecurity, permitGlobalRole, authorizeBucket, strictBouncer } from './middleware.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -266,8 +266,14 @@ apiRouter.use('/vault/files', strictLimiter);
 
 apiRouter.use((req, res, next) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
-    const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
-    log.run(userEmail, `${req.method} ${req.path}`, 'AUTHORIZED');
+    const bucketUuid = req.headers['x-bucket-uuid']; 
+    if (bucketUuid) {
+        const log = db.prepare('INSERT INTO audit_logs (bucket_uuid, user_email, action, status) VALUES (?, ?, ?, ?)');
+        log.run(bucketUuid, userEmail, `${req.method} ${req.path}`, 'AUTHORIZED');
+    } else {
+        const log = db.prepare('INSERT INTO audit_logs (user_email, action, status) VALUES (?, ?, ?)');
+        log.run(userEmail, `${req.method} ${req.path}`, 'AUTHORIZED');
+    }
     next();
 });
 
@@ -678,7 +684,8 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
                             db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
                             versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
 
-                        } catch (e) { console.error("Cleanup failed"); 
+                        } catch (e) {
+                            console.error("Cleanup failed");
                             break;
                         }
                     }
@@ -1186,12 +1193,44 @@ apiRouter.post('/vault/notifications/clear', permitGlobalRole('standard_user'), 
     } catch (err) { res.status(500).json({ error: "Clear failed." }); }
 });
 
-apiRouter.get('/vault/audit', permitGlobalRole('admin'), (req, res) => {
+apiRouter.get('/vault/audit', permitGlobalRole('standard_user'), (req, res) => {
     try {
-        res.json(db.prepare(`SELECT id, user_email, action, status, timestamp FROM audit_logs ORDER BY timestamp DESC LIMIT 100`).all());
-    } catch (err) { res.status(500).json({ error: "Failed." }); }
-});
 
+        let roles = req.auth.payload[`${namespace}/roles`] || [];
+        const role = Array.isArray(roles) ? roles[0] : 'standard_user';
+        const userId = req.auth.payload.sub;
+
+        const targetBucketUuid = req.query.bucket_uuid;
+
+        if (targetBucketUuid) {
+            const bucket = db.prepare(`SELECT owner_id FROM buckets WHERE uuid = ?`).get(targetBucketUuid);
+            if (!bucket) {
+                return res.status(404).json({ error: "Bucket tidak ditemukan." });
+            }
+            if (bucket.owner_id !== userId && role !== 'admin') {
+                return res.status(403).json({ error: "Akses Ditolak: Anda bukan pemilik bucket ini." });
+            }
+            return res.json(db.prepare(`
+                SELECT id, user_email, action, status, timestamp 
+                FROM audit_logs 
+                WHERE bucket_uuid = ? 
+                ORDER BY timestamp DESC LIMIT 100
+            `).all(targetBucketUuid));
+        }
+        else if (role === 'admin') {
+            return res.json(db.prepare(`
+                SELECT id, user_email, action, status, timestamp 
+                FROM audit_logs 
+                ORDER BY timestamp DESC LIMIT 100
+            `).all());
+        }
+        return res.status(403).json({ error: "Akses Ditolak: Anda tidak memiliki izin untuk melihat log audit." });
+
+    } catch (err) {
+        console.error("Error di rute /vault/audit:", err);
+        return res.status(500).json({ error: "Failed.", detail: err.message });
+    }
+});
 apiRouter.get('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) => {
     try {
         const dbFiles = db.prepare(`SELECT v.physical_path, f.filename FROM versions v JOIN files f ON v.file_id = f.id`).all();

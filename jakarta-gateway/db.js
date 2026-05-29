@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS buckets (
   uuid TEXT UNIQUE NOT NULL,           
   name TEXT NOT NULL,                
   region TEXT DEFAULT 'sub-01',       
-  owner_id TEXT NOT NULL,             
+  owner_id TEXT NOT NULL,            
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   deleted_at TIMESTAMP DEFAULT NULL,
   FOREIGN KEY(owner_id) REFERENCES users(sub) ON DELETE CASCADE
@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS versions (
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bucket_uuid TEXT,
   user_email TEXT,
   action TEXT,
   status TEXT,

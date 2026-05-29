@@ -34,31 +34,25 @@ export const permitGlobalRole = (requiredRole) => {
     };
 };
 
-const hashFingerprint = (ip, ua) => {
+const hashFingerprint = (ua) => {
     // Hash it so the expected value isn't readable in the JWT
     return crypto
         .createHash('sha256')
-        .update(`${ip}||${ua}`)
+        .update(`${ua}`)
         .digest('hex');
 };
 
 export const validateFingerprint = (req, res, next) => {
     const tokenFingerprint = req.auth.payload['https://richardgatewayta.duckdns.org/fingerprint'];
-    console.log(`[SECURITY] Token Fingerprint: ${tokenFingerprint}`);
-
+    // console.log(`[SECURITY] Token Fingerprint: ${tokenFingerprint}`);
     if (!tokenFingerprint) {
         return res.status(401).json({ error: "Missing fingerprint claim in token." });
     }
-    // const currentIp = req.ip;
-    let rawIp = req.headers['x-forwarded-for']?.split(',')[0].trim()
-        || req.socket.remoteAddress
-        || req.ip
-        || 'unknown';
-    const currentIp = rawIp.startsWith('::ffff:') ? rawIp.substring(7) : rawIp;
     const currentUserAgent = req.headers['user-agent'];
     // const currentFingerprint = `${currentIp}-${currentUserAgent}`;
-    const currentFingerprint = hashFingerprint(currentIp, currentUserAgent);
-    console.warn(`[SECURITY] Validating fingerprint: Token=${tokenFingerprint} | Current=${currentFingerprint}`);
+
+    const currentFingerprint = hashFingerprint(currentUserAgent);
+    // console.warn(`[SECURITY] Validating fingerprint: Token=${tokenFingerprint} | Current=${currentFingerprint}`);
     if (tokenFingerprint !== currentFingerprint) {
         console.warn(`[SECURITY] Fingerprint mismatch for request to ${req.path}`);
         return res.status(401).json({ error: "Session validation failed. Please log in again." });
@@ -148,7 +142,14 @@ export const validateFileSecurity = (filename, headerMime, detectedType, buffer)
     const dangerousMimes = ['application/x-sh', 'application/x-shellscript', 'text/x-shellscript'];
     // 1. Ekstraksi Ekstensi yang Aman
     const lastDotIndex = filename.lastIndexOf('.');
-    if (lastDotIndex === -1) {
+    const isFolderPlaceholder = filename === '.keep' || buffer?.length === 0;
+
+    if (isFolderPlaceholder) {
+        console.log(`[UPLOAD] Bypass MIME sniffing untuk Virtual Folder: ${filename}`);
+        // PERBAIKAN 2: Gunakan sintaks 'return object' agar eksekusi langsung berhenti di sini
+        return { isSpoofed: false, finalMime: 'application/x-directory' };
+    }
+    else if (lastDotIndex === -1) {
         return { isSpoofed: true, finalMime: 'BLOCKED' };
     }
     const ext = filename.toLowerCase().substring(lastDotIndex);
