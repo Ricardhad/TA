@@ -3,6 +3,7 @@ import mime from 'mime-types';
 import db from './db.js';
 import { auth } from 'express-oauth2-jwt-bearer';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 dotenv.config();
 
 
@@ -32,15 +33,35 @@ export const permitGlobalRole = (requiredRole) => {
         next();
     };
 };
+
+const hashFingerprint = (ip, ua) => {
+    // Hash it so the expected value isn't readable in the JWT
+    return crypto
+        .createHash('sha256')
+        .update(`${ip}||${ua}`)
+        .digest('hex');
+};
+
 export const validateFingerprint = (req, res, next) => {
     const tokenFingerprint = req.auth.payload['https://richardgatewayta.duckdns.org/fingerprint'];
-    
-    const currentIp = req.ip;
+    console.log(`[SECURITY] Token Fingerprint: ${tokenFingerprint}`);
+
+    if (!tokenFingerprint) {
+        return res.status(401).json({ error: "Missing fingerprint claim in token." });
+    }
+    // const currentIp = req.ip;
+    let rawIp = req.headers['x-forwarded-for']?.split(',')[0].trim()
+        || req.socket.remoteAddress
+        || req.ip
+        || 'unknown';
+    const currentIp = rawIp.startsWith('::ffff:') ? rawIp.substring(7) : rawIp;
     const currentUserAgent = req.headers['user-agent'];
-    const currentFingerprint = `${currentIp}-${currentUserAgent}`;
+    // const currentFingerprint = `${currentIp}-${currentUserAgent}`;
+    const currentFingerprint = hashFingerprint(currentIp, currentUserAgent);
     console.warn(`[SECURITY] Validating fingerprint: Token=${tokenFingerprint} | Current=${currentFingerprint}`);
     if (tokenFingerprint !== currentFingerprint) {
-        return res.status(401).json({ error: "Contextual Identity Mismatch! Token Hijacking suspected. please login again." });
+        console.warn(`[SECURITY] Fingerprint mismatch for request to ${req.path}`);
+        return res.status(401).json({ error: "Session validation failed. Please log in again." });
     }
     next();
 };

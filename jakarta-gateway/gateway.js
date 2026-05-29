@@ -304,10 +304,10 @@ apiRouter.get('/vault/identity', (req, res) => {
     console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
     try {
         if (userSub && userEmail !== 'anonymous') {
-            db.prepare(`INSERT INTO users (sub, email) VALUES (?, ?) ON CONFLICT(sub) DO UPDATE SET email = excluded.email`).run(userSub, userEmail);
+            db.prepare(`INSERT INTO users (sub, email) VALUES (?, ?) ON CONFLICT(sub) DO UPDATE SET email = excluded.email  ON CONFLICT(email) DO UPDATE SET sub = excluded.sub`).run(userSub, userEmail);
         }
         res.json({ message: "username retrieved", user: userEmail, roles: userRoles });
-    } catch (err) { res.status(500).json({ error: "Database query failed" }); }
+    } catch (err) { res.status(400).json({ error: "user already exists or database error" }); }
 });
 
 apiRouter.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
