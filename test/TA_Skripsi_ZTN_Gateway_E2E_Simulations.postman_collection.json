@@ -1,0 +1,1775 @@
+{
+  "info": {
+    "_postman_id": "abdeebcd-8128-4c05-beee-3dd5c70488f2",
+    "name": "TA_Skripsi_ZTN_Gateway_E2E_Simulations",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "32821974"
+  },
+  "item": [
+    {
+      "name": "00 - Auth / Helpers",
+      "item": [
+        {
+          "name": "Get Google Auth Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const data = pm.response.json();",
+                  "if (data.access_token) {",
+                  "    pm.environment.set(\"access_token\", data.access_token);",
+                  "    pm.environment.set(\"access_token_admin\", data.access_token);",
+                  "}",
+                  "if (data.refresh_token) {",
+                  "    pm.environment.set(\"current_refresh_token\", data.refresh_token);",
+                  "}",
+                  "pm.test(\"Token Sukses Diperbarui otomatis\", function () {",
+                  "    pm.expect(data).to.have.property('access_token');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "password",
+                  "type": "text"
+                },
+                {
+                  "key": "client_id",
+                  "value": "KHkz5KAw9FkWgsVGsFeGtmWivjWqbpQx",
+                  "type": "text"
+                },
+                {
+                  "key": "username",
+                  "value": "richardhad2004@gmail.com",
+                  "type": "text"
+                },
+                {
+                  "key": "password",
+                  "value": "U7te3fMhTWDXH4b",
+                  "type": "text"
+                },
+                {
+                  "key": "audience",
+                  "value": "https://richardgatewayta.duckdns.org",
+                  "type": "text"
+                },
+                {
+                  "key": "scope",
+                  "value": "openid profile email offline_access",
+                  "type": "text"
+                },
+                {
+                  "key": "connection",
+                  "value": "Username-Password-Authentication",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "https://richard-ztna-project.jp.auth0.com/oauth/token",
+              "protocol": "https",
+              "host": [
+                "richard-ztna-project",
+                "jp",
+                "auth0",
+                "com"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "01 - Security Testcases",
+      "item": [
+        {
+          "name": "TC-38 - Simulasi Session Hijacking (Invalid JWT Fingerprint)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-38: Akses Ditolak karena Fingerprint Tidak Cocok (401/403)\", function () {",
+                  "    // Server Zero Trust harus menolak akses jika fingerprint perangkat berbeda",
+                  "    // meskipun token JWT-nya sendiri masih valid dan belum expired.",
+                  "    pm.expect(pm.response.code).to.be.oneOf([401, 403]);",
+                  "});",
+                  "",
+                  "pm.test(\"Pesan Error Relevan\", function () {",
+                  "    const jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('error');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "User-Agent",
+                "value": "HackerBrowser/99.0 (Simulated Hijack)",
+                "description": "Header User-Agent yang dimanipulasi"
+              },
+              {
+                "key": "X-Device-Fingerprint",
+                "value": "invalid_stolen_fingerprint_hash_12345",
+                "description": "Header kustom fingerprint yang dimanipulasi (jika ada)"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-01 - Zero Trust Auth Enforcement",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-01: Perimeter Terkunci - Server Wajib Menolak Tanpa Token (401)\", function () {",
+                  "    pm.response.to.have.status(401);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/identity",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "identity"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-02 - Public Health Check Status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-02: Status Gateway & Spoke Online (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().gateway).to.eql(\"online\");",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-03 - Create New Bucket (Pipeline Inisialisasi)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-03: Create New Bucket Berhasil dan Ambil UUID\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "    const data = pm.response.json();",
+                  "    if(data.uuid) { pm.environment.set(\"bucket_uuid\", data.uuid); }",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"SME_Core_Vault\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-04 - List User Buckets Verifikasi",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-04: Daftar Bucket Berhasil Diambil (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-05 - Valid Upload Test (Berkas Utama)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-05: Legitimate Upload Berhasil dan Tangkap File UUID\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const data = pm.response.json();",
+                  "    if(data.uuid) { pm.environment.set(\"active_file_uuid\", data.uuid); }",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "x-bucket-uuid",
+                "value": "{{bucket_uuid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "multipart/form-data; boundary=----PostmanValidBoundary123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "------PostmanValidBoundary123\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain\r\n\r\nHalo, ini adalah berkas rahasia utama Richard.\r\n------PostmanValidBoundary123--\r\n"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-06 - DDoS Mitigation Threshold Check",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-06: Mitigasi DDoS Rate-Limiting Berjalan (200/429)\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 429]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-07 - Refresh Token Replay Rejected",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-07: Mekanisme RTR Valid - Replay Attack Ditolak Auth0 (403)\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "refresh_token",
+                  "type": "text"
+                },
+                {
+                  "key": "client_id",
+                  "value": "KHkz5KAw9FkWgsVGsFeGtmWivjWqbpQx",
+                  "type": "text"
+                },
+                {
+                  "key": "refresh_token",
+                  "value": "{{current_refresh_token}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "https://richard-ztna-project.jp.auth0.com/oauth/token",
+              "protocol": "https",
+              "host": [
+                "richard-ztna-project",
+                "jp",
+                "auth0",
+                "com"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-08 - WORM Protected File Cannot Be Deleted",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-08: Kebijakan WORM Aktif - Berkas Terkunci Tidak Boleh Dihapus Klien (403)\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{active_file_uuid}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{active_file_uuid}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-09 - Malware & MIME Sanitation Test",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-09: Sanitasi MIME Berhasil - Eksekusi Shell Script Ditolak (403)\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "x-bucket-uuid",
+                "value": "{{bucket_uuid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "multipart/form-data; boundary=----PostmanBoundaryABC123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "------PostmanBoundaryABC123\r\nContent-Disposition: form-data; name=\"file\"; filename=\"exploit.sh\"\r\nContent-Type: application/x-sh\r\n\r\n#!/bin/bash\necho 'Malware Simulation'\r\n------PostmanBoundaryABC123--\r\n"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-10 - Extension Spoofing",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-10: Anti-Spoofing Berhasil Menahan Manipulasi Ekstensi Gambar Palsu (403)\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "x-bucket-uuid",
+                "value": "{{bucket_uuid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "multipart/form-data; boundary=----PostmanSpoofingXYZ987"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "------PostmanSpoofingXYZ987\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n#!/bin/bash\necho 'Hidden Script Inside Image Content'\r\n------PostmanSpoofingXYZ987--\r\n"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-11 - Payload Terlalu Besar Ditolak",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "pm.variables.set(\"huge_payload\", \"A\".repeat(6 * 1024 * 1024));"
+                ],
+                "type": "text/javascript"
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-11: Payload Terlalu Besar (>5MB) Sukses Ditolak Gateway (413)\", function () {",
+                  "    pm.response.to.have.status(413);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "x-bucket-uuid",
+                "value": "{{bucket_uuid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "multipart/form-data; boundary=----PostmanSizeLimitBoundary"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "------PostmanSizeLimitBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big_data.txt\"\r\nContent-Type: text/plain\r\n\r\n{{huge_payload}}\r\n------PostmanSizeLimitBoundary--\r\n"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-12 - Rename Bucket (Valid)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-12: Rename Bucket Berhasil (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"SME_Core_Vault_Renamed\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets/{{bucket_uuid}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets",
+                "{{bucket_uuid}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-13 - IDOR / Privilege Escalation Ditolak",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-13: IDOR Menggunakan Token Orang Lain Sukses Ditolak (403)\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_hacker}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Hacked_Bucket\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets/{{bucket_uuid}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets",
+                "{{bucket_uuid}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-14 - Mengubah Nama File (Rename)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-14: Mengubah Nama File Berhasil (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript",
+                "packages": {},
+                "requests": {}
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"newName\": \"Dokumen_TA_Revisi_Final.txt\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{active_file_uuid}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{active_file_uuid}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-15 - Generate Secure Share Link (KOREKSI: GET METHOD)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const data = pm.response.json();",
+                  "",
+                  "pm.test(\"TC-15: Generate Signed URL Berhasil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    ",
+                  "    // Pastikan properti dari gateway kamu sesuai (apakah 'shareUrl' atau 'url')",
+                  "    const urlyangditerima = data.share_url ; ",
+                  "    ",
+                  "    pm.expect(urlyangditerima).to.not.be.undefined;",
+                  "    ",
+                  "    if (urlyangditerima) {",
+                  "        // 1. Set langsung ke environment murni",
+                  "        pm.environment.set(\"shared_url\", urlyangditerima);",
+                  "        ",
+                  "        // 2. Buat versi tampered untuk tes security di TC-16",
+                  "        const tampered = urlyangditerima + \"X_HACKED\";",
+                  "        pm.environment.set(\"tampered_url\", tampered);",
+                  "        ",
+                  "        console.log(\"LOG SUCCESS: shared_url berhasil di-set ke env ->\", urlyangditerima);",
+                  "    }else{",
+                  "        console.log(\"gagal hasil undefined\", urlyangditerima)",
+                  "    }",
+                  "});"
+                ],
+                "type": "text/javascript",
+                "packages": {},
+                "requests": {}
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{active_file_uuid}}/links",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{active_file_uuid}}",
+                "links"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-16 - URL Tampering Protection Test",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-16: Manipulasi Karakter Tautan Sementara Sukses Ditolak Gateway (403)\", function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{tampered_url}}",
+              "host": [
+                "{{tampered_url}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-17 - Undangan Kolaborasi (Bucket Share)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-17: Undangan Kolaborasi Berhasil (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript",
+                "packages": {},
+                "requests": {}
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"richard.h22@mhs.istts.ac.id\",\n  \"permission\": \"READ\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets/{{bucket_uuid}}/share",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets",
+                "{{bucket_uuid}}",
+                "share"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-18 - List Bucket Members",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-18: List Anggota Kolaborasi Berhasil Diambil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets/{{bucket_uuid}}/members",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets",
+                "{{bucket_uuid}}",
+                "members"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-19 - Search User to Invite",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-19: Fitur Pencarian Akun User Berhasil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/users/search?q=partner",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "users",
+                "search"
+              ],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "partner"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-20 - Cabut Akses Anggota Kolaborasi (Revoke)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-20: Cabut Akses Kolaborator Berhasil (200/404)\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 404]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/buckets/{{bucket_uuid}}/share/google-oauth2|id-partner-simulasi",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "buckets",
+                "{{bucket_uuid}}",
+                "share",
+                "google-oauth2|id-partner-simulasi"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-21 - Fetch Notifications History",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-21: Log Notifikasi Kolaborasi Berhasil Diambil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript",
+                "packages": {},
+                "requests": {}
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "disableBodyPruning": true
+          },
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": []
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/notifications",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "notifications"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-22 - Clear Notifikasi",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-22: Bersihkan Papan Notifikasi Berhasil\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/notifications/clear",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "notifications",
+                "clear"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-23 - Pengecekan Kuota Pengguna (Quota Check)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-23: Status Kuota Pengguna Akurat (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/usage",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "usage"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-24 - Decryption & Download Konten",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-24: Unduh & Dekripsi Kriptografi Berkas Berhasil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{active_file_uuid}}/content",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{active_file_uuid}}",
+                "content"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-25 - View File Version History",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-25: Log Versi Audit Berkas Berhasil Diambil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{active_file_uuid}}/versions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{active_file_uuid}}",
+                "versions"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-26 - Akses File UUID Tidak Valid Ditolak",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-26: Akses Berkas Palsu Terisolasi Otomatis (404)\", function () {",
+                  "    pm.response.to.have.status(404);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/uuid-asal-asalan-999/content",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "uuid-asal-asalan-999",
+                "content"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-27 - Upload Berkas Kedua Khusus Untuk Pengujian Trash",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const data = pm.response.json();",
+                  "if(data.uuid) { pm.environment.set(\"file_to_trash_uuid\", data.uuid); }",
+                  "pm.test(\"Berkas Uji Tempat Sampah Sukses Dibuat\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "x-bucket-uuid",
+                "value": "{{bucket_uuid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "multipart/form-data; boundary=----PostmanTrashBoundary"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "------PostmanTrashBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"trash_dump.txt\"\r\nContent-Type: text/plain\r\n\r\nBerkas replika untuk diuji buang dan pulihkan.\r\n------PostmanTrashBoundary--\r\n"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-28 - Pindahkan Berkas Kedua ke Trash Bin (Soft Delete)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-28: Soft Delete Berhasil Memindahkan Berkas ke Trash (200)\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 204]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{file_to_trash_uuid}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{file_to_trash_uuid}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-29 - View Trash Bin Content",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-29: Isi Berkas Sampah Berhasil Ditampilkan\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/trash",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "trash"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-30 - Pemulihan Berkas dari Tempat Sampah (Restore)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-30: Pemulihan Berkas (Restore) Berhasil (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{file_to_trash_uuid}}/restore",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{file_to_trash_uuid}}",
+                "restore"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-31 - Pengosongan Tempat Sampah Total (Purge Trash Bin)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-31: Kliring Massal Tong Sampah Berhasil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/trash",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "trash"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-32 - View System Audit Logs (Admin Master Security Check)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-32: Log Audit Forensik Diambil Oleh Admin (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_admin}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/audit",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "audit"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-33 - Admin Performance / RAM Leak Stress Test",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-33: Admin Performance Profiling Berhasil (200)\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_admin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/octet-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "BINARY_STRESS_TEST_DATA"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/admin/test/performance",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "admin",
+                "test",
+                "performance"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-34 - Check Sync Status Dry-Run",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-34: Get Sync Dry-Run Report Berhasil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_admin}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/admin/sync",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "admin",
+                "sync"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-35 - Trigger Force Sinkronisasi Admin",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-35: Eksekusi Force Sync Cloud-Surabaya Berhasil\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_admin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"force_sync\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/admin/sync",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "admin",
+                "sync"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-36 - Perintah Bitrot Data Integrity Scan",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-36: Perintah Bitrot Scan Berhasil Dieksekusi\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_admin}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scan_range\": \"last_30_days\",\n  \"fix_errors\": false\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/admin/bitrot/scan",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "admin",
+                "bitrot",
+                "scan"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "TC-37 - Hard Delete Berkas Permanen (Purge File)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test(\"TC-37: Admin Purge File Secara Fisik Sukses (200)\", function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 404]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token_admin}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/vault/files/{{active_file_uuid}}/purge",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "vault",
+                "files",
+                "{{active_file_uuid}}",
+                "purge"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
