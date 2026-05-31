@@ -345,189 +345,6 @@ apiRouter.get('/vault/files', permitGlobalRole('standard_user'), (req, res) => {
     } catch (err) { res.status(500).json({ error: "Database query failed" }); }
 });
 
-// menggunakan fetch
-// apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
-//     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
-//     const USER_QUOTA = 5 * 1024 * 1024 * 1024;
-//     const MAX_SIZE = 1 * 1024 * 1024 * 1024;
-//     const VIDEO_MAX_SIZE = 50 * 1024 * 1024;
-//     const DEFAULT_MAX_SIZE = 5 * 1024 * 1024;
-
-//     const contentType = req.headers['content-type'];
-//     const contentLength = req.headers['content-length'];
-//     const activeLimit = (req.globalRole === 'admin') ? ADMIN_QUOTA : USER_QUOTA;
-//     const controller = new AbortController();
-
-//     req.on('error', (err) => {
-//         console.warn(`[UPLOAD-GATEWAY] Stream Error: ${err.message}`);
-//         controller.abort();
-//     });
-//     req.on('aborted', () => {
-//         console.warn(`[UPLOAD-GATEWAY] User membatalkan unggahan.`);
-//         controller.abort();
-//     });
-
-//     if (!contentType || !contentType.includes('multipart/form-data')) return res.status(400).json({ error: "Invalid Request" });
-//     if (contentLength && parseInt(contentLength) > MAX_SIZE) return res.status(413).json({ error: "File Too Large" });
-
-//     const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 }, highWaterMark: 16 * 1024 });
-//     const userId = req.auth.payload.sub;
-
-//     const bucketUuid = req.headers['x-bucket-uuid'];
-//     const folderPrefix = req.headers['x-file-prefix'] || '';
-//     const bucket = db.prepare('SELECT id FROM buckets WHERE uuid = ?').get(bucketUuid);
-
-//     if (!bucket) return res.status(404).json({ error: "Target bucket does not exist." });
-
-//     let isProcessing = false;
-//     let limitReached = false;
-
-//     busboy.on('file', async (name, file, info) => {
-//         if (isProcessing) return;
-//         isProcessing = true;
-
-//         const { filename, mimeType: headerMime } = info;
-//         const fullVirtualFilename = folderPrefix + filename;
-
-//         const pass = new PassThrough({ highWaterMark: 16 * 1024 });
-
-//         // Baca magic byte secara aman tanpa merusak rantai pipe utama
-//         const stream = file;
-//         const buffer = await new Promise((resolve, reject) => {
-//             const chunks = [];
-//             stream.once('data', (chunk) => {
-//                 chunks.push(chunk);
-//                 resolve(Buffer.concat(chunks));
-//             });
-//             stream.on('error', reject);
-//         });
-//         pass.write(buffer);
-
-//         const type = await fileTypeFromBuffer(buffer);
-//         const { isSpoofed, finalMime } = validateFileSecurity(filename, headerMime, type, buffer);
-//         const lastDotIndex = filename.lastIndexOf('.');
-//         const ext = lastDotIndex !== -1 ? filename.toLowerCase().substring(lastDotIndex) : '';
-//         const isVideo = ['.mp4', '.mov', '.webm'].includes(ext);
-//         const limit = isVideo ? VIDEO_MAX_SIZE : DEFAULT_MAX_SIZE;
-
-//         let uploadedBytes = buffer.length;
-//         let dynamicLimitReached = false;
-
-//         if (info.size > limit) {
-//             return res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
-//         }
-
-//         // --- SISTEM MANAJEMEN BACKPRESSURE OTOMATIS DAN AKURAT ---
-//         // Alirkan data dari Busboy ke PassThrough dengan pengawasan
-//         file.pipe(pass);
-
-//         file.on('data', (chunk) => {
-//             uploadedBytes += chunk.length;
-
-//             if (uploadedBytes > limit && !dynamicLimitReached) {
-//                 dynamicLimitReached = true;
-//                 console.warn(`[GATEWAY] Ditolak: ${filename} melewati limit ${limit / 1024 / 1024}MB.`);
-
-//                 file.unpipe(pass); // Putus hubungan aliran secara fisik
-//                 file.resume();     // Buang sisa data dari memori browser
-//                 pass.destroy(new Error("DYNAMIC_LIMIT_EXCEEDED"));
-
-//                 if (!res.headersSent) {
-//                     res.status(413).json({ error: `File terlalu besar. Limit untuk ${ext} adalah ${limit / 1024 / 1024}MB` });
-//                 }
-//             }
-//         });
-
-//         file.on('limit', () => { limitReached = true; });
-
-//         // Eksekusi pengiriman ke Spoke
-//         (async () => {
-//             try {
-//                 if (isSpoofed) {
-//                     file.resume();
-//                     if (!res.headersSent) return res.status(403).json({ error: "Security Violation" });
-//                     return;
-//                 }
-
-//                 const usage = db.prepare(`SELECT SUM(v.size) as total_used FROM versions v JOIN files f ON v.file_id = f.id WHERE f.owner_id = ?`).get(userId);
-//                 if ((usage.total_used || 0) >= activeLimit) {
-//                     file.resume();
-//                     if (!res.headersSent) return res.status(403).json({ error: "Quota Exceeded" });
-//                     return;
-//                 }
-
-//                 const spokeResponse = await spokeFetch(`/internal/files`, {
-//                     method: 'POST',
-//                     body: pass,
-//                     duplex: 'half',
-//                     signal: controller.signal,
-//                     headers: {
-//                         'x-original-name': filename,
-//                         'content-type': headerMime
-//                     }
-//                 });
-
-//                 if (limitReached) {
-//                     if (!res.headersSent) return res.status(413).json({ error: "File Too Large" });
-//                     return;
-//                 }
-//                 if (!spokeResponse.ok) throw new Error(`Spoke rejected upload`);
-
-//                 const data = await spokeResponse.json();
-//                 const { physical_path, size, checksum } = data;
-
-//                 let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
-//                 if (!fileRecord) {
-//                     const uuid = randomUUID();
-//                     const info = db.prepare('INSERT INTO files (uuid, filename, owner_id, mime_type, bucket_id) VALUES (?, ?, ?, ?, ?)').run(uuid, fullVirtualFilename, userId, finalMime, bucket.id);
-//                     fileRecord = { id: info.lastInsertRowid, uuid: uuid };
-//                 } else {
-//                     db.prepare('UPDATE files SET mime_type = ? WHERE id = ?').run(finalMime, fileRecord.id);
-//                 }
-
-//                 let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-//                 while (versions.length >= 5) {
-//                     try {
-//                         await spokeFetch(`/vault/delete/${versions[0].physical_path}`, { method: 'DELETE' });
-//                         db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
-//                         versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-//                     } catch (e) { console.error("Cleanup failed"); }
-//                 }
-
-//                 const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
-//                 const newVersion = (lastVersion.v || 0) + 1;
-//                 db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
-
-//                 if (!res.headersSent) {
-//                     res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
-//                 }
-//                 setImmediate(() => { req.destroy(); });
-//             } catch (err) {
-//                 file.resume();
-//                 if (err.name === 'AbortError') {
-//                     console.warn("[UPLOAD] Streaming ke Spoke dihentikan karena pembatalan user.");
-//                 } else if (err.message !== "DYNAMIC_LIMIT_EXCEEDED") {
-//                     console.error("[UPLOAD ERROR]", err.message);
-//                 }
-
-//                 if (!res.headersSent) {
-//                     res.status(500).json({ error: "Gateway stream interrupted.", error_detail: err.message });
-//                 }
-//             }
-//         })();
-//     });
-
-//     busboy.on('finish', () => {
-//         if (!isProcessing) {
-//             console.warn("[SECURITY ALERT] Request Multipart masuk tanpa menyertakan part file.");
-//             if (!res.headersSent) {
-//                 return res.status(400).json({ error: "Bad Request", message: "No file payload detected in multipart form data." });
-//             }
-//         }
-//     });
-
-//     req.pipe(busboy);
-// });
 // menggunakan http request 
 apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucket('WRITE'), (req, res) => {
     const ADMIN_QUOTA = 50 * 1024 * 1024 * 1024;
@@ -921,23 +738,7 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
     }
 });
 // gateway.js - Soft Delete
-// apiRouter.delete('/vault/files/:uuid', authorizeVault('WRITE'), async (req, res) => {
-//     const { uuid } = req.params;
-//     try {
-//         const file = db.prepare('SELECT id FROM files WHERE uuid = ?').get(uuid);
-//         if (!file) return res.status(404).json({ error: "File not found." });
 
-//         // Ubah status: isi deleted_at dengan timestamp saat ini
-//         db.prepare("UPDATE files SET deleted_at = datetime('now') WHERE id = ?").run(file.id);
-
-//         res.status(200).json({ 
-//             status: "Success", 
-//             message: "File moved to trash bin." 
-//         });
-//     } catch (err) {
-//         res.status(500).json({ error: "Failed to move file to trash." });
-//     }
-// });
 apiRouter.put('/vault/files/:uuid', renamelimit, authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     const { newName } = req.body;
@@ -1115,15 +916,19 @@ apiRouter.post('/vault/buckets/:bucketUuid/share', shareFiturLimiter, permitGlob
         const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
         db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, ?) ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission`).run(bucket.id, targetUser.sub, permission);
+        //  console.log(bucket.name);
+        db.prepare(`INSERT INTO notifications (user_id,message, timestamp) VALUES (?, ?, ?)`).run(targetUser.sub, `You have been granted ${permission} access to the bucket '${bucket.name}'.`, new Date().toISOString());
         res.json({ status: "Invitation Successful" });
     } catch (err) { res.status(500).json({ error: "Failed to invite user." }); }
 });
 
 apiRouter.delete('/vault/buckets/:bucketUuid/share/:userId', shareFiturLimiter, authorizeBucket('ADMIN'), (req, res) => {
     try {
-        const bucket = db.prepare('SELECT id, owner_id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
+        const bucket = db.prepare('SELECT id, owner_id, name FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (req.params.userId === bucket.owner_id) return res.status(400).json({ error: "Cannot revoke access from the bucket owner." });
         db.prepare('DELETE FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?').run(bucket.id, req.params.userId);
+        // console.log(bucket.name);
+        db.prepare(`INSERT INTO notifications (user_id,message, timestamp) VALUES (?, ?, ?)`).run( req.params.userId, `Your access to the bucket '${bucket.name}' has been revoked.`, new Date().toISOString());
         res.json({ status: "Access revoked successfully." });
     } catch (err) { res.status(500).json({ error: "Failed to remove member." }); }
 });
@@ -1139,17 +944,7 @@ apiRouter.put('/vault/buckets/:bucketUuid', renamelimit, authorizeBucket('ADMIN'
     } catch (err) { res.status(500).json({ error: "Failed to update bucket." }); }
 });
 
-// apiRouter.delete('/vault/buckets/:bucketUuid', permitGlobalRole('standard_user'), (req, res) => {
-//     try {
-//         const bucket = db.prepare('SELECT id, name, owner_id FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
-//         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
-//         if (bucket.owner_id !== req.auth.payload.sub && req.globalRole !== 'admin') return res.status(403).json({ error: "Access Denied." });
-//         const fileCount = db.prepare('SELECT COUNT(*) as count FROM files WHERE bucket_id = ?').get(bucket.id);
-//         if (fileCount.count > 0) return res.status(409).json({ error: "Bucket is not empty." });
-//         db.prepare('DELETE FROM buckets WHERE id = ?').run(bucket.id);
-//         res.json({ status: "Bucket Deleted" });
-//     } catch (err) { res.status(500).json({ error: "Failed to delete bucket." }); }
-// });
+
 // gateway.js - Hard Delete Bucket
 apiRouter.delete('/vault/buckets/:uuid', authorizeBucket('ADMIN'), async (req, res) => {
     const { uuid } = req.params;
@@ -1272,127 +1067,7 @@ apiRouter.post('/vault/admin/sync', permitGlobalRole('admin'), async (req, res) 
         res.json({ message: "Sync Complete", report });
     } catch (err) { res.status(500).json({ error: "Sync failed." }); }
 });
-// apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
-//     const controller = new AbortController();
-//     req.setTimeout(0);
 
-//     req.on('error', (err) => {
-//         console.warn(`[GATEWAY SAFE-CATCH] Stream Error: ${err.message}`);
-//         controller.abort();
-//         pass.destroy(new Error("client stream error"));
-//     });
-
-//     const pass = new PassThrough({ highWaterMark: 16 * 1024 });
-
-//     req.on('aborted', () => {
-//         console.warn(`[GATEWAY SAFE-CATCH] Klien membatalkan unggahan secara sepihak.`);
-//         controller.abort();
-//         pass.destroy(new Error("client aborted"));
-//     });
-
-//     // 🚨 1. DEKLARASI BATAS MAKSIMAL TRANSFER (1 GB + Toleransi 50 MB)
-//     const MAX_BENCHMARK_SIZE = (1024 * 1024 * 1024) + (50 * 1024 * 1024);
-//     let uploadedBytes = 0;
-//     let limitReached = false;
-
-//     req.on('data', (chunk) => {
-//         uploadedBytes += chunk.length;
-
-//         if (uploadedBytes > MAX_BENCHMARK_SIZE && !limitReached) {
-//             limitReached = true;
-//             console.warn(`[SECURITY] Transfer dihentikan! Benchmark melebihi batas aman 1 GB.`);
-
-//             req.pause(); // Rem paksa
-//             req.destroy(new Error("PAYLOAD_TOO_LARGE")); // Tebas hulu (koneksi React)
-//             pass.destroy(new Error("PAYLOAD_TOO_LARGE")); // Tebas hilir (pipa internal)
-
-//             if (!res.headersSent) {
-//                 return res.status(413).json({ error: "Benchmark melebihi kapasitas maksimal (1 GB)." });
-//             }
-//             return;
-//         }
-//         const currentRAM_MB = process.memoryUsage().rss / (1024 * 1024);
-
-//         // --- BACKPRESSURE RAM (Pembatas Kecepatan Memori) ---
-//         const canContinue = pass.write(chunk);
-//         if (!canContinue || currentRAM_MB > 400) {
-//             if (currentRAM_MB > 400) {
-//                 console.warn(`[RAM GUARD] Mengerem jaringan! RAM kritis: ${currentRAM_MB.toFixed(2)} MB`);
-//             }
-//             req.pause(); // Rem paksa hulu dari localhost agar RAM tidak menabrak 450 MB PM2
-//         }
-//     });
-
-//     pass.on('drain', () => {
-//         setTimeout(() => {
-//             if (req.readable && !limitReached) {
-//                 req.resume();
-//             }
-//         }, 50);
-//     });
-
-//     req.on('end', () => {
-//         if (!limitReached) pass.end();
-//     });
-
-//     try {
-//         const spokeResponse = await spokeFetch(`/internal/files/test/upload`, {
-//             method: 'POST',
-//             body: pass,
-//             duplex: 'half',
-//             signal: controller.signal,
-//             headers: {
-//                 'Content-Type': req.headers['content-type'] || 'application/octet-stream'
-//             }
-//         });
-
-//         if (!spokeResponse.ok) {
-//             throw new Error(`Spoke menolak paket. Status: ${spokeResponse.status}`);
-//         }
-
-//         const data = await spokeResponse.json();
-
-//         if (!res.headersSent) {
-//             res.json({
-//                 message: "Benchmark Complete",
-//                 spoke_received_gb: data.size_gb,
-//                 note: data.note || "Stress test successful"
-//             });
-//         }
-//     } catch (err) {
-//         if (err.name === 'AbortError') {
-//             console.warn("[GATEWAY] Fetch ke Spoke dibatalkan karena klien terputus.");
-//         } else if (err.message !== "PAYLOAD_TOO_LARGE") {
-//             console.error("[GATEWAY] Benchmark route error:", err.message);
-//         }
-
-//         if (!res.headersSent) {
-//             res.status(500).json({ error: "Stream Interrupted: " + err.message });
-//         }
-//     }
-// });
-// apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
-//     try {
-//         const spokeResponse = await spokeFetch(`/internal/files/test/upload`, { 
-//             method: 'POST', 
-//             body: req,            // <-- Alirkan request mentah langsung ke Surabaya
-//             duplex: 'half',       // <-- Syarat wajib Node.js fetch untuk aliran (Stream)
-//             headers: {
-//                 'Content-Type': req.headers['content-type'] || 'application/octet-stream'
-//             }
-//         });
-//         const data = await spokeResponse.json();
-
-//         res.json({ 
-//             message: "Benchmark Complete", 
-//             spoke_received_gb: data.size_gb,
-//             note: data.note || "Stress test successful"
-//         });
-//     } catch (err) { 
-//         console.error("Benchmark route error:", err);
-//         res.status(500).json({ error: err.message }); 
-//     }
-// });
 apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async (req, res) => {
     req.setTimeout(0);
 
