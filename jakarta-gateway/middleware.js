@@ -16,7 +16,7 @@ export const bouncer = auth({
 export const permitGlobalRole = (requiredRole) => {
     return (req, res, next) => {
         if (req.auth && req.auth.payload && req.auth.payload.gty === 'client-credentials') {
-            console.log("[RBAC] Machine-to-Machine token detected. Granting Admin bypass.");
+            console.warn("[RBAC] Machine-to-Machine token detected. Granting Admin bypass.");
             req.globalRole = 'admin'; // Berikan Spoke hak akses penuh
             return next();
         }
@@ -43,6 +43,9 @@ const hashFingerprint = (ua) => {
 };
 
 export const validateFingerprint = (req, res, next) => {
+    if (req.auth && req.auth.payload && req.auth.payload.gty === 'client-credentials') {
+        return next();
+    }
     const tokenFingerprint = req.auth.payload['https://richardgatewayta.duckdns.org/fingerprint'];
     // console.log(`[SECURITY] Token Fingerprint: ${tokenFingerprint}`);
     if (!tokenFingerprint) {

@@ -84,21 +84,19 @@ let gatewayTokenExpiry = 0;
 async function getGatewayToken() {
     const now = Math.floor(Date.now() / 1000);
 
-    // Gunakan token lama jika belum kedaluwarsa agar tidak membebani limit Auth0
     if (cachedGatewayToken && now < gatewayTokenExpiry) {
         return cachedGatewayToken;
     }
 
     console.log("[AUTH] Fetching fresh M2M token from Auth0 to contact Gateway...");
 
-    // Spoke meminta token ke Auth0
     const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
             client_id: process.env.M2M_CLIENT_ID,
             client_secret: process.env.M2M_CLIENT_SECRET,
-            audience: process.env.AUTH0_AUDIENCE, // Sesuai dengan API Gateway Anda
+            audience: process.env.AUTH0_AUDIENCE, 
             grant_type: 'client_credentials'
         })
     });
@@ -283,8 +281,6 @@ app.post('/internal/maintenance/purge', async (req, res) => {
 // AGEN PEMINDAI BIT ROT
 app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
     res.json({ status: "Bit Rot scan initiated in the background." });
-
-    // 🆕 FIX: Menggunakan STORAGE_DIR bukan 'vault_data'
     console.log(`[MAINTENANCE] Starting Bit Rot Scan on ${STORAGE_DIR}...`);
 
     try {
@@ -307,20 +303,18 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
 
         console.log(`[MAINTENANCE] Scan complete. Audited ${reportPayload.length} files. Sending to Gateway...`);
 
-        // Untuk menembak ke Gateway, kita membutuhkan akses token M2M dari Spoke
-        // Anda perlu mereplikasi logika getSpokeToken() di sini jika Gateway mewajibkan autentikasi
-        // Asumsi sementara rute Gateway ini dilindungi JWT.
-
-        // --- CONTOH PEMANGGILAN FETCH (Sesuaikan URL) ---
+        
         const GATEWAY_URL = 'https://richardgatewayta.duckdns.org:8080';
         const token = await getGatewayToken();
+        console.log(token);
         const gatewayResponse = await fetch(`${GATEWAY_URL}/api/v1/vault/admin/bitrot/report`, {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
             body: JSON.stringify(reportPayload)
         });
         if (!gatewayResponse.ok) {
-            throw new Error(`Gateway rejected the report with status: ${gatewayResponse.status}`);
+            throw new Error(`Gateway rejected the report with status: ${gatewayResponse.status}, detail: ${await gatewayResponse.text()}`);
+
         }
 
         console.log("[MAINTENANCE] Report successfully delivered to Gateway.");

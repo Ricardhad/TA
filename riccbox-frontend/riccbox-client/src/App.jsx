@@ -394,8 +394,8 @@ function App() {
         setDialog({ open: true, type: 'ALERT', title: 'Namespace Destroyed', message: data.message });
       }
       else if (type === 'RENAME_FILE') {
-        if (!inputValue || inputValue === targetData.filename.replace(currentPrefix, '')) {
-          return closeDialog(); // Tidak ada perubahan, tutup saja
+      if (!inputValue || inputValue === targetData.filename) {
+          return closeDialog(); 
         }
         let finalName = inputValue;
 
@@ -1627,19 +1627,19 @@ function App() {
                       <tr key={item.uuid} style={{ borderBottom: '1px solid #e0e0e0' }}>
                         <td style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '10px' }}>
                           {item.type === 'folder' ? (
-                            <>
+                            <div onClick={() => setCurrentPrefix(currentPrefix + item.displayName + '/')} style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
                               <span style={{ fontSize: '1.5rem' }}>📁</span>
-                              <strong style={{ cursor: 'pointer', color: '#000' }} onClick={() => setCurrentPrefix(currentPrefix + item.displayName + '/')}>
+                              <strong style={{ cursor: 'pointer', color: '#000' }}>
                                 {item.displayName}
                               </strong>
-                            </>
+                            </div>
                           ) : (
-                            <>
+                            <div>
                               <span style={{ fontSize: '1.5rem' }}>📄</span>
                               <span style={{ cursor: 'pointer', color: '#2196F3' }} onClick={() => openInspector(item)}>
                                 {item.displayName}
                               </span>
-                            </>
+                            </div>
                           )}
                         </td>
                         <td style={{ padding: '12px', color: '#555' }}>{item.type === 'folder' ? '-' : formatBytes(item.size)}</td>

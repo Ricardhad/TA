@@ -209,9 +209,12 @@ async function getSpokeToken() {
 
             console.log(`[AUTH] New token issued ending in: ...${cachedM2MToken.slice(-5)}`);
             return cachedM2MToken;
+        } catch (error) {
+            console.error("[AUTH ERROR] Failed to fetch M2M token:", error);
+            throw error;
         } finally {
             tokenPromise = null;
-        }
+        } 
     })();
 
     return await tokenPromise;
@@ -1155,6 +1158,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
     });
 });
 apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, res) => {
+    try {
     let corruptedFiles = 0;
     for (const item of req.body) {
         const dbRecord = db.prepare('SELECT checksum, id FROM versions WHERE physical_path = ?').get(item.path);
@@ -1164,6 +1168,7 @@ apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, re
         }
     }
     res.json({ message: "Scan complete", corrupted: corruptedFiles });
+   } catch (err) { res.status(500).json({ error: "Failed to process report.", detail: err.message }); }
 });
 
 apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req, res) => {
