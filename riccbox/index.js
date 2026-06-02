@@ -306,7 +306,7 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
         
         const GATEWAY_URL = 'https://richardgatewayta.duckdns.org:8080';
         const token = await getGatewayToken();
-        console.log(token);
+        // console.log(token);
         const gatewayResponse = await fetch(`${GATEWAY_URL}/api/v1/vault/admin/bitrot/report`, {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
