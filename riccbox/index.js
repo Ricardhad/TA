@@ -96,7 +96,7 @@ async function getGatewayToken() {
         body: JSON.stringify({
             client_id: process.env.M2M_CLIENT_ID,
             client_secret: process.env.M2M_CLIENT_SECRET,
-            audience: process.env.AUTH0_AUDIENCE, 
+            audience: process.env.AUTH0_AUDIENCE,
             grant_type: 'client_credentials'
         })
     });
@@ -159,64 +159,142 @@ app.use((err, req, res, next) => {
     }
     next(err);
 });
+// app.post('/internal/files', async (req, res) => {
+//     const originalName = req.headers['x-original-name'] || 'uploaded-file';
+//     const isVideo = ['.mp4', '.mov', '.webm'].some(ext => originalName.toLowerCase().endsWith(ext));
+
+//     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
+//     const vaultPath = path.join(STORAGE_DIR, safeName);
+
+//     try {
+//         console.log("[SPOKE] Menerima aliran data dari Gateway...");
+        
+//         // Konfigurasi Cipher AES-256-GCM
+//         const iv = crypto.randomBytes(12);
+//         const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+//         const writeStream = fs.createWriteStream(vaultPath);
+
+//         writeStream.write(iv); // Tulis 12 byte IV di depan file .enc
+
+//         if (isVideo) {
+//             console.log("[SPOKE] Sanitasi video via PURE STREAMING (sesuai buku)...");
+//             const sanitizer = spawn(ffmpegInstaller.path, [
+//                 '-hide_banner', '-loglevel', 'error',
+//                 '-probesize', '500M', '-analyzeduration', '500M',
+//                 '-err_detect', 'ignore_err',
+//                 '-fflags', '+genpts+discardcorrupt+igndts',
+//                 '-i', 'pipe:0', // Ambil dari stdin
+//                 '-map_metadata', '-1',
+//                 '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+//                 '-c:a', 'aac', '-f', 'mp4',
+//                 '-movflags', 'frag_keyframe+empty_moov', // <--- KUNCI DARI BUKU ANDA!
+//                 'pipe:1' // Lemparkan ke stdout
+//             ]);
+
+//             // Tangkap log error FFmpeg jika ada yang aneh
+//             sanitizer.stderr.on('data', (data) => {
+//                 console.warn(`[FFMPEG]: ${data}`);
+//             });
+
+//             // Pipa 1: Alirkan request mentah langsung ke mulut (stdin) FFmpeg
+//             req.pipe(sanitizer.stdin);
+
+//             // Pipa 2: Alirkan muntahan (stdout) FFmpeg langsung ke Cipher, lalu ke Disk
+//             await pipeline(sanitizer.stdout, cipher, writeStream);
+
+//         } else {
+//             // Jika bukan video, langsung alirkan dari request ke Cipher lalu ke Disk
+//             await pipeline(req, cipher, writeStream);
+//         }
+
+//         // Finalisasi: Tulis 16 byte Auth Tag di paling belakang
+//         const authTag = cipher.getAuthTag();
+//         fs.appendFileSync(vaultPath, authTag);
+
+//         const finalChecksum = await calculateFileHash(vaultPath);
+//         const stats = fs.statSync(vaultPath);
+
+//         console.log(`[SPOKE] Sukses! File tersimpan aman: ${safeName} (${stats.size} bytes)`);
+//         res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
+
+//     } catch (err) {
+//         console.error(`[SPOKE ERROR]: ${err.message}`);
+//         if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); // Hapus jika gagal
+//         if (!res.headersSent) res.status(500).json({ error: "Processing Failed" });
+//     }
+// });
 
 app.post('/internal/files', async (req, res) => {
     const originalName = req.headers['x-original-name'] || 'uploaded-file';
     const isVideo = ['.mp4', '.mov', '.webm'].some(ext => originalName.toLowerCase().endsWith(ext));
 
-    // 1. Tentukan path file sementara untuk proses sanitasi
-    const tempFilePath = path.join(STORAGE_DIR, `temp-${Date.now()}.tmp`);
+    // 1. Tentukan path file sementara HANYA 2 (Mentah dan Bersih)
+    const tempRawPath = path.join(STORAGE_DIR, `temp-raw-${Date.now()}.tmp`);
+    const tempCleanPath = path.join(STORAGE_DIR, `temp-clean-${Date.now()}.tmp`);
     const safeName = `${Date.now()}-${originalName.replace(/\s+/g, '_')}.enc`;
     const vaultPath = path.join(STORAGE_DIR, safeName);
 
     try {
-        // 2. Buffer file ke disk dulu sampai selesai (Ini menjamin FFmpeg punya data utuh)
-        await pipeline(req, fs.createWriteStream(tempFilePath));
-        console.log("[SPOKE] Upload selesai, memulai sanitasi...");
+        // 2. Buffer file ke disk dulu menggunakan tempRawPath
+        await pipeline(req, fs.createWriteStream(tempRawPath));
+        console.log("[SPOKE] Upload selesai, memulai pemrosesan...");
 
-        // 3. Konfigurasi Cipher
-        const iv = crypto.randomBytes(12);
-        const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
-        const writeStream = fs.createWriteStream(vaultPath);
-        
-        // let encrypted = cipher.update(MASTER_KEY, 'utf8', 'hex');
-        // encrypted += cipher.final('hex');
-        writeStream.write(iv);
-        // writeStream.write(encrypted, 'hex');
+        // 3. Jika Video, jalankan sanitasi
         if (isVideo) {
-            // Jalankan FFmpeg membaca dari file .tmp
+            console.log("[SPOKE] Sanitasi video dengan FFmpeg...");
             const sanitizer = spawn(ffmpegInstaller.path, [
                 '-hide_banner', '-loglevel', 'error',
-                '-i', tempFilePath, // Baca dari file temp yang sudah utuh
+                '-i', tempRawPath, // Baca dari file mentah yang benar
                 '-map_metadata', '-1',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
                 '-c:a', 'aac',
                 '-f', 'mp4',
                 '-movflags', '+faststart',
-                'pipe:1'
+                tempCleanPath // Output ke file bersih
             ]);
 
-            await pipeline(sanitizer.stdout, cipher, writeStream);
-        } else {
-            await pipeline(fs.createReadStream(tempFilePath), cipher, writeStream);
-        }
+            await new Promise((resolve, reject) => {
+                sanitizer.on('close', (code) => {
+                    if (code === 0) resolve();
+                    else reject(new Error(`FFmpeg exit code: ${code}`));
+                });
+                sanitizer.on('error', reject);
+            });
+            console.log("[SPOKE] Sanitasi selesai. Memulai enkripsi...");
+        } 
 
-        // Finalisasi
+        // 4. Finalisasi Enkripsi
+        // Jika video pakai yang Clean, jika gambar/dokumen pakai yang Raw
+        const fileToEncrypt = isVideo ? tempCleanPath : tempRawPath;
+        
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+        const writeStream = fs.createWriteStream(vaultPath);
+
+        writeStream.write(iv); // Tulis IV di depan file .enc
+
+        // Alirkan file yang sudah dipilih ke dalam cipher
+        await pipeline(fs.createReadStream(fileToEncrypt), cipher, writeStream);
+
+        // Tulis Auth Tag di paling belakang
         const authTag = cipher.getAuthTag();
         fs.appendFileSync(vaultPath, authTag);
 
-        // 4. Cleanup
-        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        // 5. Cleanup (Hapus HANYA file sementara yang memang ada)
+        if (fs.existsSync(tempRawPath)) fs.unlinkSync(tempRawPath);
+        if (fs.existsSync(tempCleanPath)) fs.unlinkSync(tempCleanPath);
 
         const finalChecksum = await calculateFileHash(vaultPath);
         const stats = fs.statSync(vaultPath);
 
         res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
-
     } catch (err) {
         console.error(`[SPOKE ERROR]: ${err.message}`);
-        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        // Pastikan cleanup jalan jika terjadi eror
+        if (fs.existsSync(tempRawPath)) fs.unlinkSync(tempRawPath);
+        if (fs.existsSync(tempCleanPath)) fs.unlinkSync(tempCleanPath);
         if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+        
         if (!res.headersSent) res.status(500).json({ error: "Processing Failed" });
     }
 });
@@ -303,7 +381,7 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
 
         console.log(`[MAINTENANCE] Scan complete. Audited ${reportPayload.length} files. Sending to Gateway...`);
 
-        
+
         const GATEWAY_URL = 'https://richardgatewayta.duckdns.org:8080';
         const token = await getGatewayToken();
         // console.log(token);
