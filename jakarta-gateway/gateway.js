@@ -1263,10 +1263,9 @@ app.use((err, req, res, next) => {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
         } catch (dbErr) { console.error("Log fail:", dbErr.message); }
-        res.status(err.status).json({ error: err.message });
+        return res.status(err.status|| 401).json({ error: err.message });
         // return res.status().json({ error: "Unauthorized", message: err.message });
     }
-
     console.error("[SERVER ERROR]", err);
     res.status(500).json({ error: "Internal Error" });
 });
