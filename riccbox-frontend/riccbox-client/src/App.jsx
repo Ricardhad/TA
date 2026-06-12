@@ -245,10 +245,12 @@ function App() {
   const checkIdentity = async () => {
     try {
       const token = await getAccessTokenSilently({ authorizationParams: { audience: AUDIENCE } });
+      // console.log("DEBUG: Token yang dikirim:", token);
       const res = await fetch(`${API_BASE}/api/v1/vault/identity`, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
+      // console.log("Identity Check:", data.roles[0]);
       if (data.roles && data.roles.includes('admin')) setUserRole('admin');
-    } catch (err) { console.error(err); }
+    } catch (err) { console.error(err.message); }
   };
 
   const fetchUsage = async () => {

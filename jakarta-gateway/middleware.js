@@ -35,7 +35,6 @@ export const permitGlobalRole = (requiredRole) => {
 };
 
 const hashFingerprint = (ua) => {
-    // Hash it so the expected value isn't readable in the JWT
     return crypto
         .createHash('sha256')
         .update(`${ua}`)

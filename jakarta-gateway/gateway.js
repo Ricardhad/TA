@@ -69,7 +69,7 @@ const apiRouter = express.Router();
 
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
-const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
+const namespace ='https://richardgatewayta.duckdns.org';
 const createTimeLimiter = (minute, maxamount, message) => {
     return rateLimit({
         windowMs: minute * 60 * 1000,
@@ -314,14 +314,15 @@ apiRouter.get('/vault/identity', (req, res) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
     const userSub = req.auth?.payload.sub;
-    console.log(userRoles,userEmail)
-    console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
+    // console.log(userRoles[0],userEmail)
+    // console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
     try {
         if (userSub && userEmail !== 'anonymous') {
-            db.prepare(`INSERT INTO users (sub, email) VALUES (?, ?) ON CONFLICT(sub) DO UPDATE SET email = excluded.email  ON CONFLICT(email) DO UPDATE SET sub = excluded.sub`).run(userSub, userEmail);
+            db.prepare(`INSERT OR REPLACE INTO users (sub, email) 
+            VALUES (?, ?)`).run(userSub, userEmail);
         }
-        res.json({ message: "username retrieved", user: userEmail, roles: userRoles });
-    } catch (err) { res.status(400).json({ error: "user already exists or database error" }); }
+        res.json({ message: "username retrieved", user: userEmail, roles: userRoles[0] });
+    } catch (err) {console.error("Database Error:", err); return res.status(400).json({ error: "user already exists or database error" }); }
 });
 
 apiRouter.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
