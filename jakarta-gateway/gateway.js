@@ -69,7 +69,7 @@ const apiRouter = express.Router();
 
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
-const namespace ='https://richardgatewayta.duckdns.org';
+const namespace = 'https://richardgatewayta.duckdns.org';
 const createTimeLimiter = (minute, maxamount, message) => {
     return rateLimit({
         windowMs: minute * 60 * 1000,
@@ -189,17 +189,28 @@ async function getSpokeToken() {
     }
 
     console.log("[AUTH] Fetching fresh M2M token from Auth0...");
-    const params = new URLSearchParams();
-    params.append('client_id', process.env.M2M_CLIENT_ID.trim());
-    params.append('client_secret', process.env.M2M_CLIENT_SECRET.trim());
-    params.append('audience', 'https://richardgatewayta.duckdns.org');
-    params.append('grant_type', 'client_credentials');
+    // const params = new URLSearchParams();
+    // params.append('client_id', process.env.M2M_CLIENT_ID.trim());
+    // params.append('client_secret', process.env.M2M_CLIENT_SECRET.trim());
+    // params.append('audience', 'https://richardgatewayta.duckdns.org');
+    // params.append('grant_type', 'client_credentials');
     tokenPromise = (async () => {
         try {
             const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: params // Langsung kirim objek URLSearchParams
+                headers: { 
+                    'Content-Type': 
+                    // 'application/x-www-form-urlencoded'
+                    'application/json'
+                 },
+                // body: params
+                body: JSON.stringify({
+                    client_id: process.env.M2M_CLIENT_ID,
+                    client_secret: process.env.M2M_CLIENT_SECRET,
+                    audience: process.env.NAMESPACE,
+                    grant_type: 'client_credentials'
+                })
+
             });
             const data = await response.json();
 
@@ -322,7 +333,7 @@ apiRouter.get('/vault/identity', (req, res) => {
             VALUES (?, ?)`).run(userSub, userEmail);
         }
         res.json({ message: "username retrieved", user: userEmail, roles: userRoles[0] });
-    } catch (err) {console.error("Database Error:", err); return res.status(400).json({ error: "user already exists or database error" }); }
+    } catch (err) { console.error("Database Error:", err); return res.status(400).json({ error: "user already exists or database error" }); }
 });
 
 apiRouter.get('/vault/usage', permitGlobalRole('standard_user'), (req, res) => {
