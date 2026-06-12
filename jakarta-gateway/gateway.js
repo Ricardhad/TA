@@ -172,6 +172,8 @@ let tokenExpiry = 0;
 let tokenPromise = null;
 
 async function getSpokeToken() {
+    // Paksa buang cache untuk tes
+    // cachedM2MToken = null;
     const now = Math.floor(Date.now() / 1000);
 
     if (cachedM2MToken && now < tokenExpiry) {
@@ -183,20 +185,18 @@ async function getSpokeToken() {
     }
 
     console.log("[AUTH] Fetching fresh M2M token from Auth0...");
-
+    const params = new URLSearchParams();
+    params.append('client_id', process.env.M2M_CLIENT_ID.trim());
+    params.append('client_secret', process.env.M2M_CLIENT_SECRET.trim());
+    params.append('audience', 'https://richardgatewayta.duckdns.org');
+    params.append('grant_type', 'client_credentials');
     tokenPromise = (async () => {
         try {
             const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
                 method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({
-                    client_id: process.env.M2M_CLIENT_ID,
-                    client_secret: process.env.M2M_CLIENT_SECRET,
-                    audience: process.env.NAMESPACE,
-                    grant_type: 'client_credentials'
-                })
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: params // Langsung kirim objek URLSearchParams
             });
-
             const data = await response.json();
 
             if (!data.access_token) {
@@ -214,7 +214,7 @@ async function getSpokeToken() {
             throw error;
         } finally {
             tokenPromise = null;
-        } 
+        }
     })();
 
     return await tokenPromise;
@@ -269,7 +269,7 @@ apiRouter.use('/vault/files', strictLimiter);
 
 apiRouter.use((req, res, next) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
-    const bucketUuid = req.headers['x-bucket-uuid']; 
+    const bucketUuid = req.headers['x-bucket-uuid'];
     if (bucketUuid) {
         const log = db.prepare('INSERT INTO audit_logs (bucket_uuid, user_email, action, status) VALUES (?, ?, ?, ?)');
         log.run(bucketUuid, userEmail, `${req.method} ${req.path}`, 'AUTHORIZED');
@@ -310,6 +310,7 @@ apiRouter.get('/vault/identity', (req, res) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
     const userSub = req.auth?.payload.sub;
+    
     console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
     try {
         if (userSub && userEmail !== 'anonymous') {
@@ -931,7 +932,7 @@ apiRouter.delete('/vault/buckets/:bucketUuid/share/:userId', shareFiturLimiter, 
         if (req.params.userId === bucket.owner_id) return res.status(400).json({ error: "Cannot revoke access from the bucket owner." });
         db.prepare('DELETE FROM bucket_policies WHERE bucket_id = ? AND grantee_id = ?').run(bucket.id, req.params.userId);
         // console.log(bucket.name);
-        db.prepare(`INSERT INTO notifications (user_id,message, timestamp) VALUES (?, ?, ?)`).run( req.params.userId, `Your access to the bucket '${bucket.name}' has been revoked.`, new Date().toISOString());
+        db.prepare(`INSERT INTO notifications (user_id,message, timestamp) VALUES (?, ?, ?)`).run(req.params.userId, `Your access to the bucket '${bucket.name}' has been revoked.`, new Date().toISOString());
         res.json({ status: "Access revoked successfully." });
     } catch (err) { res.status(500).json({ error: "Failed to remove member." }); }
 });
@@ -1159,16 +1160,16 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
 });
 apiRouter.post('/vault/admin/bitrot/report', permitGlobalRole('admin'), (req, res) => {
     try {
-    let corruptedFiles = 0;
-    for (const item of req.body) {
-        const dbRecord = db.prepare('SELECT checksum, id FROM versions WHERE physical_path = ?').get(item.path);
-        if (dbRecord && dbRecord.checksum !== item.hash) {
-            corruptedFiles++;
-            db.prepare('INSERT INTO audit_logs (action, status) VALUES (?, ?)').run(`BIT_ROT_DETECTED_${item.path}`, 'CRITICAL');
+        let corruptedFiles = 0;
+        for (const item of req.body) {
+            const dbRecord = db.prepare('SELECT checksum, id FROM versions WHERE physical_path = ?').get(item.path);
+            if (dbRecord && dbRecord.checksum !== item.hash) {
+                corruptedFiles++;
+                db.prepare('INSERT INTO audit_logs (action, status) VALUES (?, ?)').run(`BIT_ROT_DETECTED_${item.path}`, 'CRITICAL');
+            }
         }
-    }
-    res.json({ message: "Scan complete", corrupted: corruptedFiles });
-   } catch (err) { res.status(500).json({ error: "Failed to process report.", detail: err.message }); }
+        res.json({ message: "Scan complete", corrupted: corruptedFiles });
+    } catch (err) { res.status(500).json({ error: "Failed to process report.", detail: err.message }); }
 });
 
 apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req, res) => {
@@ -1243,13 +1244,13 @@ app.use((err, req, res, next) => {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
         } catch (dbErr) { console.error("Log fail:", dbErr.message); }
-        return res.status(401).json({ error: "Unauthorized", message: err.message });
+        return res.status().json({ error: "Unauthorized", message: err.message });
     }
-
+    
     console.error("[SERVER ERROR]", err);
     res.status(500).json({ error: "Internal Error" });
 });
-// ==========================================
+// =============================401=============
 // 7. START SERVER
 // ==========================================
 const sslOptions = {
