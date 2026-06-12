@@ -69,7 +69,7 @@ const apiRouter = express.Router();
 
 const LOCAL_SPOKE_IP = process.env.SPOKE_IP;
 const LOCAL_PORT = process.env.GATEWAY_PORT;
-const namespace = process.env.NAMESPACE || 'unknown_namespace';
+const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
 const createTimeLimiter = (minute, maxamount, message) => {
     return rateLimit({
         windowMs: minute * 60 * 1000,
@@ -126,6 +126,10 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'x-bucket-uuid', 'x-file-prefix'],
     credentials: true
 }));
+app.use((err, req, res, next) => {
+    console.error("[AUTH ERROR DETAIL]:", err.message);
+    res.status(err.status || 401).json({ message: err.message });
+});
 
 
 app.use((req, res, next) => {
@@ -310,7 +314,7 @@ apiRouter.get('/vault/identity', (req, res) => {
     const userEmail = req.auth?.payload[`${namespace}/email`] || 'anonymous';
     const userRoles = req.auth?.payload[`${namespace}/roles`] || 'anonymous';
     const userSub = req.auth?.payload.sub;
-    
+    console.log(userRoles,userEmail)
     console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
     try {
         if (userSub && userEmail !== 'anonymous') {
@@ -1244,9 +1248,10 @@ app.use((err, req, res, next) => {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
         } catch (dbErr) { console.error("Log fail:", dbErr.message); }
-        return res.status().json({ error: "Unauthorized", message: err.message });
+        res.status(err.status).json({ error: err.message });
+        // return res.status().json({ error: "Unauthorized", message: err.message });
     }
-    
+
     console.error("[SERVER ERROR]", err);
     res.status(500).json({ error: "Internal Error" });
 });
@@ -1260,7 +1265,7 @@ const sslOptions = {
 
 const server = https.createServer(sslOptions, app).listen(PUBLIC_PORT, '0.0.0.0', () => {
     console.log('--- Zero Trust Architecture Active ---');
-    console.log(`Public Entry: https://richardgatewayta.duckdns.org:${PUBLIC_PORT}`);
+    console.log(`Public Entry: ${process.env.NAMESPACE}:${PUBLIC_PORT}`);
     console.log(`Internal Destination: ${LOCAL_SPOKE_IP}:${LOCAL_PORT}`);
     console.log('--------------------------------------');
 });

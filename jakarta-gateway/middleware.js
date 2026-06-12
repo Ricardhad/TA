@@ -6,8 +6,8 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 dotenv.config();
 
-
 export const bouncer = auth({
+    // audience: 'https://richardgatewayta.duckdns.org',
     audience: process.env.NAMESPACE,
     issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
     tokenSigningAlg: 'RS256'
