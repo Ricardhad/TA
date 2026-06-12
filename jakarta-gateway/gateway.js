@@ -198,11 +198,11 @@ async function getSpokeToken() {
         try {
             const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
                 method: 'POST',
-                headers: { 
-                    'Content-Type': 
-                    // 'application/x-www-form-urlencoded'
-                    'application/json'
-                 },
+                headers: {
+                    'Content-Type':
+                        // 'application/x-www-form-urlencoded'
+                        'application/json'
+                },
                 // body: params
                 body: JSON.stringify({
                     client_id: process.env.M2M_CLIENT_ID,
@@ -329,8 +329,11 @@ apiRouter.get('/vault/identity', (req, res) => {
     // console.log(`req.auth payload: ${JSON.stringify(req.auth?.payload)}`);
     try {
         if (userSub && userEmail !== 'anonymous') {
-            db.prepare(`INSERT OR REPLACE INTO users (sub, email) 
-            VALUES (?, ?)`).run(userSub, userEmail);
+            db.prepare(`INSERT INTO users (sub, email) 
+	          VALUES (?, ?) 
+              ON CONFLICT(sub) 
+            DO UPDATE SET email = excluded.email
+        `).run(userSub, userEmail);
         }
         res.json({ message: "username retrieved", user: userEmail, roles: userRoles[0] });
     } catch (err) { console.error("Database Error:", err); return res.status(400).json({ error: "user already exists or database error" }); }
