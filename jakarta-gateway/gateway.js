@@ -673,7 +673,7 @@ apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) =>
     } catch (err) { res.status(500).json({ error: "Failed to generate share link" }); }
 });
 
-// 3. HARD DELETE (Purge Full File OR Specific Version)
+//  HARD DELETE 
 apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), authorizeVault('ADMIN'), async (req, res) => {
     const { uuid } = req.params;
 
@@ -692,8 +692,6 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
             return res.status(404).json({ error: "File not found." });
         }
 
-        // Jika BUKAN global admin, cek hak akses di tabel bucket_policies
-        // Ganti blok ini:
         if (currentUserRole !== 'admin') {
             const hasAccess = db.prepare(`
                 SELECT id FROM bucket_policies 
@@ -724,14 +722,11 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
             purgeTransaction(allVersions[0].file_id);
             return res.status(200).json({ status: "File completely purged." });
         } else {
-            // LOGIKA B: Hapus HANYA VERSI SPESIFIK
-
-            // --- KACAMATA X-RAY: Tampilkan semua versi yang ADA di DB untuk UUID ini ---
+           
             const availableVersions = db.prepare(`SELECT v.id, v.version_num FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
             console.log(`[PURGE X-RAY] Available versions in DB for this UUID:`, availableVersions);
             // ---------------------------------------------------------------------------
 
-            // Gunakan CAST ke TEXT untuk menghindari masalah beda tipe data (String vs Integer)
             const fileInfo = db.prepare(`
                 SELECT v.id as v_id, v.physical_path 
                 FROM files f 
@@ -778,7 +773,6 @@ apiRouter.put('/vault/files/:uuid', renamelimit, authorizeVault('WRITE'), async 
 apiRouter.delete('/vault/files/:uuid', permitGlobalRole('standard_user'), authorizeVault('WRITE'), async (req, res) => {
     const { uuid } = req.params;
     try {
-        // 1. BARU: Ambil ID file dan TIMESTAMP dari versi komit paling terakhir (tertinggi)
         const file = db.prepare(`
             SELECT f.id, v.timestamp
             FROM files f
@@ -1129,10 +1123,9 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
     });
 
     pass.on('drain', () => {
-        req.resume(); // Buka keran kembali hanya jika pipa benar-benar plong
+        req.resume(); 
     });
 
-    // 2. GENERATE TOKEN SPOKE SECARA MANUAL (Meniru kelakuan spokeFetch)
     const token = await getSpokeToken();
 
     // 3. ATUR KONFIGURASI HTTP REQUEST MURNI
@@ -1148,7 +1141,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
         }
     };
 
-    // 4. BUKA SOKET ALIRAN MURNI KE SPOKE SURABAYA
+    // 4. BUKA SOKET 
     const spokeReq = http.request(options, (spokeRes) => {
         let responseData = '';
 
@@ -1185,9 +1178,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
         }
     });
 
-    // 🚨 KUNCI UTAMA KESELAMATAN: Hubungkan pipa pass langsung ke request!
-    // http.request akan otomatis menghentikan pembacaan 'pass' jika buffer kernel OS penuh.
-    pass.pipe(spokeReq);
+     pass.pipe(spokeReq);
 
     req.on('end', () => {
         pass.end();
@@ -1234,7 +1225,6 @@ apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req
 //             headers: {
 //                 'Content-Type': 'application/octet-stream',
 //                 'Content-Length': req.headers['content-length'],
-//                 // 🚨 KUNCI PERBAIKAN: Masukkan Basic Auth di SINI, bukan di URL
 //                 'Authorization': `Basic ${authString}`,
 //                 'Host': `${LOCAL_SPOKE_IP}:9000`
 //             },
