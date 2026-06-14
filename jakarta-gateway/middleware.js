@@ -52,7 +52,7 @@ export const validateFingerprint = (req, res, next) => {
     }
     const currentUserAgent = req.headers['user-agent'];
     // const currentFingerprint = `${currentIp}-${currentUserAgent}`;
-
+    // console.warn(currentUserAgent);
     const currentFingerprint = hashFingerprint(currentUserAgent);
     // console.warn(`[SECURITY] Validating fingerprint: Token=${tokenFingerprint} | Current=${currentFingerprint}`);
     if (tokenFingerprint !== currentFingerprint) {

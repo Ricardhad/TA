@@ -832,14 +832,19 @@ apiRouter.get('/vault/trash', (req, res) => {
             FROM files f
             JOIN versions v ON f.id = v.file_id
             JOIN buckets b ON f.bucket_id = b.id
-            WHERE f.owner_id = ? AND f.deleted_at IS NOT NULL
-            AND v.id IN (SELECT MAX(id) FROM versions GROUP BY file_id)
+            WHERE (f.owner_id = ? OR b.owner_id = ?)
+              AND f.deleted_at IS NOT NULL
+              AND v.id = (
+                  SELECT MAX(v2.id) 
+                  FROM versions v2 
+                  WHERE v2.file_id = f.id
+              )
             ORDER BY f.deleted_at DESC
-        `).all(userId);
+        `).all(userId, userId);
 
         res.json(trashFiles);
     } catch (err) {
-        res.status(500).json({ error: "Failed to fetch trash bin." });
+       return res.status(500).json({ details: err.message});
     }
 });
 // gateway.js - Empty Trash (Batch Purge)
@@ -850,8 +855,9 @@ apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, 
             SELECT f.id, v.physical_path 
             FROM files f
             JOIN versions v ON f.id = v.file_id
-            WHERE f.deleted_at IS NOT NULL AND f.owner_id = ?
-        `).all(userId);
+            JOIN buckets b ON f.bucket_id = b.id
+            WHERE f.deleted_at IS NOT NULL AND (f.owner_id = ? OR b.owner_id = ?)
+        `).all(userId, userId);
 
         if (trashedFiles.length === 0) return res.status(400).json({ error: "Trash bin is already empty." });
 
@@ -869,7 +875,7 @@ apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, 
 
         res.json({ status: "Success", message: `Successfully purged ${trashedFiles.length} files.` });
     } catch (err) {
-        res.status(500).json({ error: "Failed to empty trash bin." });
+       return res.status(500).json({ error: "Failed to empty trash bin." ,details: err.message});
     }
 });
 apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req, res) => {
@@ -886,6 +892,23 @@ apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req
             const spokeResponse = await spokeFetch(`/internal/files/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: fileMeta.physical_path }) });
             if (!spokeResponse.ok) throw new Error("Copy failed.");
             const { new_physical_path, size, checksum } = await spokeResponse.json();
+            let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
+            while (versions.length >= 5) {
+                try {
+                    const response = await spokeFetch(`/internal/files/${versions[0].physical_path}`, { method: 'DELETE' });
+                    console.log(`[RESTORE] Old version purged to maintain version limit.`, response.ok ? "Spoke purge successful." : "Spoke purge failed.");
+                    if (!response.ok) {
+                        console.error(`[RESTORE] Failed to purge old version from Spoke. Status: ${response.status}`);
+                        break;
+                    }
+                    db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+                    versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
+
+                } catch (e) {
+                    console.error("[RESTORE] Cleanup versions failed:", e.message);
+                    break; 
+                }
+            }
             const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileMeta.id);
             const newVersionNum = (lastVersion.v || 0) + 1;
             db.prepare(`INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))`).run(fileMeta.id, newVersionNum, new_physical_path, size, checksum);
