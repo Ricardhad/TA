@@ -441,7 +441,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
             file.on('data', onData);
             file.once('end', onEnd);
             file.once('error', onError);
-            file.resume(); // ✅ THE MISSING LINE — busboy file streams start paused
+            file.resume(); 
         });
 
         console.log(`[UPLOAD] 3. MIME sniffing...`);
@@ -544,8 +544,8 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
                 }
             });
         });
-        spokeReq.setTimeout(30_000, () => {
-            console.error('[UPLOAD] Spoke timeout after 30s');
+        spokeReq.setTimeout(120_000, () => {
+            console.error('[UPLOAD] Spoke timeout after 120s');
             spokeReq.destroy(new Error('SPOKE_TIMEOUT'));
         });
 
