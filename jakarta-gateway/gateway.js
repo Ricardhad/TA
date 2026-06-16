@@ -172,7 +172,6 @@ const strictLimiter = rateLimit({
 // ==========================================
 let cachedM2MToken = null;
 let tokenExpiry = 0;
-// 🆕 Tambahkan variabel kunci
 let tokenPromise = null;
 
 async function getSpokeToken() {
