@@ -929,7 +929,7 @@ apiRouter.post('/vault/buckets', bucketCreationLimiter, (req, res) => {
             db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, 'ADMIN')`).run(info.lastInsertRowid, userId);
         })();
         res.json({ status: "Bucket Created", uuid: bucketUuid });
-    } catch (err) { res.status(500).json({ error: "Could not create bucket." }); }
+    } catch (err) { res.status(500).json({ error: "Could not create bucket." , detail: err.message }); }
 });
 
 apiRouter.get('/vault/buckets', (req, res) => {

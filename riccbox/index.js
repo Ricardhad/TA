@@ -392,7 +392,6 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
         });
         if (!gatewayResponse.ok) {
             throw new Error(`Gateway rejected the report with status: ${gatewayResponse.status}, detail: ${await gatewayResponse.text()}`);
-
         }
 
         console.log("[MAINTENANCE] Report successfully delivered to Gateway.");
@@ -401,16 +400,18 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
     }
 });
 
+
 // ==========================================
 // 3. RUTE PENGUNDUHAN DEKRIPSI
 // ==========================================
 app.get('/internal/files/:filename', (req, res) => {
+    try {
     const filename = path.basename(req.params.filename);
     const filePath = path.join(STORAGE_DIR, filename);
 
     if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+    console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI:", process.env.VAULT_KEY);
 
-    try {
         const stats = fs.statSync(filePath);
         const fd = fs.openSync(filePath, 'r');
 
@@ -423,7 +424,14 @@ app.get('/internal/files/:filename', (req, res) => {
 
         const finalDecipher = crypto.createDecipheriv('aes-256-gcm', MASTER_KEY, iv);
         finalDecipher.setAuthTag(tag);
-
+        finalDecipher.on('error', (err) => {
+            console.error("DECRYPTION STREAM ERROR:", err.message);
+            if (!res.headersSent) {
+             return res.status(500).send("Security Integrity Check Failed.");
+            }else {
+                return res.destroy(); 
+            }
+        }); 
         const readStream = fs.createReadStream(filePath, { start: 12, end: stats.size - 17 });
 
         console.log(`[SPOKE] Decrypting stream: ${filename}`);
@@ -431,7 +439,7 @@ app.get('/internal/files/:filename', (req, res) => {
 
     } catch (err) {
         console.error("DECRYPTION ERROR:", err.message);
-        res.status(500).send("Security Integrity Check Failed.");
+       return res.status(500).send("Security Integrity Check Failed.");
     }
 });
 
