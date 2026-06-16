@@ -955,6 +955,8 @@ apiRouter.post('/vault/buckets/:bucketUuid/share', shareFiturLimiter, permitGlob
         if (!targetUser) return res.status(404).json({ error: "User not found." });
         const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
+        const ownercheck= db.prepare('SELECT owner_id FROM buckets WHERE id = ?').get(bucket.id);
+        if (targetUser.sub === ownercheck.owner_id) return res.status(400).json({ error: "User is already the bucket owner." });
         db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, ?) ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission`).run(bucket.id, targetUser.sub, permission);
         //  console.log(bucket.name);
         db.prepare(`INSERT INTO notifications (user_id,message, timestamp) VALUES (?, ?, ?)`).run(targetUser.sub, `You have been granted ${permission} access to the bucket '${bucket.name}'.`, new Date().toISOString());
