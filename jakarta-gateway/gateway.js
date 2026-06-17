@@ -44,9 +44,7 @@ const autoPurgeTrash = async () => {
                 method: 'DELETE',
                 headers: { 'x-m2m-token': M2M_TOKEN }
             });
-
-            if (spokeRes.ok) {
-                // 3. Jika fisik sukses dihapus, hapus metadata secara permanen
+            if (spokeRes.ok || spokeRes.status === 404) {
                 db.prepare("DELETE FROM versions WHERE file_id = ?").run(file.id);
                 db.prepare("DELETE FROM files WHERE id = ?").run(file.id);
                 console.log(`Permanently purged expired file: ${file.uuid}`);
@@ -720,9 +718,13 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
 
             if (allVersions.length === 0) return res.status(404).json({ error: "File not found." });
 
-            // 1. Hapus fisik di Spoke
+            // 1. PERKETAT: Hapus fisik di Spoke dan validasi responsnya
             for (const v of allVersions) {
-                await spokeFetch(`/internal/files/${v.physical_path}`, { method: 'DELETE' });
+                const response = await spokeFetch(`/internal/files/${v.physical_path}`, { method: 'DELETE' });
+                // Batalkan seluruh transaksi jika Spoke error (kecuali 404 file sudah hilang)
+                if (!response.ok && response.status !== 404) {
+                    throw new Error(`Spoke failed to delete physically. Status: ${response.status}`);
+                }
             }
 
             // 2. Hapus DB dengan aman (anak dulu, baru induk)
@@ -867,17 +869,29 @@ apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, 
 
         if (trashedFiles.length === 0) return res.status(400).json({ error: "Trash bin is already empty." });
 
-        // Hapus fisik di Spoke
         for (const file of trashedFiles) {
             await spokeFetch(`/internal/files/${file.physical_path}`, { method: 'DELETE' });
         }
 
-        // Hapus dari database Gateway
-        const stmt = db.prepare('DELETE FROM files WHERE id = ?');
-        const deleteMany = db.transaction((files) => {
-            for (const file of files) stmt.run(file.id);
-        });
-        deleteMany(trashedFiles);
+        const stmtDeleteVersions = db.prepare('DELETE FROM versions WHERE file_id = ?');
+        const stmtDeleteFile = db.prepare('DELETE FROM files WHERE id = ?');
+        let successCount = 0;
+        for (const file of trashedFiles) {
+            try {
+                const spokeRes = await spokeFetch(`/internal/files/${file.physical_path}`, { method: 'DELETE' });
+
+                if (spokeRes.ok || spokeRes.status === 404) {
+                    stmtDeleteVersions.run(file.id);
+                    stmtDeleteFile.run(file.id);
+                    successCount++;
+                } else {
+                    console.warn(`[TRASH PURGE] Gagal hapus fisik ${file.physical_path}, melewati penghapusan metadata.`);
+                }
+            } catch (err) {
+                console.error(`[TRASH PURGE] Koneksi ke Spoke terputus saat menghapus ${file.physical_path}`);
+                break; 
+            }
+        }
 
         res.json({ status: "Success", message: `Successfully purged ${trashedFiles.length} files.` });
     } catch (err) {
@@ -895,26 +909,20 @@ apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req
         } else {
             const fileMeta = db.prepare(`SELECT f.id, f.filename, v.physical_path FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? AND v.version_num = ?`).get(req.params.uuid, req.query.v);
             if (!fileMeta) return res.status(404).json({ error: "Version not found." });
+            let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
+            while (versions.length >= 5) {
+                const response = await spokeFetch(`/internal/files/${versions[0].physical_path}`, { method: 'DELETE' });
+                if (response.ok || response.status === 404) {
+                    db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+                } else {
+                    console.error(`[RESTORE GUARD] Spoke menolak hapus fisik. Status: ${response.status}`);
+                    return res.status(503).json({ error: "Storage Blocked", message: "Gagal memangkas versi lama." });
+                }
+                versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
+            }
             const spokeResponse = await spokeFetch(`/internal/files/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: fileMeta.physical_path }) });
             if (!spokeResponse.ok) throw new Error("Copy failed.");
             const { new_physical_path, size, checksum } = await spokeResponse.json();
-            let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
-            while (versions.length >= 5) {
-                try {
-                    const response = await spokeFetch(`/internal/files/${versions[0].physical_path}`, { method: 'DELETE' });
-                    console.log(`[RESTORE] Old version purged to maintain version limit.`, response.ok ? "Spoke purge successful." : "Spoke purge failed.");
-                    if (!response.ok) {
-                        console.error(`[RESTORE] Failed to purge old version from Spoke. Status: ${response.status}`);
-                        break;
-                    }
-                    db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
-                    versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileMeta.id);
-
-                } catch (e) {
-                    console.error("[RESTORE] Cleanup versions failed:", e.message);
-                    break;
-                }
-            }
             const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileMeta.id);
             const newVersionNum = (lastVersion.v || 0) + 1;
             db.prepare(`INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))`).run(fileMeta.id, newVersionNum, new_physical_path, size, checksum);
@@ -1289,7 +1297,7 @@ app.use((err, req, res, next) => {
         try {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
-        } catch (dbErr) { console.error("Log fail:", dbErr.message); }
+        } catch (dbErr) { console.error("Log fail:", dbErr.message); }  
         return res.status(err.status || 401).json({ error: err.message });
         // return res.status().json({ error: "Unauthorized", message: err.message });
     }
