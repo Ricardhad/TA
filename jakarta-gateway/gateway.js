@@ -153,7 +153,7 @@ app.use((req, res, next) => {
 // app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
+    windowMs: 5 * 60 * 1000, // 5 menit
     max: 1500,
     message: { error: "Too many requests. Please try again later." },
     standardHeaders: true,
@@ -161,8 +161,8 @@ const apiLimiter = rateLimit({
 });
 
 const strictLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000,
-    max: 50,
+    windowMs: 1 * 60 * 1000,// 1 menit
+    max: 30,
     message: { error: "Action rate limit exceeded." }
 });
 
@@ -391,6 +391,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
     });
 
     if (!contentType || !contentType.includes('multipart/form-data')) return res.status(400).json({ error: "Invalid Request" });
+
     if (contentLength && parseInt(contentLength) > MAX_SIZE) return res.status(413).json({ error: "File Too Large" });
 
     const busboy = Busboy({ headers: req.headers, limits: { fileSize: MAX_SIZE, files: 1 }, highWaterMark: 16 * 1024 });
@@ -440,7 +441,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
             file.on('data', onData);
             file.once('end', onEnd);
             file.once('error', onError);
-            file.resume(); 
+            file.resume();
         });
 
         console.log(`[UPLOAD] 3. MIME sniffing...`);
@@ -512,21 +513,33 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
                     }
 
                     let versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-                    while (versions.length >= 5) {
-                        try {
+                    try {
+                        while (versions.length >= 5) {
+                            console.log(`[VERSION GUARD] Versi file melampaui batas (${versions.length}). Memangkas versi tertua: ${versions[0].physical_path}`);
                             const response = await spokeFetch(`/internal/files/${versions[0].physical_path}`, { method: 'DELETE' });
-                            console.log(`[UPLOAD] Old version purged to maintain version limit.`, response.ok ? "Spoke purge successful." : "Spoke purge failed.");
-                            if (!response.ok) {
-                                console.error(`[UPLOAD] Failed to purge old version from Spoke. Status: ${response.status}, Response: ${await response.text()}`);
-                                break;
+                            if (response.ok || response.status === 404) {
+                                if (response.status === 404) {
+                                    console.warn(`[VERSION GUARD] Berkas fisik sudah tidak ada di Spoke (404). Sinkronisasi pangkalan data...`);
+                                } else {
+                                    console.log(`[VERSION GUARD] Berkas fisik versi tertua sukses dihapus dari Spoke.`);
+                                }
+                                db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
+                            } else {
+                                console.error(`[VERSION GUARD] Spoke menolak perintah hapus. Status: ${response.status}`);
+                                throw new Error('SPOKE_PURGE_FAILED');
                             }
-                            db.prepare('DELETE FROM versions WHERE id = ?').run(versions[0].id);
                             versions = db.prepare('SELECT id, physical_path FROM versions WHERE file_id = ? ORDER BY version_num ASC').all(fileRecord.id);
-
-                        } catch (e) {
-                            console.error("Cleanup failed");
-                            break;
                         }
+                    } catch (err) {
+                        console.error(`[VERSION GUARD FATAL] Gagal mengosongkan kuota versi:`, err.message);
+
+                        if (!res.headersSent) {
+                            return res.status(503).json({
+                                error: "Storage Consistency Error",
+                                message: "Gagal memproses versi baru karena jalur komunikasi lokal sibuk. Sila coba beberapa saat lagi."
+                            });
+                        }
+                        return;
                     }
 
                     const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
@@ -721,7 +734,7 @@ apiRouter.delete('/vault/files/:uuid/purge', permitGlobalRole('standard_user'), 
             purgeTransaction(allVersions[0].file_id);
             return res.status(200).json({ status: "File completely purged." });
         } else {
-           
+
             const availableVersions = db.prepare(`SELECT v.id, v.version_num FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ?`).all(uuid);
             console.log(`[PURGE X-RAY] Available versions in DB for this UUID:`, availableVersions);
             // ---------------------------------------------------------------------------
@@ -837,7 +850,7 @@ apiRouter.get('/vault/trash', (req, res) => {
 
         res.json(trashFiles);
     } catch (err) {
-       return res.status(500).json({ details: err.message});
+        return res.status(500).json({ details: err.message });
     }
 });
 // gateway.js - Empty Trash (Batch Purge)
@@ -868,7 +881,7 @@ apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, 
 
         res.json({ status: "Success", message: `Successfully purged ${trashedFiles.length} files.` });
     } catch (err) {
-       return res.status(500).json({ error: "Failed to empty trash bin." ,details: err.message});
+        return res.status(500).json({ error: "Failed to empty trash bin.", details: err.message });
     }
 });
 apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req, res) => {
@@ -899,7 +912,7 @@ apiRouter.post('/vault/files/:uuid/restore', authorizeVault('WRITE'), async (req
 
                 } catch (e) {
                     console.error("[RESTORE] Cleanup versions failed:", e.message);
-                    break; 
+                    break;
                 }
             }
             const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileMeta.id);
@@ -928,7 +941,7 @@ apiRouter.post('/vault/buckets', bucketCreationLimiter, (req, res) => {
             db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, 'ADMIN')`).run(info.lastInsertRowid, userId);
         })();
         res.json({ status: "Bucket Created", uuid: bucketUuid });
-    } catch (err) { res.status(500).json({ error: "Could not create bucket." , detail: err.message }); }
+    } catch (err) { res.status(500).json({ error: "Could not create bucket.", detail: err.message }); }
 });
 
 apiRouter.get('/vault/buckets', (req, res) => {
@@ -954,7 +967,7 @@ apiRouter.post('/vault/buckets/:bucketUuid/share', shareFiturLimiter, permitGlob
         if (!targetUser) return res.status(404).json({ error: "User not found." });
         const bucket = db.prepare('SELECT id, name FROM buckets WHERE uuid = ?').get(req.params.bucketUuid);
         if (!bucket) return res.status(404).json({ error: "Bucket not found." });
-        const ownercheck= db.prepare('SELECT owner_id FROM buckets WHERE id = ?').get(bucket.id);
+        const ownercheck = db.prepare('SELECT owner_id FROM buckets WHERE id = ?').get(bucket.id);
         if (targetUser.sub === ownercheck.owner_id) return res.status(400).json({ error: "User is already the bucket owner." });
         db.prepare(`INSERT INTO bucket_policies (bucket_id, grantee_id, permission) VALUES (?, ?, ?) ON CONFLICT(bucket_id, grantee_id) DO UPDATE SET permission = excluded.permission`).run(bucket.id, targetUser.sub, permission);
         //  console.log(bucket.name);
@@ -1124,7 +1137,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
     });
 
     pass.on('drain', () => {
-        req.resume(); 
+        req.resume();
     });
 
     const token = await getSpokeToken();
@@ -1179,7 +1192,7 @@ apiRouter.post('/vault/admin/test/performance', permitGlobalRole('admin'), async
         }
     });
 
-     pass.pipe(spokeReq);
+    pass.pipe(spokeReq);
 
     req.on('end', () => {
         pass.end();
@@ -1277,7 +1290,7 @@ app.use((err, req, res, next) => {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
         } catch (dbErr) { console.error("Log fail:", dbErr.message); }
-        return res.status(err.status|| 401).json({ error: err.message });
+        return res.status(err.status || 401).json({ error: err.message });
         // return res.status().json({ error: "Unauthorized", message: err.message });
     }
     console.error("[SERVER ERROR]", err);

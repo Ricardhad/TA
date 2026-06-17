@@ -14,45 +14,7 @@ import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 
 dotenv.config();
 
-function createVideoSanitizerProcess() {
-    const ffmpeg = spawn(ffmpegInstaller.path, [
-        '-hide_banner',
-        '-loglevel', 'error',
 
-        // 🚨 CONFIGURASI KESABARAN MAKSIMAL
-        '-probesize', '500M',
-        '-analyzeduration', '500M',
-
-        // Memaksa FFmpeg jangan error kalau ada data sampah/tidak lengkap
-        '-err_detect', 'ignore_err',
-        '-fflags', '+genpts+discardcorrupt+igndts',
-
-        // Input tanpa format paksaan agar dia auto-detect
-        '-i', 'pipe:0',
-
-        '-map_metadata', '-1',
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-tune', 'zerolatency',
-        '-c:a', 'aac',
-
-        // Output tetap mp4, tapi dengan flag agar metadata di awal
-        '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+faststart',
-        'pipe:1'
-    ]);
-
-    // 🚨 WAJIB: Tangkap error agar tidak mati diam-diam
-    ffmpeg.stderr.on('data', (data) => {
-        console.error(`[FFMPEG ERROR]: ${data.toString()}`);
-    });
-
-    ffmpeg.on('error', (err) => {
-        console.error(`[FFMPEG FATAL]: ${err.message}`);
-    });
-
-    return ffmpeg;
-}
 const calculateFileHash = (filePath) => {
     return new Promise((resolve, reject) => {
         const hash = crypto.createHash('sha256');
@@ -100,7 +62,7 @@ async function getGatewayToken() {
             grant_type: 'client_credentials'
         })
     });
-
+    console.log(`[AUTH] Auth0 responded with status: ${response.status}`);
     const data = await response.json();
 
     if (!data.access_token) {
@@ -268,6 +230,7 @@ app.post('/internal/files', async (req, res) => {
         const fileToEncrypt = isVideo ? tempCleanPath : tempRawPath;
         
         const iv = crypto.randomBytes(12);
+        console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI: (Master Key)", MASTER_KEY.toString('hex'));
         const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
         const writeStream = fs.createWriteStream(vaultPath);
 
@@ -410,8 +373,8 @@ app.get('/internal/files/:filename', (req, res) => {
     const filePath = path.join(STORAGE_DIR, filename);
 
     if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-    console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI:", process.env.VAULT_KEY);
-
+    // console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI:", process.env.VAULT_KEY);
+          console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI: (Master Key)", MASTER_KEY.toString('hex'));
         const stats = fs.statSync(filePath);
         const fd = fs.openSync(filePath, 'r');
 
