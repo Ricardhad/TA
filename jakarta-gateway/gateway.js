@@ -56,7 +56,7 @@ const autoPurgeTrash = async () => {
 };
 
 setGlobalDispatcher(customAgent);
-dotenv.config();
+dotenv.config({override: true});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -298,6 +298,7 @@ app.get('/api/v1/vault/view/:uuid', async (req, res) => {
     try {
         if (Math.floor(Date.now() / 1000) > parseInt(expires)) return res.status(403).send("This link has expired.");
         const secret = process.env.URL_SIGNING_SECRET;
+        console.log(process.env.URL_SIGNING_SECRET);
         const expectedSig = crypto.createHmac('sha256', secret).update(`${uuid}:${expires}:${permission}`).digest('hex');
         if (sig !== expectedSig) return res.status(403).send("Invalid signature.");
 
@@ -675,6 +676,7 @@ apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) =>
         const file = db.prepare('SELECT filename FROM files WHERE uuid = ?').get(fileUuid);
         if (!file) return res.status(404).json({ error: "File not found" });
         const expires = Math.floor(Date.now() / 1000) + (ttl * 60);
+        console.log(process.env.URL_SIGNING_SECRET);
         const signature = crypto.createHmac('sha256', process.env.URL_SIGNING_SECRET).update(`${fileUuid}:${expires}:${permission}`).digest('hex');
         res.json({
             share_url: `https://richardgatewayta.duckdns.org:${PUBLIC_PORT}/api/v1/vault/view/${fileUuid}?expires=${expires}&permission=${permission}&sig=${signature}`,
