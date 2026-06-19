@@ -205,7 +205,11 @@ export const validateFileSecurity = (filename, headerMime, detectedType, buffer)
         '.mov': 'video/quicktime'
     };
     if (!allowedExtensions[ext]) return { isSpoofed: true, finalMime: 'BLOCKED' };
-    if (ext === '.mp4' && detectedType && detectedType.mime !== 'video/mp4') {
+    // if (ext === '.mp4' && detectedType && detectedType.mime !== 'video/mp4') {
+    //     return { isSpoofed: true, finalMime: 'BLOCKED' };
+    // }
+    if (detectedType && detectedType.mime !== allowedExtensions[ext]) {
+        console.warn(`[SECURITY] BLOCKED: Magic Number Spoofing! File ${filename} is actually ${detectedType.mime}`);
         return { isSpoofed: true, finalMime: 'BLOCKED' };
     }
     // Validasi MIME: Apakah headerMime yang dikirim klien sesuai dengan ekstensi yang diklaim?
