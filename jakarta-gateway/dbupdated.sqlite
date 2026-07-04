@@ -1,9 +1,3 @@
-import Database from 'better-sqlite3';
-const db = new Database('vault.db');
-db.pragma('foreign_keys = ON ');
-db.pragma('journal_mode = WAL');
-
-db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   sub TEXT PRIMARY KEY,
   email TEXT NOT NULL
@@ -50,6 +44,9 @@ CREATE TABLE IF NOT EXISTS versions (
   physical_path TEXT NOT NULL,       
   size INTEGER,
   checksum TEXT,                   
+  encrypted_dek TEXT,
+  kek_version INTEGER DEFAULT 1,
+  key_state TEXT DEFAULT 'ACTIVE',
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
@@ -84,24 +81,3 @@ CREATE TABLE IF NOT EXISTS api_keys (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(owner_id) REFERENCES users(sub) ON DELETE CASCADE
 );
-`);
-
-
-try {
-    const stmt = db.prepare("PRAGMA table_info(versions)").all();
-    const hasEncryptedDek = stmt.some(column => column.name === 'encrypted_dek');
-    
-    if (!hasEncryptedDek) {
-        console.log("[DB MIGRATION] Menambahkan kolom Key Lifecycle Management (KLM)...");
-        db.exec(`
-            ALTER TABLE versions ADD COLUMN encrypted_dek TEXT;
-            ALTER TABLE versions ADD COLUMN kek_version INTEGER DEFAULT 1;
-            ALTER TABLE versions ADD COLUMN key_state TEXT DEFAULT 'ACTIVE';
-        `);
-        console.log("[DB MIGRATION] Kolom KLM berhasil ditambahkan ke tabel 'versions'!");
-    }
-} catch (err) {
-    console.error("[DB FATAL ERROR] Gagal melakukan migrasi skema KLM:", err.message);
-}
-
-export default db;

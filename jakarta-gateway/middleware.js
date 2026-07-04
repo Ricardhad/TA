@@ -61,7 +61,7 @@ export const validateFingerprint = (req, res, next) => {
     }
     next();
 };
-export const strictBouncer = [bouncer, validateFingerprint];
+
 // export const authorizeVault = (requiredRole = 'VIEWER') => {
 //     return (req, res, next) => {
 //         const userId = req.auth.payload.sub;
@@ -328,3 +328,67 @@ export function authorizeBucket(requiredPermission) {
         next();
     };
 }
+export const apiKeyAuth = (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+
+    if (!apiKey) {
+        return next();
+    }
+
+    try {
+        const hashedKey = crypto.createHash('sha256').update(apiKey).digest('hex');
+        
+        const keyRecord = db.prepare('SELECT owner_id FROM api_keys WHERE key_hash = ?').get(hashedKey);
+
+        if (!keyRecord) {
+            console.warn(`[SECURITY] Invalid API Key attempt from IP: ${req.ip}`);
+            return res.status(401).json({ error: "Unauthorized: Invalid API Key." });
+        }
+        const userRecord = db.prepare('SELECT email FROM users WHERE sub = ?').get(keyRecord.owner_id);
+        
+        const realEmail = userRecord ? userRecord.email : `api-client-${keyRecord.owner_id.substring(0,8)}@machine.local`;
+        console.log(`[AUTH] Machine-to-Machine API Key accepted for user: ${keyRecord.owner_id}`);
+
+        const namespace = process.env.NAMESPACE || 'https://richardgatewayta.duckdns.org';
+        
+        req.auth = {
+            payload: {
+                sub: keyRecord.owner_id, // Gunakan ID pemilik kunci
+                [`${namespace}/email`]: realEmail,
+                [`${namespace}/roles`]: ['standard_user'], // Anggap sebagai user standar
+                gty: 'client-credentials' 
+            }
+        };
+
+        req.isApiKeyAuthenticated = true;
+        
+        return next();
+    } catch (err) {
+        console.error("[AUTH ERROR] API Key validation failed:", err);
+        return res.status(500).json({ error: "Internal server error during authentication." });
+    }
+};
+
+const skipIfApiKey = (middleware) => {
+    return (req, res, next) => {
+        if (req.isApiKeyAuthenticated) {
+            return next();
+        }
+        return middleware(req, res, next);
+    };
+};
+
+
+
+
+
+
+
+
+export const strictBouncer = [
+    apiKeyAuth, 
+    skipIfApiKey(bouncer), 
+    skipIfApiKey(validateFingerprint,
+    bouncer, 
+    validateFingerprint,
+    )];

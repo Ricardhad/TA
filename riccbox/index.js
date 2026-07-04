@@ -34,7 +34,8 @@ app.use(express.urlencoded({
     extended: true
 }));
 
-const MASTER_KEY = Buffer.from(process.env.VAULT_KEY, 'hex');
+const currentKekVer = process.env.CURRENT_KEK_VERSION || '1';
+const MASTER_KEY = Buffer.from(process.env[`VAULT_KEY_V${currentKekVer}`], 'hex');
 
 if (MASTER_KEY.length !== 32) {
     throw new Error("VAULT_KEY must be a 64-character hex string (32 bytes)");
@@ -227,30 +228,74 @@ app.post('/internal/files', async (req, res) => {
 
         // 4. Finalisasi Enkripsi
         // Jika video pakai yang Clean, jika gambar/dokumen pakai yang Raw
+        // const fileToEncrypt = isVideo ? tempCleanPath : tempRawPath;
+        
+        // const iv = crypto.randomBytes(12);
+        // console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI: (Master Key)", MASTER_KEY.toString('hex'));
+        // const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+        // const writeStream = fs.createWriteStream(vaultPath);
+
+        // writeStream.write(iv); // Tulis IV di depan file .enc
+
+        // // Alirkan file yang sudah dipilih ke dalam cipher
+        // await pipeline(fs.createReadStream(fileToEncrypt), cipher, writeStream);
+
+        // // Tulis Auth Tag di paling belakang
+        // const authTag = cipher.getAuthTag();
+        // fs.appendFileSync(vaultPath, authTag);
+
+        // // 5. Cleanup (Hapus HANYA file sementara yang memang ada)
+        // if (fs.existsSync(tempRawPath)) fs.unlinkSync(tempRawPath);
+        // if (fs.existsSync(tempCleanPath)) fs.unlinkSync(tempCleanPath);
+
+        // const finalChecksum = await calculateFileHash(vaultPath);
+        // const stats = fs.statSync(vaultPath);
+
+        // res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
+        // 4. Finalisasi Enkripsi (Envelope Encryption)
+        const currentKekVer = process.env.CURRENT_KEK_VERSION || '1';
+        const activeKek = Buffer.from(process.env[`VAULT_KEY_V${currentKekVer}`], 'hex');
+        
+        const kekIv = crypto.randomBytes(12);
+        const wrapper = crypto.createCipheriv('aes-256-gcm', activeKek, kekIv);
+
         const fileToEncrypt = isVideo ? tempCleanPath : tempRawPath;
         
+        const rawDek = crypto.randomBytes(32); // Buat Kunci Data (DEK) Telanjang
         const iv = crypto.randomBytes(12);
-        console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI: (Master Key)", MASTER_KEY.toString('hex'));
-        const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+        
+        const cipher = crypto.createCipheriv('aes-256-gcm', rawDek, iv);
         const writeStream = fs.createWriteStream(vaultPath);
 
-        writeStream.write(iv); // Tulis IV di depan file .enc
-
-        // Alirkan file yang sudah dipilih ke dalam cipher
+        writeStream.write(iv); 
         await pipeline(fs.createReadStream(fileToEncrypt), cipher, writeStream);
 
-        // Tulis Auth Tag di paling belakang
         const authTag = cipher.getAuthTag();
         fs.appendFileSync(vaultPath, authTag);
 
-        // 5. Cleanup (Hapus HANYA file sementara yang memang ada)
+        
+        let encDek = wrapper.update(rawDek, 'utf8', 'hex');
+        encDek += wrapper.final('hex');
+        const kekTag = wrapper.getAuthTag().toString('hex');
+        
+        const finalEncryptedDek = `${kekIv.toString('hex')}:${encDek}:${kekTag}`;
+
+        rawDek.fill(0); 
+
         if (fs.existsSync(tempRawPath)) fs.unlinkSync(tempRawPath);
         if (fs.existsSync(tempCleanPath)) fs.unlinkSync(tempCleanPath);
 
         const finalChecksum = await calculateFileHash(vaultPath);
         const stats = fs.statSync(vaultPath);
 
-        res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
+        res.status(200).json({ 
+            status: "Success", 
+            physical_path: safeName, 
+            size: stats.size, 
+            checksum: finalChecksum,
+            encrypted_dek: finalEncryptedDek,
+            kek_version: 1
+        });
     } catch (err) {
         console.error(`[SPOKE ERROR]: ${err.message}`);
         // Pastikan cleanup jalan jika terjadi eror
@@ -369,12 +414,26 @@ app.post('/internal/maintenance/bitrot/scan', async (req, res) => {
 // ==========================================
 app.get('/internal/files/:filename', (req, res) => {
     try {
-    const filename = path.basename(req.params.filename);
-    const filePath = path.join(STORAGE_DIR, filename);
+        const filename = path.basename(req.params.filename);
+        const filePath = path.join(STORAGE_DIR, filename);
 
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-    // console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI:", process.env.VAULT_KEY);
-          console.log("KUNCI YANG DIPAKAI SISTEM SAAT INI: (Master Key)", MASTER_KEY.toString('hex'));
+        if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
+        const eDekHeader = req.headers['x-file-dek'];
+        const kekVersion = req.headers['x-kek-version'] || '1'; // Tangkap versi dari Gateway
+        
+        if (!eDekHeader) return res.status(400).send("Access Denied: Missing Encrypted DEK");
+
+        const archiveKekHex = process.env[`VAULT_KEY_V${kekVersion}`] || process.env.VAULT_KEY;
+        const archiveKek = Buffer.from(archiveKekHex, 'hex');
+
+        const [kekIvHex, encDekHex, kekTagHex] = eDekHeader.split(':');
+        
+        const unwrapper = crypto.createDecipheriv('aes-256-gcm', archiveKek, Buffer.from(kekIvHex, 'hex'));
+        unwrapper.setAuthTag(Buffer.from(kekTagHex, 'hex'));
+        
+        const rawDek = Buffer.concat([unwrapper.update(Buffer.from(encDekHex, 'hex')), unwrapper.final()]);
+
         const stats = fs.statSync(filePath);
         const fd = fs.openSync(filePath, 'r');
 
@@ -385,27 +444,31 @@ app.get('/internal/files/:filename', (req, res) => {
         fs.readSync(fd, tag, 0, 16, stats.size - 16);
         fs.closeSync(fd);
 
-        const finalDecipher = crypto.createDecipheriv('aes-256-gcm', MASTER_KEY, iv);
+        const finalDecipher = crypto.createDecipheriv('aes-256-gcm', rawDek, iv);
         finalDecipher.setAuthTag(tag);
         finalDecipher.on('error', (err) => {
             console.error("DECRYPTION STREAM ERROR:", err.message);
-            if (!res.headersSent) {
-             return res.status(500).send("Security Integrity Check Failed.");
-            }else {
-                return res.destroy(); 
-            }
+            if (!res.headersSent) return res.status(500).send("Security Integrity Check Failed.");
+            else return res.destroy(); 
         }); 
-        const readStream = fs.createReadStream(filePath, { start: 12, end: stats.size - 17 });
 
-        console.log(`[SPOKE] Decrypting stream: ${filename}`);
+        const readStream = fs.createReadStream(filePath, { start: 12, end: stats.size - 17 });
+        
+        res.on('close', () => {
+             rawDek.fill(0);
+             console.log("[SPOKE] Memory Zeroization Executed.");
+        });
+
+        console.log('[SPOKE] info DEK:', rawDek.toString('hex'), 'EDEk:', eDekHeader, 'KEK v:', kekVersion);
+        console.log(`[SPOKE] Decrypting stream: ${filename} (KEK v${kekVersion})`);
+        
         readStream.pipe(finalDecipher).pipe(res);
 
     } catch (err) {
         console.error("DECRYPTION ERROR:", err.message);
-       return res.status(500).send("Security Integrity Check Failed.");
+        if (!res.headersSent) return res.status(500).send("Security Integrity Check Failed.");
     }
 });
-
 app.post('/internal/files/copy', async (req, res) => {
     const { source_path } = req.body;
 

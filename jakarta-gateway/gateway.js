@@ -56,7 +56,7 @@ const autoPurgeTrash = async () => {
 };
 
 setGlobalDispatcher(customAgent);
-dotenv.config({override: true});
+dotenv.config({ override: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -302,12 +302,20 @@ app.get('/api/v1/vault/view/:uuid', async (req, res) => {
         const expectedSig = crypto.createHmac('sha256', secret).update(`${uuid}:${expires}:${permission}`).digest('hex');
         if (sig !== expectedSig) return res.status(403).send("Invalid signature.");
 
-        const fileMeta = db.prepare(`SELECT f.filename, f.mime_type, v.physical_path, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? ORDER BY v.version_num DESC LIMIT 1`).get(uuid);
+        // const fileMeta = db.prepare(`SELECT f.filename, f.mime_type, v.physical_path, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? ORDER BY v.version_num DESC LIMIT 1`).get(uuid);
+        // if (!fileMeta) return res.status(404).send("File no longer exists.");
+
+        // const spokeResponse = await spokeFetch(`/internal/files/${fileMeta.physical_path}`);
+        // if (!spokeResponse.ok) throw new Error("Spoke failed to provide file.");
+        const fileMeta = db.prepare(`SELECT f.filename, f.mime_type, v.physical_path, v.size, v.encrypted_dek FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? ORDER BY v.version_num DESC LIMIT 1`).get(uuid);
         if (!fileMeta) return res.status(404).send("File no longer exists.");
 
-        const spokeResponse = await spokeFetch(`/internal/files/${fileMeta.physical_path}`);
-        if (!spokeResponse.ok) throw new Error("Spoke failed to provide file.");
-
+        const spokeResponse = await spokeFetch(`/internal/files/${fileMeta.physical_path}`, {
+            headers: {
+                'x-file-dek': fileMeta.encrypted_dek,
+                'x-kek-version': fileMeta.kek_version || 1 // INI TAMBAHANNYA
+            }
+        });
         res.setHeader('Content-Type', fileMeta.mime_type || 'application/octet-stream');
         if (permission === 'viewable') res.setHeader('Content-Disposition', 'inline');
         else res.setHeader('Content-Disposition', `attachment; filename="${fileMeta.filename}"`);
@@ -500,7 +508,7 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
 
                 try {
                     const data = JSON.parse(responseData);
-                    const { physical_path, size, checksum } = data;
+                    const { physical_path, size, checksum, encrypted_dek, kek_version } = data;
 
                     let fileRecord = db.prepare('SELECT id, uuid FROM files WHERE filename = ? AND bucket_id = ?').get(fullVirtualFilename, bucket.id);
                     if (!fileRecord) {
@@ -544,8 +552,9 @@ apiRouter.post('/vault/files', permitGlobalRole('standard_user'), authorizeBucke
                     const lastVersion = db.prepare('SELECT MAX(version_num) as v FROM versions WHERE file_id = ?').get(fileRecord.id);
 
                     const newVersion = (lastVersion.v || 0) + 1;
-                    db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
-
+                    // db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, timestamp) VALUES (?, ?, ?, ?, ?, datetime('now'))").run(fileRecord.id, newVersion, physical_path, size, checksum);
+                    db.prepare("INSERT INTO versions (file_id, version_num, physical_path, size, checksum, encrypted_dek, kek_version, key_state, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', datetime('now'))")
+                        .run(fileRecord.id, newVersion, physical_path, size, checksum, encrypted_dek, kek_version || 1);
                     if (!res.headersSent) res.json({ status: "Vaulted", version: newVersion, uuid: fileRecord.uuid, finalMime });
                     setImmediate(() => { req.destroy(); });
 
@@ -650,10 +659,25 @@ apiRouter.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, 
     const { uuid } = req.params;
     const requestedVersion = req.query.v;
     try {
-        const fileInfo = db.prepare(`SELECT f.filename,f.mime_type, v.physical_path, v.size FROM files f JOIN versions v ON f.id = v.file_id WHERE f.uuid = ? ${requestedVersion ? 'AND v.version_num = ?' : ''} ORDER BY v.version_num DESC LIMIT 1`).get(requestedVersion ? [uuid, requestedVersion] : [uuid]);
+        // PERBAIKAN 1: Tambahkan v.kek_version di dalam perintah SELECT
+        const fileInfo = db.prepare(`
+            SELECT f.filename, f.mime_type, v.physical_path, v.size, v.encrypted_dek, v.kek_version 
+            FROM files f 
+            JOIN versions v ON f.id = v.file_id 
+            WHERE f.uuid = ? ${requestedVersion ? 'AND v.version_num = ?' : ''} 
+            ORDER BY v.version_num DESC LIMIT 1
+        `).get(requestedVersion ? [uuid, requestedVersion] : [uuid]);
+        
         if (!fileInfo) return res.status(404).json({ error: "Version not found." });
 
-        const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`);
+        // PERBAIKAN 2: Ubah semua 'fileMeta' menjadi 'fileInfo'
+        const spokeResponse = await spokeFetch(`/internal/files/${fileInfo.physical_path}`, {
+            headers: {
+                'x-file-dek': fileInfo.encrypted_dek,
+                'x-kek-version': fileInfo.kek_version || 1 
+            }
+        });
+        
         if (!spokeResponse.ok) throw new Error("Spoke failed to provide file stream.");
 
         res.setHeader('Content-Type', fileInfo.mime_type || 'application/octet-stream');
@@ -661,11 +685,22 @@ apiRouter.get('/vault/files/:uuid/content', authorizeVault('READ'), async (req, 
         if (actualSize) res.setHeader('Content-Length', actualSize);
 
         let downloadName = fileInfo.filename;
-        if (requestedVersion) downloadName = fileInfo.filename.includes('.') ? fileInfo.filename.replace(/(\.[^.]+)$/, `_v${requestedVersion}$1`) : `${fileInfo.filename}_v${requestedVersion}`;
+        if (requestedVersion) {
+            downloadName = fileInfo.filename.includes('.') 
+                ? fileInfo.filename.replace(/(\.[^.]+)$/, `_v${requestedVersion}$1`) 
+                : `${fileInfo.filename}_v${requestedVersion}`;
+        }
         res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
 
+        // Pipeline stream data dari Spoke langsung ke Client
         Readable.fromWeb(spokeResponse.body).pipe(res);
-    } catch (err) { if (!res.headersSent) res.status(500).json({ error: "Could not retrieve file." }); }
+        // const edek = fileInfo.encrypted_dek;
+        // const kekVersion = fileInfo.kek_version || 1;
+        // console.log(`[DOWNLOAD] User ${req.auth.payload.sub} mengunduh file ${uuid} versi ${requestedVersion || 'latest'} dengan DEK terenkripsi: ${edek} dan KEK version: ${kekVersion}`);
+    } catch (err) { 
+        console.error("[DOWNLOAD ERROR]", err.message);
+        if (!res.headersSent) res.status(500).json({ error: "Could not retrieve file." }); 
+    }
 });
 
 apiRouter.get('/vault/files/:uuid/links', authorizeVault('WRITE'), (req, res) => {
@@ -891,7 +926,7 @@ apiRouter.delete('/vault/trash', permitGlobalRole('standard_user'), async (req, 
                 }
             } catch (err) {
                 console.error(`[TRASH PURGE] Koneksi ke Spoke terputus saat menghapus ${file.physical_path}`);
-                break; 
+                break;
             }
         }
 
@@ -1267,6 +1302,75 @@ apiRouter.post('/vault/admin/bitrot/scan', permitGlobalRole('admin'), async (req
 //         res.status(502).json({ error: "MinIO Unreachable" });
 //     }
 // });
+// [BARU] MANAJEMEN API KEY (REVISI PAK MIKHAEL)
+// ==========================================
+
+// 1. Generate API Key Baru
+apiRouter.post('/vault/api-keys', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    const { description } = req.body;
+    
+    const MAX_API_KEYS = 5; 
+    try {
+        const countRow = db.prepare('SELECT COUNT(*) as count FROM api_keys WHERE owner_id = ?').get(userId);
+        if (countRow && countRow.count >= MAX_API_KEYS) {
+            return res.status(403).json({ 
+                error: "Quota Exceeded", 
+                message: `Batas maksimal tercapai. Anda hanya dapat memiliki maksimal ${MAX_API_KEYS} API Key aktif. Sila cabut (revoke) kunci lama terlebih dahulu.` 
+            });
+        }
+    } catch (err) {
+        console.error("[API KEY ERROR] Gagal mengecek kuota kunci:", err.message);
+        return res.status(500).json({ error: "Gagal memvalidasi kuota API Key." });
+    }
+
+    const rawString = crypto.randomBytes(32).toString('hex');
+    const plainApiKey = `rb_api_key_${rawString}`;
+
+    const hashedKey = crypto.createHash('sha256').update(plainApiKey).digest('hex');
+
+    try {
+        const info = db.prepare('INSERT INTO api_keys (key_hash, owner_id, description) VALUES (?, ?, ?)')
+            .run(hashedKey, userId, description || 'My API Key');
+
+        res.status(201).json({
+            message: "API Key berhasil dibuat. SIMPAN KUNCI INI SEKARANG. Sistem tidak akan menampilkannya lagi.",
+            api_key: plainApiKey,
+            id: info.lastInsertRowid,
+            description: description || 'My API Key'
+        });
+    } catch (err) {
+        console.error("[API KEY ERROR] Gagal membuat key:", err.message);
+        res.status(500).json({ error: "Gagal membuat API Key." });
+    }
+});
+
+// 2. Lihat Daftar API Key Milik Sendiri (Hanya menampilkan meta, bukan kuncinya)
+apiRouter.get('/vault/api-keys', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    try {
+        // Hati-hati: Kita TIDAK melempar kolom key_hash ke frontend
+        const keys = db.prepare('SELECT id, description, created_at FROM api_keys WHERE owner_id = ? ORDER BY created_at DESC').all(userId);
+        res.json(keys);
+    } catch (err) {
+        res.status(500).json({ error: "Gagal mengambil daftar API Key." });
+    }
+});
+
+// 3. Cabut/Hapus API Key (Revoke)
+apiRouter.delete('/vault/api-keys/:id', permitGlobalRole('standard_user'), (req, res) => {
+    const userId = req.auth.payload.sub;
+    const keyId = req.params.id;
+    try {
+        const result = db.prepare('DELETE FROM api_keys WHERE id = ? AND owner_id = ?').run(keyId, userId);
+        if (result.changes === 0) {
+            return res.status(404).json({ error: "API Key tidak ditemukan atau Anda tidak memiliki akses." });
+        }
+        res.json({ status: "Revoked", message: "API Key berhasil dicabut permanen." });
+    } catch (err) {
+        res.status(500).json({ error: "Gagal mencabut API Key." });
+    }
+});
 app.use('/api/v1', strictBouncer, apiRouter);
 
 
@@ -1299,7 +1403,7 @@ app.use((err, req, res, next) => {
         try {
             db.prepare('INSERT INTO audit_logs (user_email, action, status, ip_address) VALUES (?, ?, ?, ?)')
                 .run('unauthenticated_user', `BLOCKED_AUTH: ${req.path}`, 'FAILED', ip);
-        } catch (dbErr) { console.error("Log fail:", dbErr.message); }  
+        } catch (dbErr) { console.error("Log fail:", dbErr.message); }
         return res.status(err.status || 401).json({ error: err.message });
         // return res.status().json({ error: "Unauthorized", message: err.message });
     }
