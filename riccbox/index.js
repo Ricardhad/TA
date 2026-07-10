@@ -253,9 +253,10 @@ app.post('/internal/files', async (req, res) => {
 
         // res.status(200).json({ status: "Success", physical_path: safeName, size: stats.size, checksum: finalChecksum });
         // 4. Finalisasi Enkripsi (Envelope Encryption)
-        const currentKekVer = process.env.CURRENT_KEK_VERSION || '1';
+        const currentKekVer = process.env.CURRENT_KEK_VERSION;
+        console.log(`[SPOKE] Menggunakan KEK versi: ${currentKekVer}`);
         const activeKek = Buffer.from(process.env[`VAULT_KEY_V${currentKekVer}`], 'hex');
-        
+        // console.log(`[SPOKE] Kunci Enkripsi Master (KEK) yang digunakan: ${activeKek.toString('hex')}`);
         const kekIv = crypto.randomBytes(12);
         const wrapper = crypto.createCipheriv('aes-256-gcm', activeKek, kekIv);
 
@@ -294,7 +295,7 @@ app.post('/internal/files', async (req, res) => {
             size: stats.size, 
             checksum: finalChecksum,
             encrypted_dek: finalEncryptedDek,
-            kek_version: 1
+            kek_version: currentKekVer
         });
     } catch (err) {
         console.error(`[SPOKE ERROR]: ${err.message}`);
@@ -420,11 +421,11 @@ app.get('/internal/files/:filename', (req, res) => {
         if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
 
         const eDekHeader = req.headers['x-file-dek'];
-        const kekVersion = req.headers['x-kek-version'] || '1'; // Tangkap versi dari Gateway
+        const kekVersion = req.headers['x-kek-version'] || '1'; 
         
         if (!eDekHeader) return res.status(400).send("Access Denied: Missing Encrypted DEK");
 
-        const archiveKekHex = process.env[`VAULT_KEY_V${kekVersion}`] || process.env.VAULT_KEY;
+        const archiveKekHex = process.env[`VAULT_KEY_V${kekVersion}`] || process.env.VAULT_KEY_V1;
         const archiveKek = Buffer.from(archiveKekHex, 'hex');
 
         const [kekIvHex, encDekHex, kekTagHex] = eDekHeader.split(':');

@@ -1,3 +1,4 @@
+@ -1,83 +0,0 @@
 CREATE TABLE IF NOT EXISTS users (
   sub TEXT PRIMARY KEY,
   email TEXT NOT NULL
